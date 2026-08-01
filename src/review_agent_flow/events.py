@@ -22,8 +22,10 @@ class WebhookDecision:
     title: str | None = None
     source_branch: str | None = None
     target_branch: str | None = None
+    description: str | None = None
     parent_mr_iid: int | None = None
     merged_sha: str | None = None
+    action: str | None = None
 
 
 def parse_auto_fix_branch(branch: str) -> tuple[int, int] | None:
@@ -94,24 +96,23 @@ def _parse_merge_request(payload: dict[str, Any]) -> WebhookDecision:
     title = str(attrs.get("title") or "")
     source_branch = attrs.get("source_branch")
     target_branch = attrs.get("target_branch")
-    branch_match = AUTO_FIX_BRANCH_RE.match(str(source_branch or ""))
-    is_auto_fix = title.startswith(AUTO_FIX_TITLE_PREFIX) or branch_match is not None
-    parent_mr_iid = int(branch_match.group("mr_iid")) if branch_match else None
+    description = attrs.get("description")
     action = attrs.get("action")
-    if action == "merge" and is_auto_fix:
+    if action == "merge":
         merged_sha = attrs.get("merge_commit_sha") or attrs.get("last_commit_id") or sha
         return WebhookDecision(
             accepted=True,
-            reason="auto-fix merge request merged",
-            kind="autofix_merged",
+            reason="merge request merged",
+            kind="merge",
             project_id=project_id,
             mr_iid=mr_iid,
             sha=str(merged_sha),
             title=title,
             source_branch=str(source_branch) if source_branch else None,
             target_branch=str(target_branch) if target_branch else None,
-            parent_mr_iid=parent_mr_iid,
+            description=str(description) if description is not None else None,
             merged_sha=str(merged_sha),
+            action="merge",
         )
     if action and action not in {"open", "reopen", "update"}:
         return WebhookDecision(
@@ -122,8 +123,8 @@ def _parse_merge_request(payload: dict[str, Any]) -> WebhookDecision:
         )
     return WebhookDecision(
         accepted=True,
-        reason="auto-fix merge request" if is_auto_fix else "normal merge request",
-        kind="autofix" if is_auto_fix else "normal",
+        reason="merge request",
+        kind="normal",
         project_id=project_id,
         mr_iid=mr_iid,
         sha=str(sha),
@@ -131,7 +132,8 @@ def _parse_merge_request(payload: dict[str, Any]) -> WebhookDecision:
         title=title,
         source_branch=str(source_branch) if source_branch else None,
         target_branch=str(target_branch) if target_branch else None,
-        parent_mr_iid=parent_mr_iid,
+        description=str(description) if description is not None else None,
+        action=str(action) if action is not None else None,
     )
 
 
@@ -180,20 +182,20 @@ def _parse_pipeline(payload: dict[str, Any]) -> tuple[WebhookDecision, ...]:
 
         title = str(merge_request.get("title") or attrs.get("title") or "")
         source_branch = merge_request.get("source_branch") or attrs.get("ref")
-        branch_match = AUTO_FIX_BRANCH_RE.match(str(source_branch or ""))
-        is_auto_fix = title.startswith(AUTO_FIX_TITLE_PREFIX) or branch_match is not None
-        parent_mr_iid = int(branch_match.group("mr_iid")) if branch_match else None
+        description = merge_request.get("description") or attrs.get("description")
         decisions.append(
             WebhookDecision(
                 accepted=True,
-                reason="successful auto-fix pipeline" if is_auto_fix else "successful pipeline",
-                kind="autofix" if is_auto_fix else "normal",
+                reason="successful pipeline",
+                kind="pipeline",
                 project_id=project_id,
                 mr_iid=mr_iid,
                 sha=str(sha),
                 title=title,
                 source_branch=str(source_branch) if source_branch else None,
-                parent_mr_iid=parent_mr_iid,
+                target_branch=str(merge_request.get("target_branch") or attrs.get("target_branch") or "")
+                or None,
+                description=str(description) if description is not None else None,
             )
         )
     return tuple(decisions)

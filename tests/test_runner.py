@@ -31,3 +31,35 @@ def test_runner_exposes_run_id(tmp_path: Path) -> None:
         timeout_seconds=5,
     ).run(AgentContext("42", 7, 11, "abc", "https://gitlab.example", tmp_path))
     assert result.stdout.strip() == "11"
+
+
+def test_runner_exposes_side_effect_idempotency_context(tmp_path: Path) -> None:
+    result = LocalCliAgentRunner(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os; print(os.environ['REVIEW_AGENT_FLOW_NOTE_MARKER']); "
+                "print(os.environ['REVIEW_AGENT_FLOW_AUTO_FIX_TARGET_BRANCH']); "
+                "print(os.environ['REVIEW_AGENT_FLOW_AUTO_FIX_MARKER'])"
+            ),
+        ],
+        timeout_seconds=5,
+    ).run(
+        AgentContext(
+            "42",
+            7,
+            11,
+            "abc",
+            "https://gitlab.example",
+            tmp_path,
+            auto_fix_target_branch="feature/source",
+            auto_fix_marker="ReviewFlow-Auto-Fix-Run-ID:11 SHA:abc",
+            note_marker="ReviewFlow-Run-ID:11 SHA:abc",
+        )
+    )
+    assert result.stdout.splitlines() == [
+        "ReviewFlow-Run-ID:11 SHA:abc",
+        "feature/source",
+        "ReviewFlow-Auto-Fix-Run-ID:11 SHA:abc",
+    ]

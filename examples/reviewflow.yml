@@ -17,7 +17,9 @@ ai:
 
 notifications:
   channels:
-    - type: feishu
+    - id: feishu-reviewers
+      type: feishu
       webhook_env: FEISHU_WEBHOOK
-    - type: wecom
+    - id: wecom-reviewers
+      type: wecom
       webhook_env: WECOM_WEBHOOK

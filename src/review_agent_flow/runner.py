@@ -20,6 +20,11 @@ class AgentContext:
     skill_path: Path | None = None
     gitlab_token: str | None = None
     auto_fix_enabled: bool = False
+    auto_fix_branch: str | None = None
+    auto_fix_target_branch: str | None = None
+    auto_fix_title: str | None = None
+    auto_fix_marker: str | None = None
+    note_marker: str | None = None
 
 
 @dataclass(frozen=True)
@@ -53,6 +58,16 @@ class LocalCliAgentRunner:
                 "REVIEW_AGENT_FLOW_AUTO_FIX_ENABLED": str(context.auto_fix_enabled).lower(),
             }
         )
+        if context.auto_fix_branch is not None:
+            env["REVIEW_AGENT_FLOW_AUTO_FIX_BRANCH"] = context.auto_fix_branch
+        if context.auto_fix_target_branch is not None:
+            env["REVIEW_AGENT_FLOW_AUTO_FIX_TARGET_BRANCH"] = context.auto_fix_target_branch
+        if context.auto_fix_title is not None:
+            env["REVIEW_AGENT_FLOW_AUTO_FIX_TITLE"] = context.auto_fix_title
+        if context.auto_fix_marker is not None:
+            env["REVIEW_AGENT_FLOW_AUTO_FIX_MARKER"] = context.auto_fix_marker
+        if context.note_marker is not None:
+            env["REVIEW_AGENT_FLOW_NOTE_MARKER"] = context.note_marker
         if context.skill_path is not None:
             env["REVIEW_AGENT_FLOW_SKILL"] = str(context.skill_path)
         if context.gitlab_token is not None:

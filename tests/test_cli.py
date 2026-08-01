@@ -34,11 +34,13 @@ def test_worker_resolves_relative_policy_from_repository(monkeypatch, tmp_path: 
     args = SimpleNamespace(
         gitlab_url="https://gitlab",
         gitlab_token="token",
+        project_id="42",
         repository=str(repository),
         policy=None,
         db=None,
         worktrees=None,
         agent_timeout=1800,
+        fetch_timeout=60,
         poll_interval=5.0,
         once=True,
     )

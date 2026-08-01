@@ -23,7 +23,7 @@ def test_notification_title_is_sent_to_webhook(monkeypatch) -> None:
             return False
 
         def read(self):
-            return b"{}"
+            return b'{"code": 0}'
 
     def fake_urlopen(request, timeout):
         captured["payload"] = json.loads(request.data)
@@ -34,3 +34,24 @@ def test_notification_title_is_sent_to_webhook(monkeypatch) -> None:
     result = notifier.notify(NotificationEvent(title="MR title", body="review body"))
     assert result.delivered is True
     assert "MR title" in captured["payload"]["content"]["text"]
+
+
+def test_notification_requires_provider_business_success(monkeypatch) -> None:
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+        def read(self):
+            return b'{"code": 99, "msg": "invalid token"}'
+
+    monkeypatch.setattr(notifications, "urlopen", lambda request, timeout: Response())
+    result = WebhookNotifier("feishu", "https://example.invalid").notify(
+        NotificationEvent(title="MR title", body="review body")
+    )
+    assert result.delivered is False
+    assert "provider rejected" in result.detail

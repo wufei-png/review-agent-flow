@@ -26,9 +26,10 @@ def test_normal_merge_request_is_accepted() -> None:
     assert decision.project_id == "42"
     assert decision.mr_iid == 1
     assert decision.sha == "abc"
+    assert decision.description is None
 
 
-def test_auto_fix_merge_request_is_classified_without_ai_path() -> None:
+def test_auto_fix_shaped_merge_request_is_not_trusted_by_parser() -> None:
     decision = parse_webhook(
         "Merge Request Hook",
         _merge_request_payload(
@@ -37,8 +38,8 @@ def test_auto_fix_merge_request_is_classified_without_ai_path() -> None:
         ),
     )
     assert decision.accepted is True
-    assert decision.kind == "autofix"
-    assert decision.parent_mr_iid == 1
+    assert decision.kind == "normal"
+    assert decision.parent_mr_iid is None
     assert parse_auto_fix_branch("autofix/MR-1/run-7") == (1, 7)
 
 
@@ -65,7 +66,7 @@ def test_auto_fix_merge_event_carries_the_resulting_parent_sha() -> None:
         ),
     )
     assert decision.accepted is True
-    assert decision.kind == "autofix_merged"
+    assert decision.kind == "merge"
     assert decision.merged_sha == "merged-parent-sha"
 
 

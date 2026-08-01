@@ -27,9 +27,10 @@ ai:
   skill: .gitlab/review-agent/SKILL.md
   auto_fix: true
 notifications:
-  channels:
-    - type: feishu
-      webhook_env: FEISHU_WEBHOOK
+      channels:
+        - id: feishu-reviewers
+          type: feishu
+          webhook_env: FEISHU_WEBHOOK
 """,
         encoding="utf-8",
     )
@@ -38,6 +39,7 @@ notifications:
     assert policy.human.reviewers == ("alice", "bob")
     assert policy.ai.command == ("opencode", "run")
     assert policy.ai.auto_fix is True
+    assert policy.notifications.channels[0]["id"] == "feishu-reviewers"
     assert policy.notifications.channels[0]["type"] == "feishu"
     assert policy.notifications.channels[0]["webhook_env"] == "FEISHU_WEBHOOK"
 

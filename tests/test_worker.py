@@ -32,7 +32,11 @@ class FakeGitLab:
         return CreatedMergeRequest(project_id, 2, title, source_branch, target_branch, "url")
 
     def find_merge_request_by_source_branch(
-        self, project_id: str, source_branch: str, target_branch: str
+        self,
+        project_id: str,
+        source_branch: str,
+        target_branch: str,
+        marker: str | None = None,
     ) -> CreatedMergeRequest | None:
         return None
 
@@ -43,13 +47,13 @@ class RecordingNotifier(FanoutNotifier):
         self.events: list[NotificationEvent] = []
         self.attempts = 0
 
-    def channel_specs(self) -> tuple[tuple[int, str], ...]:
-        return ((0, "recording"),)
+    def channel_specs(self) -> tuple[tuple[str, str], ...]:
+        return (("recording", "recording"),)
 
-    def notify_channel(self, event: NotificationEvent, channel_index: int) -> NotificationResult:
+    def notify_channel(self, event: NotificationEvent, channel_id: str) -> NotificationResult:
         self.events.append(event)
         self.attempts += 1
-        return NotificationResult("recording", True)
+        return NotificationResult(channel_id, True)
 
 
 class FlakyNotifier(RecordingNotifier):
@@ -57,12 +61,12 @@ class FlakyNotifier(RecordingNotifier):
         super().__init__()
         self.failures = failures
 
-    def notify_channel(self, event: NotificationEvent, channel_index: int) -> NotificationResult:
+    def notify_channel(self, event: NotificationEvent, channel_id: str) -> NotificationResult:
         self.events.append(event)
         self.attempts += 1
         if self.attempts <= self.failures:
-            return NotificationResult("recording", False, "temporary outage")
-        return NotificationResult("recording", True)
+            return NotificationResult(channel_id, False, "temporary outage")
+        return NotificationResult(channel_id, True)
 
 
 def _git_repository(path: Path) -> str:
@@ -106,6 +110,115 @@ def test_worker_runs_agent_in_exact_sha_worktree_and_cleans_it(tmp_path: Path) -
     assert result.agent_result.stdout.strip() == "reviewed"
     assert not (tmp_path / "worktrees" / "run-1").exists()
     assert notifier.events[0].recipients == ("alice",)
+
+
+def test_worker_abandons_auto_fix_intent_when_no_child_mr_is_found(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    sha = _git_repository(repository)
+    mr = MergeRequest("42", 1, "Improve validation", "alice", "feature", "main", sha, "https://mr")
+    store = SQLiteStore(tmp_path / "review.db")
+    run = store.enqueue("42", 1, sha)
+    worker = ReviewWorker(
+        store,
+        FakeGitLab(mr),
+        GitWorktreeManager(repository, tmp_path / "worktrees"),
+        ReviewPolicy(
+            ai=AIPolicy(
+                enabled=True,
+                auto_fix=True,
+                command=(sys.executable, "-c", "print('reviewed')"),
+            )
+        ),
+        repository,
+        "https://gitlab",
+    )
+
+    result = worker.process_one()
+
+    assert result is not None and result.status == "succeeded"
+    intent = store.get_auto_fix_intent(run.run_id)
+    assert intent is not None and intent.status == "abandoned"
+
+
+def test_worktree_registration_failure_is_compensated(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    sha = _git_repository(repository)
+    mr = MergeRequest("42", 1, "Improve validation", "alice", "feature", "main", sha, "https://mr")
+
+    class FailingStore(SQLiteStore):
+        def register_worktree(self, run_id: int, path: Path, sha: str):
+            raise RuntimeError("database unavailable")
+
+    class RecordingManager(GitWorktreeManager):
+        def __init__(self, repository: Path, root: Path) -> None:
+            super().__init__(repository, root)
+            self.removed: list[Path] = []
+
+        def remove(self, path: Path) -> None:
+            self.removed.append(path)
+            super().remove(path)
+
+    store = FailingStore(tmp_path / "review.db")
+    store.enqueue("42", 1, sha)
+    worktrees = RecordingManager(repository, tmp_path / "worktrees")
+    worker = ReviewWorker(
+        store,
+        FakeGitLab(mr),
+        worktrees,
+        ReviewPolicy(ai=AIPolicy(enabled=True, command=(sys.executable, "-c", "print('reviewed')"))),
+        repository,
+        "https://gitlab",
+    )
+
+    result = worker.process_one()
+
+    assert result is not None and result.status == "failed"
+    assert worktrees.removed == [tmp_path / "worktrees" / "run-1"]
+    assert not worktrees.removed[0].exists()
+
+
+def test_worktree_cleanup_failure_is_retried_without_rerunning_agent(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    sha = _git_repository(repository)
+    mr = MergeRequest("42", 1, "Improve validation", "alice", "feature", "main", sha, "https://mr")
+    store = SQLiteStore(tmp_path / "review.db")
+    store.enqueue("42", 1, sha)
+
+    class FailOnceManager(GitWorktreeManager):
+        def __init__(self, repository: Path, root: Path) -> None:
+            super().__init__(repository, root)
+            self.failures = 1
+
+        def remove(self, path: Path) -> None:
+            if self.failures:
+                self.failures -= 1
+                raise RuntimeError("temporary cleanup failure")
+            super().remove(path)
+
+    worker = ReviewWorker(
+        store,
+        FakeGitLab(mr),
+        FailOnceManager(repository, tmp_path / "worktrees"),
+        ReviewPolicy(
+            ai=AIPolicy(
+                enabled=True,
+                command=(sys.executable, "-c", "print('reviewed')"),
+            )
+        ),
+        repository,
+        "https://gitlab",
+        retry_delay_seconds=0,
+    )
+    result = worker.process_one()
+    assert result is not None and result.status == "succeeded"
+    assert "cleanup pending" in result.detail
+    record = store.get_worktree_record(1)
+    assert record is not None and record.status == "pending_cleanup"
+    assert worker.process_worktree_cleanup() == 1
+    assert store.get_worktree_record(1).status == "cleaned"
 
 
 def test_worker_uses_packaged_skill_when_project_skill_is_missing(tmp_path: Path) -> None:
@@ -205,16 +318,16 @@ def test_notification_channels_are_isolated_and_terminal_failure_is_audited(tmp_
     class MixedNotifier(FanoutNotifier):
         def __init__(self) -> None:
             super().__init__()
-            self.calls: list[int] = []
+            self.calls: list[str] = []
 
-        def channel_specs(self) -> tuple[tuple[int, str], ...]:
-            return ((0, "failing"), (1, "working"))
+        def channel_specs(self) -> tuple[tuple[str, str], ...]:
+            return (("failing", "feishu"), ("working", "wecom"))
 
-        def notify_channel(self, event: NotificationEvent, channel_index: int) -> NotificationResult:
-            self.calls.append(channel_index)
-            if channel_index == 0:
-                return NotificationResult("failing", False, "permanent outage")
-            return NotificationResult("working", True)
+        def notify_channel(self, event: NotificationEvent, channel_id: str) -> NotificationResult:
+            self.calls.append(channel_id)
+            if channel_id == "failing":
+                return NotificationResult(channel_id, False, "permanent outage")
+            return NotificationResult(channel_id, True)
 
     notifier = MixedNotifier()
     worker = ReviewWorker(
@@ -229,7 +342,7 @@ def test_notification_channels_are_isolated_and_terminal_failure_is_audited(tmp_
     )
     result = worker.process_one()
     assert result is not None and result.status == "succeeded"
-    assert notifier.calls == [0, 1]
+    assert notifier.calls == ["failing", "working"]
     assert worker.process_notifications(limit=2) == 2
     assert store.get_notification_delivery(1).status == "failed"
     assert store.get_notification_delivery(2).status == "delivered"

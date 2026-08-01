@@ -17,6 +17,7 @@ class MergeRequest:
     sha: str
     web_url: str
     draft: bool = False
+    description: str = ""
 
 
 @dataclass(frozen=True)
@@ -35,6 +36,7 @@ class CreatedMergeRequest:
     source_branch: str
     target_branch: str
     web_url: str
+    description: str = ""
 
 
 class GitLabClient(Protocol):
@@ -43,6 +45,8 @@ class GitLabClient(Protocol):
     def get_latest_pipeline(self, project_id: str, sha: str) -> Pipeline | None: ...
 
     def create_note(self, project_id: str, mr_iid: int, body: str) -> None: ...
+
+    def has_note_marker(self, project_id: str, mr_iid: int, marker: str) -> bool: ...
 
     def create_branch(self, project_id: str, branch: str, ref: str) -> None: ...
 
@@ -56,5 +60,9 @@ class GitLabClient(Protocol):
     ) -> CreatedMergeRequest: ...
 
     def find_merge_request_by_source_branch(
-        self, project_id: str, source_branch: str, target_branch: str
+        self,
+        project_id: str,
+        source_branch: str,
+        target_branch: str,
+        marker: str | None = None,
     ) -> CreatedMergeRequest | None: ...

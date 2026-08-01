@@ -12,13 +12,13 @@
 
 ## Review
 
-**Reviewer**: 显式配置的 GitLab username。Reviewer 与 Approval Requirement 分开建模。
+**Reviewer**: 显式配置的 GitLab username，仅作为 Notify-only 人审通知对象；Approval Requirement 不属于 v0.1。
 
 **AI Review**: Agent 针对一个 MR 的一个 SHA 执行评审并直接向 GitLab 提交 Note。首版默认关闭，不批准也不阻塞合并。
 
-**Review Run**: 对一个 MR 的一个 SHA 执行的一次评审尝试。每个 Run 使用独立 Git worktree，并按 Project/MR/SHA 幂等。
+**Review Run**: 对一个 MR 的一个 SHA 执行的一次评审尝试。每个 Run 使用独立 Git worktree，并按 Project/MR/SHA/类型幂等；租约过期允许至少一次重试，外部副作用通过稳定标记和关系协调。
 
-**Auto-fix Merge Request**: Agent 创建的独立 MR，目标为原 MR 的 source branch，使用 `[ReviewFlow Auto-Fix]` 标题前缀和 `autofix/MR-<iid>/run-<run-id>` 分支，只通知原 MR 创建者。
+**Auto-fix Merge Request**: Agent 创建的独立 MR，目标为原 MR 的 source branch。Worker 先登记服务端 intent，再向 Agent 提供 `[ReviewFlow Auto-Fix]` 标题、`autofix/MR-<iid>/run-<run-id>` 分支和唯一 Run/SHA marker；Agent 必须把 marker 写入 MR description，只通知原 MR 创建者；标题/分支本身不是可信身份。
 
 ## Execution
 
@@ -29,3 +29,5 @@
 **Review Agent Skill**: 指导 Agent 读取上下文、提交 Note、创建 Auto-fix MR 的默认能力说明。Project 可用 `.gitlab/review-agent/SKILL.md` 覆盖。
 
 **Trusted Execution Environment**: 部署者信任 Worker 主机和 Agent 能力的运行边界。核心不默认裁剪 Agent 工具、网络或凭据权限。
+
+**Deployment boundary**: v0.1 一个 API/Worker 进程只服务一个 GitLab Project；Webhook secret 和 Project ID 必须配置。Repository 对象缺失由显式 `ensure_sha` 在仓库锁内限时 fetch 后再校验，Worktree manager 不隐藏 fetch。

@@ -8,22 +8,27 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
-from .events import parse_auto_fix_branch
 from .gitlab import GitLabClient
 from .notifications import FanoutNotifier, NotificationEvent, NotificationResult
 from .policy import ReviewPolicy
+from .repository import GitShaEnsurer
 from .runner import AgentContext, AgentResult, LocalCliAgentRunner
 from .store import (
     DEFAULT_LEASE_SECONDS,
     DEFAULT_MAX_ATTEMPTS,
     DEFAULT_NOTIFICATION_LEASE_SECONDS,
     DEFAULT_NOTIFICATION_MAX_ATTEMPTS,
+    DEFAULT_WORKTREE_CLEANUP_LEASE_SECONDS,
+    DEFAULT_WORKTREE_CLEANUP_MAX_ATTEMPTS,
     ReviewRun,
     SQLiteStore,
+    auto_fix_intent_marker,
 )
 from .worktree import GitWorktreeManager
 
-DEFAULT_REVIEW_AGENT_SKILL = Path(__file__).resolve().parent / "defaults" / "review-agent" / "SKILL.md"
+DEFAULT_REVIEW_AGENT_SKILL = (
+    Path(__file__).resolve().parent / "defaults" / "review-agent" / "SKILL.md"
+)
 LOGGER = logging.getLogger(__name__)
 
 
@@ -52,6 +57,10 @@ class ReviewWorker:
         retry_delay_seconds: float = 5.0,
         notification_lease_seconds: int = DEFAULT_NOTIFICATION_LEASE_SECONDS,
         notification_max_attempts: int = DEFAULT_NOTIFICATION_MAX_ATTEMPTS,
+        project_id: str | None = None,
+        sha_ensurer: GitShaEnsurer | None = None,
+        worktree_cleanup_lease_seconds: int = DEFAULT_WORKTREE_CLEANUP_LEASE_SECONDS,
+        worktree_cleanup_max_attempts: int = DEFAULT_WORKTREE_CLEANUP_MAX_ATTEMPTS,
     ) -> None:
         self.store = store
         self.gitlab = gitlab
@@ -67,6 +76,10 @@ class ReviewWorker:
         self.retry_delay_seconds = retry_delay_seconds
         self.notification_lease_seconds = notification_lease_seconds
         self.notification_max_attempts = notification_max_attempts
+        self.project_id = project_id
+        self.sha_ensurer = sha_ensurer or GitShaEnsurer(repository)
+        self.worktree_cleanup_lease_seconds = worktree_cleanup_lease_seconds
+        self.worktree_cleanup_max_attempts = worktree_cleanup_max_attempts
 
     def process_one(self) -> WorkerResult | None:
         run = self.store.claim_next(
@@ -77,6 +90,8 @@ class ReviewWorker:
             return None
 
         try:
+            if self.project_id is not None and run.project_id != self.project_id:
+                raise ValueError("Review Run belongs to a different configured Project")
             merge_request = self.gitlab.get_merge_request(run.project_id, run.mr_iid)
             if merge_request.draft:
                 self.store.requeue(
@@ -86,11 +101,21 @@ class ReviewWorker:
                     claim_token=run.claim_token,
                 )
                 return WorkerResult(run.run_id, "deferred", detail="draft merge request")
-            if run.kind == "autofix":
-                parent = parse_auto_fix_branch(merge_request.source_branch)
-                if parent is None:
-                    raise ValueError("auto-fix MR source branch does not identify its parent MR")
-                parent_merge_request = self.gitlab.get_merge_request(run.project_id, parent[0])
+
+            auto_fix_match = self.store.resolve_auto_fix_match(
+                run.project_id,
+                run.mr_iid,
+                merge_request.source_branch,
+                merge_request.target_branch,
+                merge_request.description,
+            )
+            if run.kind == "autofix" or auto_fix_match is not None:
+                if auto_fix_match is None:
+                    raise ValueError("untrusted Auto-fix Run has no persisted relation")
+                parent_merge_request = self.gitlab.get_merge_request(
+                    auto_fix_match.parent_project_id,
+                    auto_fix_match.parent_mr_iid,
+                )
                 self._notify_autofix(run, parent_merge_request, merge_request)
                 self.store.finish(run.run_id, "succeeded", claim_token=run.claim_token)
                 return WorkerResult(run.run_id, "succeeded", detail="auto-fix MR notification")
@@ -113,23 +138,94 @@ class ReviewWorker:
                 self.store.finish(run.run_id, "succeeded", claim_token=run.claim_token)
                 return WorkerResult(run.run_id, "succeeded", detail="human path only")
 
+            self.sha_ensurer.ensure_sha(run.sha)
+            auto_fix_intent = None
+            if self.policy.ai.auto_fix:
+                auto_fix_intent = self.store.create_auto_fix_intent(
+                    parent_project_id=run.project_id,
+                    parent_mr_iid=run.mr_iid,
+                    parent_sha=run.sha,
+                    run_id=run.run_id,
+                    source_branch=f"autofix/MR-{merge_request.iid}/run-{run.run_id}",
+                    target_branch=merge_request.source_branch,
+                    title=f"[ReviewFlow Auto-Fix] {merge_request.title}",
+                )
+
             worktree_id = str(run.run_id) if run.attempts <= 1 else f"{run.run_id}-attempt-{run.attempts}"
             worktree = self.worktrees.create(run.sha, worktree_id)
             try:
-                result = self._run_agent(run, merge_request, worktree)
-                if result.returncode != 0:
-                    self.store.finish(
+                cleanup_record = self.store.register_worktree(run.run_id, worktree, run.sha)
+            except Exception:
+                try:
+                    self.worktrees.remove(worktree)
+                except Exception:
+                    LOGGER.exception(
+                        "worktree cleanup after registration failure failed for Run %s",
                         run.run_id,
-                        "failed",
-                        result.stderr[-4000:] or "Agent failed",
-                        claim_token=run.claim_token,
                     )
-                    return WorkerResult(run.run_id, "failed", result, "Agent process failed")
-                self._record_auto_fix_if_created(run, merge_request)
-                self.store.finish(run.run_id, "succeeded", claim_token=run.claim_token)
-                return WorkerResult(run.run_id, "succeeded", result)
+                raise
+            agent_result: AgentResult | None = None
+            run_status = "succeeded"
+            detail = ""
+            auto_fix_created = False
+            auto_fix_reconciliation_complete = not self.policy.ai.auto_fix
+            try:
+                marker = f"ReviewFlow-Run-ID:{run.run_id} SHA:{run.sha}"
+                has_marker = False
+                has_note_marker = getattr(self.gitlab, "has_note_marker", None)
+                if callable(has_note_marker):
+                    has_marker = bool(
+                        has_note_marker(run.project_id, run.mr_iid, marker)
+                    )
+                if has_marker:
+                    agent_result = AgentResult(
+                        returncode=0,
+                        stdout="",
+                        stderr="review marker already exists; skipped duplicate Agent run",
+                    )
+                else:
+                    agent_result = self._run_agent(
+                        run,
+                        merge_request,
+                        worktree,
+                        auto_fix_intent,
+                        marker,
+                    )
+                if agent_result.returncode != 0:
+                    run_status = "failed"
+                    detail = agent_result.stderr[-4000:] or "Agent failed"
+                auto_fix_created = self._record_auto_fix_if_created(run, merge_request)
+                auto_fix_reconciliation_complete = True
+            except Exception as exc:
+                run_status = "failed"
+                detail = str(exc)
+                LOGGER.exception("Agent side-effect reconciliation failed for Run %s", run.run_id)
             finally:
-                self.worktrees.remove(worktree)
+                try:
+                    self.worktrees.remove(worktree)
+                    self.store.mark_worktree_cleaned(cleanup_record.cleanup_id)
+                except Exception as exc:
+                    cleanup_detail = str(exc)
+                    self.store.mark_worktree_cleanup_pending(
+                        cleanup_record.cleanup_id, cleanup_detail
+                    )
+                    detail = f"{detail}; worktree cleanup pending: {cleanup_detail}".strip("; ")
+                    LOGGER.exception("worktree cleanup failed for Run %s", run.run_id)
+
+            if (
+                auto_fix_intent is not None
+                and auto_fix_reconciliation_complete
+                and not auto_fix_created
+            ):
+                self.store.abandon_auto_fix_intent(run.run_id)
+
+            self.store.finish(
+                run.run_id,
+                run_status,
+                detail if run_status == "failed" else None,
+                claim_token=run.claim_token,
+            )
+            return WorkerResult(run.run_id, run_status, agent_result, detail)
         except Exception as exc:  # noqa: BLE001 - a failed Run must be persisted
             self.store.finish(run.run_id, "failed", str(exc), claim_token=run.claim_token)
             return WorkerResult(run.run_id, "failed", detail=str(exc))
@@ -137,9 +233,40 @@ class ReviewWorker:
     def run_forever(self, poll_interval_seconds: float = 5.0) -> None:
         while True:
             result = self.process_one()
+            self.process_worktree_cleanup(limit=1)
             self.process_notifications(limit=1)
             if result is None or result.status == "deferred":
                 time.sleep(poll_interval_seconds)
+
+    def process_worktree_cleanup(self, limit: int = 1) -> int:
+        if limit <= 0:
+            raise ValueError("worktree cleanup limit must be positive")
+        processed = 0
+        for _ in range(limit):
+            record = self.store.claim_next_worktree_cleanup(
+                lease_seconds=self.worktree_cleanup_lease_seconds,
+                max_attempts=self.worktree_cleanup_max_attempts,
+            )
+            if record is None:
+                break
+            try:
+                self.worktrees.remove(Path(record.path))
+            except Exception as exc:  # noqa: BLE001 - isolate one cleanup record
+                cleaned = False
+                detail = str(exc)
+            else:
+                cleaned = True
+                detail = None
+            self.store.finish_worktree_cleanup(
+                record.cleanup_id,
+                cleaned,
+                detail,
+                claim_token=record.claim_token,
+                max_attempts=self.worktree_cleanup_max_attempts,
+                retry_delay_seconds=self.retry_delay_seconds,
+            )
+            processed += 1
+        return processed
 
     def process_notifications(
         self, limit: int = 1, delivery_ids: tuple[int, ...] | None = None
@@ -176,9 +303,9 @@ class ReviewWorker:
                 correlation_id=delivery.correlation_id,
             )
             try:
-                result = self.notifier.notify_channel(event, delivery.channel_index)
+                result = self.notifier.notify_channel(event, delivery.channel_id)
             except Exception as exc:  # noqa: BLE001 - isolate one channel failure
-                result = NotificationResult(delivery.channel, False, str(exc))
+                result = NotificationResult(delivery.channel_id, False, str(exc))
             try:
                 self.store.finish_notification(
                     delivery.delivery_id,
@@ -195,7 +322,14 @@ class ReviewWorker:
             processed += 1
         return processed
 
-    def _run_agent(self, run: ReviewRun, merge_request, worktree: Path) -> AgentResult:
+    def _run_agent(
+        self,
+        run: ReviewRun,
+        merge_request,
+        worktree: Path,
+        auto_fix_intent,
+        marker: str,
+    ) -> AgentResult:
         command = self.policy.ai.command
         runner = LocalCliAgentRunner(command, self.agent_timeout_seconds)
         skill_path = DEFAULT_REVIEW_AGENT_SKILL
@@ -215,6 +349,13 @@ class ReviewWorker:
                 skill_path=skill_path,
                 gitlab_token=self.gitlab_token,
                 auto_fix_enabled=self.policy.ai.auto_fix,
+                auto_fix_branch=auto_fix_intent.source_branch if auto_fix_intent else None,
+                auto_fix_target_branch=auto_fix_intent.target_branch if auto_fix_intent else None,
+                auto_fix_title=auto_fix_intent.title if auto_fix_intent else None,
+                auto_fix_marker=(
+                    auto_fix_intent_marker(run.run_id, run.sha) if auto_fix_intent else None
+                ),
+                note_marker=marker,
             )
         )
 
@@ -263,10 +404,13 @@ class ReviewWorker:
         except Exception:
             LOGGER.exception("failed to enqueue notification outbox record")
 
-    def _record_auto_fix_if_created(self, run: ReviewRun, merge_request) -> None:
+    def _record_auto_fix_if_created(self, run: ReviewRun, merge_request) -> bool:
+        if not self.policy.ai.auto_fix:
+            return False
         branch = f"autofix/MR-{merge_request.iid}/run-{run.run_id}"
+        marker = auto_fix_intent_marker(run.run_id, run.sha)
         auto_fix = self.gitlab.find_merge_request_by_source_branch(
-            run.project_id, branch, merge_request.source_branch
+            run.project_id, branch, merge_request.source_branch, marker
         )
         if auto_fix is not None:
             self.store.record_auto_fix(
@@ -277,3 +421,5 @@ class ReviewWorker:
                 auto_fix_project_id=auto_fix.project_id,
                 auto_fix_mr_iid=auto_fix.iid,
             )
+            return True
+        return False

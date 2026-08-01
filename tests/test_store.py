@@ -1,6 +1,6 @@
 import sqlite3
 
-from review_agent_flow.store import SQLiteStore
+from review_agent_flow.store import SQLiteStore, auto_fix_intent_marker
 
 
 def test_enqueue_is_idempotent_and_claimable(tmp_path) -> None:
@@ -111,6 +111,105 @@ def test_auto_fix_merge_before_relation_write_is_preserved(tmp_path) -> None:
     assert store.is_suppressed_parent_sha("42", 1, "merged-parent-sha") is True
 
 
+def test_auto_fix_intent_attaches_child_before_worker_reconciliation(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "review.db")
+    run = store.enqueue("42", 1, "parent-sha")
+    store.create_auto_fix_intent(
+        "42",
+        1,
+        "parent-sha",
+        run.run_id,
+        "autofix/MR-1/run-1",
+        "feature/validation",
+        "[ReviewFlow Auto-Fix] Improve validation",
+    )
+    match = store.resolve_auto_fix_match(
+        "42",
+        9,
+        "autofix/MR-1/run-1",
+        "feature/validation",
+        auto_fix_intent_marker(run.run_id, "parent-sha"),
+    )
+    assert match is not None
+    assert match.parent_mr_iid == 1
+    assert match.auto_fix_mr_iid == 9
+
+
+def test_auto_fix_intent_rejects_reused_run_id_without_current_marker(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "review.db")
+    run = store.enqueue("42", 1, "current-sha")
+    store.create_auto_fix_intent(
+        "42",
+        1,
+        "current-sha",
+        run.run_id,
+        "autofix/MR-1/run-1",
+        "feature/validation",
+        "[ReviewFlow Auto-Fix] Improve validation",
+    )
+    assert (
+        store.resolve_auto_fix_match(
+            "42",
+            9,
+            "autofix/MR-1/run-1",
+            "feature/validation",
+            "ReviewFlow-Auto-Fix-Run-ID:1 SHA:old-sha",
+        )
+        is None
+    )
+    assert store.abandon_auto_fix_intent(run.run_id) is True
+    assert store.get_auto_fix_intent(run.run_id).status == "abandoned"
+
+
+def test_abandoned_auto_fix_intent_is_not_reclaimed(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "review.db")
+    run = store.enqueue("42", 1, "parent-sha")
+    store.create_auto_fix_intent(
+        "42",
+        1,
+        "parent-sha",
+        run.run_id,
+        "autofix/MR-1/run-1",
+        "feature/validation",
+        "[ReviewFlow Auto-Fix] Improve validation",
+    )
+    assert store.abandon_auto_fix_intent(run.run_id) is True
+    assert (
+        store.resolve_auto_fix_match(
+            "42",
+            9,
+            "autofix/MR-1/run-1",
+            "feature/validation",
+            auto_fix_intent_marker(run.run_id, "parent-sha"),
+        )
+        is None
+    )
+
+
+def test_notification_channel_identity_survives_configuration_reordering(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "review.db")
+    first = store.enqueue_notifications(
+        "review-run:reorder",
+        "Review",
+        "Body",
+        None,
+        (),
+        (("feishu-reviewers", "feishu"), ("wecom-reviewers", "wecom")),
+    )
+    second = store.enqueue_notifications(
+        "review-run:reorder",
+        "Review",
+        "Body",
+        None,
+        (),
+        (("wecom-reviewers", "wecom"), ("feishu-reviewers", "feishu")),
+    )
+    assert [(item.channel_id, item.delivery_id) for item in second] == [
+        ("feishu-reviewers", first[0].delivery_id),
+        ("wecom-reviewers", first[1].delivery_id),
+    ]
+
+
 def test_notification_outbox_is_idempotent_per_channel(tmp_path) -> None:
     store = SQLiteStore(tmp_path / "review.db")
     first = store.enqueue_notifications(
@@ -119,7 +218,7 @@ def test_notification_outbox_is_idempotent_per_channel(tmp_path) -> None:
         "Please review",
         "https://mr",
         ("alice",),
-        ((0, "feishu"), (1, "wecom")),
+        (("feishu-reviewers", "feishu"), ("wecom-reviewers", "wecom")),
     )
     duplicate = store.enqueue_notifications(
         "review-run:1:human",
@@ -127,11 +226,12 @@ def test_notification_outbox_is_idempotent_per_channel(tmp_path) -> None:
         "Please review",
         "https://mr",
         ("alice",),
-        ((0, "feishu"), (1, "wecom")),
+        (("feishu-reviewers", "feishu"), ("wecom-reviewers", "wecom")),
     )
     assert [item.delivery_id for item in duplicate] == [item.delivery_id for item in first]
     claimed = store.claim_next_notification()
     assert claimed is not None
+    assert claimed.channel_id == "feishu-reviewers"
     assert claimed.channel == "feishu"
     assert claimed.recipients == ("alice",)
     assert claimed.attempts == 1
@@ -151,7 +251,7 @@ def test_notification_outbox_retries_then_records_terminal_failure(tmp_path) -> 
         "Please review",
         None,
         ("alice",),
-        ((0, "feishu"),),
+        (("feishu-reviewers", "feishu"),),
     )
     delivery_id = deliveries[0].delivery_id
     for attempt in range(3):
@@ -183,7 +283,7 @@ def test_stale_notification_claim_cannot_finish_reclaimed_delivery(tmp_path) -> 
         "Please review",
         None,
         (),
-        ((0, "feishu"),),
+        (("feishu-reviewers", "feishu"),),
     )
     first = store.claim_next_notification(lease_seconds=60)
     assert first is not None

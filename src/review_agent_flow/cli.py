@@ -12,6 +12,7 @@ from pathlib import Path
 from .gitlab_client import PythonGitLabClient
 from .notifications import notifiers_from_policy
 from .policy import load_policy, policy_template
+from .repository import GitShaEnsurer
 from .store import SQLiteStore
 from .worker import ReviewWorker
 from .worktree import GitWorktreeManager
@@ -39,6 +40,7 @@ def _required(value: str | None, env_name: str) -> str:
 def _run_worker(args: argparse.Namespace) -> int:
     gitlab_url = _required(args.gitlab_url, "GITLAB_URL")
     gitlab_token = _required(args.gitlab_token, "GITLAB_TOKEN")
+    project_id = _required(args.project_id, "REVIEW_AGENT_FLOW_PROJECT_ID")
     repository = Path(_required(args.repository, "REVIEW_AGENT_FLOW_REPOSITORY")).expanduser().resolve()
     policy_path = Path(args.policy or os.getenv("REVIEW_AGENT_FLOW_POLICY", ".gitlab/reviewflow.yml"))
     if not policy_path.is_absolute():
@@ -56,6 +58,8 @@ def _run_worker(args: argparse.Namespace) -> int:
         repository=repository,
         gitlab_url=gitlab_url,
         gitlab_token=gitlab_token,
+        project_id=project_id,
+        sha_ensurer=GitShaEnsurer(repository, fetch_timeout_seconds=args.fetch_timeout),
         notifier=notifiers_from_policy(policy.notifications.channels),
         agent_timeout_seconds=args.agent_timeout,
         lease_seconds=args.agent_timeout + 60,
@@ -81,11 +85,13 @@ def main(argv: list[str] | None = None) -> int:
     worker = subparsers.add_parser("worker", help="run the Review Run worker")
     worker.add_argument("--gitlab-url")
     worker.add_argument("--gitlab-token")
+    worker.add_argument("--project-id")
     worker.add_argument("--repository")
     worker.add_argument("--policy")
     worker.add_argument("--db")
     worker.add_argument("--worktrees")
     worker.add_argument("--agent-timeout", type=int, default=1800)
+    worker.add_argument("--fetch-timeout", type=int, default=60)
     worker.add_argument("--poll-interval", type=float, default=5.0)
     worker.add_argument("--once", action="store_true")
     args = parser.parse_args(argv)

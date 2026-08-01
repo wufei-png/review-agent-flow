@@ -95,9 +95,14 @@ def _as_channels(value: Any) -> tuple[dict[str, Any], ...]:
             raise PolicyError(f"notifications.channels[{index}] must be a mapping")
         _reject_unknown(
             item,
-            {"type", "webhook_env", "user_ids"},
+            {"id", "type", "webhook_env", "user_ids"},
             f"notifications.channels[{index}]",
         )
+        channel_id = item.get("id")
+        if not isinstance(channel_id, str) or not channel_id:
+            raise PolicyError(
+                f"notifications.channels[{index}].id must be a non-empty string"
+            )
         channel_type = item.get("type")
         if channel_type not in {"feishu", "wecom"}:
             raise PolicyError(
@@ -120,6 +125,9 @@ def _as_channels(value: Any) -> tuple[dict[str, Any], ...]:
                 f"notifications.channels[{index}].user_ids must map non-empty strings"
             )
         channels.append(item)
+    channel_ids = [str(channel["id"]) for channel in channels]
+    if len(set(channel_ids)) != len(channel_ids):
+        raise PolicyError("notifications.channels ids must be unique")
     return tuple(channels)
 
 
@@ -210,8 +218,10 @@ ai:
 
 notifications:
   channels:
-    - type: feishu
+    - id: feishu-reviewers
+      type: feishu
       webhook_env: FEISHU_WEBHOOK
-    - type: wecom
+    - id: wecom-reviewers
+      type: wecom
       webhook_env: WECOM_WEBHOOK
 """
