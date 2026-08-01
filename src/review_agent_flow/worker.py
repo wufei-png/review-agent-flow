@@ -208,6 +208,7 @@ class ReviewWorker:
             AgentContext(
                 project_id=run.project_id,
                 mr_iid=run.mr_iid,
+                run_id=run.run_id,
                 sha=run.sha,
                 gitlab_url=self.gitlab_url,
                 worktree=worktree,

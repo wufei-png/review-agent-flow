@@ -13,6 +13,7 @@ from pathlib import Path
 class AgentContext:
     project_id: str
     mr_iid: int
+    run_id: int
     sha: str
     gitlab_url: str
     worktree: Path
@@ -46,6 +47,7 @@ class LocalCliAgentRunner:
             {
                 "REVIEW_AGENT_FLOW_PROJECT_ID": context.project_id,
                 "REVIEW_AGENT_FLOW_MR_IID": str(context.mr_iid),
+                "REVIEW_AGENT_FLOW_RUN_ID": str(context.run_id),
                 "REVIEW_AGENT_FLOW_SHA": context.sha,
                 "REVIEW_AGENT_FLOW_GITLAB_URL": context.gitlab_url,
                 "REVIEW_AGENT_FLOW_AUTO_FIX_ENABLED": str(context.auto_fix_enabled).lower(),

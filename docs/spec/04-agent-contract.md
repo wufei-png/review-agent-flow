@@ -17,6 +17,7 @@ The Worker invokes the configured command with `shell=False`, the Review Run wor
 | --- | --- |
 | `REVIEW_AGENT_FLOW_PROJECT_ID` | GitLab Project identifier |
 | `REVIEW_AGENT_FLOW_MR_IID` | Merge Request IID |
+| `REVIEW_AGENT_FLOW_RUN_ID` | Numeric Review Run identifier; use it in the Auto-fix branch name |
 | `REVIEW_AGENT_FLOW_SHA` | Exact reviewed commit |
 | `REVIEW_AGENT_FLOW_GITLAB_URL` | GitLab base URL |
 | `REVIEW_AGENT_FLOW_SKILL` | Project Skill path when it exists, otherwise the packaged default Skill |
