@@ -10,7 +10,7 @@ GitLab 人类评审与 AI Agent 协同的开源工作流编排器。
 
 - Python package and `review-agent-flow init` policy template command
 - Project policy loading with safe defaults
-- SQLite idempotency store, Auto-fix relationship tracking and database-backed Review Run queue
+- SQLite idempotency store, Auto-fix relationship tracking, notification outbox and database-backed Review Run queue
 - Generic local CLI Agent Runner
 - Git worktree lifecycle helper
 - GitLab event normalization and a `python-gitlab` adapter boundary
@@ -30,6 +30,7 @@ GitLab 人类评审与 AI Agent 协同的开源工作流编排器。
 - Agent 不需要返回 JSON，可以直接写 GitLab Note。
 - Auto-fix 创建独立 MR，分支格式为 `autofix/MR-1/run-1`，标题以 `[ReviewFlow Auto-Fix]` 开头，只通知原 MR 创建者。
 - Auto-fix MR 不触发 AI Review，但正常运行 CI；合并回原 source branch 后只跳过对应 SHA 的自动 AI Review。
+- 通知按渠道写入 SQLite outbox；单渠道失败不影响 Review Run，最多重试 3 次并保留失败记录。
 - 首版使用可信执行环境，不在核心层裁剪 Agent 权限。
 - 模型层只定义 OpenAI-compatible Provider 接口；部署文档推荐使用 [LiteLLM](https://docs.litellm.ai/)。
 - Agent 层支持通用本地 CLI，并为 [OpenCode Web](https://dev.opencode.ai/docs/web/)、[OpenCode Server](https://dev.opencode.ai/docs/server/) 和其他 CLI 预留入口。

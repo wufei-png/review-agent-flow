@@ -39,11 +39,30 @@ class FakeGitLab:
 
 class RecordingNotifier(FanoutNotifier):
     def __init__(self) -> None:
+        super().__init__()
         self.events: list[NotificationEvent] = []
+        self.attempts = 0
 
-    def notify(self, event: NotificationEvent) -> tuple[NotificationResult, ...]:
+    def channel_specs(self) -> tuple[tuple[int, str], ...]:
+        return ((0, "recording"),)
+
+    def notify_channel(self, event: NotificationEvent, channel_index: int) -> NotificationResult:
         self.events.append(event)
-        return ()
+        self.attempts += 1
+        return NotificationResult("recording", True)
+
+
+class FlakyNotifier(RecordingNotifier):
+    def __init__(self, failures: int) -> None:
+        super().__init__()
+        self.failures = failures
+
+    def notify_channel(self, event: NotificationEvent, channel_index: int) -> NotificationResult:
+        self.events.append(event)
+        self.attempts += 1
+        if self.attempts <= self.failures:
+            return NotificationResult("recording", False, "temporary outage")
+        return NotificationResult("recording", True)
 
 
 def _git_repository(path: Path) -> str:
@@ -145,3 +164,72 @@ def test_worker_requeues_draft_mr_before_human_or_ai_paths(tmp_path: Path) -> No
     result = worker.process_one()
     assert result == result.__class__(run.run_id, "deferred", detail="draft merge request")
     assert notifier.events == []
+
+
+def test_notification_failure_does_not_fail_review_run_and_is_retried(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    sha = _git_repository(repository)
+    mr = MergeRequest("42", 1, "Improve validation", "alice", "feature", "main", sha, "https://mr")
+    store = SQLiteStore(tmp_path / "review.db")
+    run = store.enqueue("42", 1, sha)
+    notifier = FlakyNotifier(failures=1)
+    worker = ReviewWorker(
+        store,
+        FakeGitLab(mr),
+        GitWorktreeManager(repository, tmp_path / "worktrees"),
+        ReviewPolicy(human=HumanPolicy(enabled=True, reviewers=("alice",))),
+        repository,
+        "https://gitlab",
+        notifier=notifier,
+        retry_delay_seconds=0,
+    )
+    result = worker.process_one()
+    assert result is not None
+    assert result.status == "succeeded"
+    assert notifier.attempts == 1
+    assert worker.process_notifications() == 1
+    assert notifier.attempts == 2
+    assert store.get_notification_delivery(1).status == "delivered"
+    assert store.get_notification_delivery(1).correlation_id == f"review-run:{run.run_id}:human"
+
+
+def test_notification_channels_are_isolated_and_terminal_failure_is_audited(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    sha = _git_repository(repository)
+    mr = MergeRequest("42", 1, "Improve validation", "alice", "feature", "main", sha, "https://mr")
+    store = SQLiteStore(tmp_path / "review.db")
+    store.enqueue("42", 1, sha)
+
+    class MixedNotifier(FanoutNotifier):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls: list[int] = []
+
+        def channel_specs(self) -> tuple[tuple[int, str], ...]:
+            return ((0, "failing"), (1, "working"))
+
+        def notify_channel(self, event: NotificationEvent, channel_index: int) -> NotificationResult:
+            self.calls.append(channel_index)
+            if channel_index == 0:
+                return NotificationResult("failing", False, "permanent outage")
+            return NotificationResult("working", True)
+
+    notifier = MixedNotifier()
+    worker = ReviewWorker(
+        store,
+        FakeGitLab(mr),
+        GitWorktreeManager(repository, tmp_path / "worktrees"),
+        ReviewPolicy(human=HumanPolicy(enabled=True, reviewers=("alice",))),
+        repository,
+        "https://gitlab",
+        notifier=notifier,
+        retry_delay_seconds=0,
+    )
+    result = worker.process_one()
+    assert result is not None and result.status == "succeeded"
+    assert notifier.calls == [0, 1]
+    assert worker.process_notifications(limit=2) == 2
+    assert store.get_notification_delivery(1).status == "failed"
+    assert store.get_notification_delivery(2).status == "delivered"

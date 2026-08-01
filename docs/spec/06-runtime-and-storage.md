@@ -47,6 +47,8 @@ Each running Run has a lease expiration and opaque claim token. A Worker clears 
 `auto_fix_mrs` must retain the parent MR, parent Run, Auto-fix Project/MR, status and `merged_sha`.
 An `auto_fix_merge_events` table retains an Auto-fix merge event that arrives before its relation is written, so the later relation write can apply the merge suppression atomically.
 
+`notification_outbox` must retain one record per notification/channel with the correlation ID, rendered event fields, channel identity, attempt count, lease, next-attempt time, final status and last error. `pending -> running -> delivered` or `failed` is independent of the Review Run state.
+
 ## Deployment defaults
 
 - SQLite is the first storage implementation.

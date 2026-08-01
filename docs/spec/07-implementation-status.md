@@ -10,6 +10,7 @@
 | OpenAI-compatible Provider protocol | `src/review_agent_flow/provider.py` |
 | Exact-SHA worktree helper | `src/review_agent_flow/worktree.py` |
 | SQLite idempotency, claim and Auto-fix relation | `src/review_agent_flow/store.py` |
+| SQLite notification outbox and per-channel retry | `src/review_agent_flow/store.py`, `worker.py` |
 | GitLab event normalization | `src/review_agent_flow/events.py` |
 | GitLab protocol and python-gitlab adapter | `src/review_agent_flow/gitlab.py`, `gitlab_client.py` |
 | Feishu/WeCom webhook adapters | `src/review_agent_flow/notifications.py` |
@@ -23,7 +24,7 @@
 
 1. Add real GitLab sandbox verification for Note, branch and Auto-fix MR APIs.
 2. Add Pipeline webhook fixtures for GitLab versions used by deployments.
-3. Add configurable retry/backoff policy and durable notification delivery records.
+3. Add configurable retry/backoff policy beyond the Worker defaults.
 4. Add full recipient identity lookup/mapping for Feishu and WeCom.
 5. Add real Agent CLI contract tests and Auto-fix MR creation fixtures.
 6. Add Postgres/Redis implementations when multi-instance deployment is required.
@@ -41,3 +42,4 @@
 - Feishu and WeCom can both be configured without changing the core workflow.
 - A deferred Pipeline Gate or Draft Run does not block later eligible Runs.
 - An expired Worker claim is recovered at most three times and stale claim tokens cannot finish a reclaimed Run.
+- Notification delivery failure leaves the Review Run successful, retries per channel up to three times, and records terminal failure for audit.

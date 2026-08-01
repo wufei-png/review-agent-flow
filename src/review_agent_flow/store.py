@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -10,6 +11,8 @@ from uuid import uuid4
 
 DEFAULT_LEASE_SECONDS = 1860
 DEFAULT_MAX_ATTEMPTS = 3
+DEFAULT_NOTIFICATION_LEASE_SECONDS = 30
+DEFAULT_NOTIFICATION_MAX_ATTEMPTS = 3
 
 
 @dataclass(frozen=True)
@@ -36,6 +39,26 @@ class AutoFixRelation:
     auto_fix_mr_iid: int
     merged_sha: str | None
     status: str
+
+
+@dataclass(frozen=True)
+class NotificationDelivery:
+    delivery_id: int
+    correlation_id: str
+    channel_index: int
+    channel: str
+    title: str
+    body: str
+    url: str | None
+    recipients: tuple[str, ...]
+    status: str
+    attempts: int
+    next_attempt_at: str | None
+    lease_until: str | None
+    claim_token: str | None
+    created_at: str
+    delivered_at: str | None
+    last_error: str | None
 
 
 class SQLiteStore:
@@ -88,6 +111,25 @@ class SQLiteStore:
                     merged_sha TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(auto_fix_project_id, auto_fix_mr_iid)
+                );
+                CREATE TABLE IF NOT EXISTS notification_outbox (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    correlation_id TEXT NOT NULL,
+                    channel_index INTEGER NOT NULL,
+                    channel TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    url TEXT,
+                    recipients_json TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at TEXT,
+                    lease_until TEXT,
+                    claim_token TEXT,
+                    created_at TEXT NOT NULL,
+                    delivered_at TEXT,
+                    last_error TEXT,
+                    UNIQUE(correlation_id, channel_index)
                 );
                 """
             )
@@ -261,6 +303,285 @@ class SQLiteStore:
                 parameters += (claim_token,)
             cursor = connection.execute(query, parameters)
         return cursor.rowcount == 1
+
+    def enqueue_notifications(
+        self,
+        correlation_id: str,
+        title: str,
+        body: str,
+        url: str | None,
+        recipients: tuple[str, ...],
+        channels: tuple[tuple[int, str], ...],
+    ) -> tuple[NotificationDelivery, ...]:
+        if not correlation_id:
+            raise ValueError("notification correlation_id cannot be empty")
+        created_at = datetime.now(UTC).isoformat()
+        recipients_json = json.dumps(list(recipients), separators=(",", ":"))
+        with self._connect() as connection:
+            for channel_index, channel in channels:
+                connection.execute(
+                    """
+                    INSERT INTO notification_outbox(
+                        correlation_id, channel_index, channel, title, body, url,
+                        recipients_json, next_attempt_at, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(correlation_id, channel_index) DO NOTHING
+                    """,
+                    (
+                        correlation_id,
+                        channel_index,
+                        channel,
+                        title,
+                        body,
+                        url,
+                        recipients_json,
+                        created_at,
+                        created_at,
+                    ),
+                )
+            rows = connection.execute(
+                """
+                SELECT id AS delivery_id, correlation_id, channel_index, channel,
+                       title, body, url, recipients_json, status, attempts,
+                       next_attempt_at, lease_until, claim_token, created_at,
+                       delivered_at, last_error
+                FROM notification_outbox
+                WHERE correlation_id = ?
+                ORDER BY channel_index
+                """,
+                (correlation_id,),
+            ).fetchall()
+        return tuple(self._notification_from_row(row) for row in rows)
+
+    def get_notification_delivery(self, delivery_id: int) -> NotificationDelivery | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id AS delivery_id, correlation_id, channel_index, channel,
+                       title, body, url, recipients_json, status, attempts,
+                       next_attempt_at, lease_until, claim_token, created_at,
+                       delivered_at, last_error
+                FROM notification_outbox WHERE id = ?
+                """,
+                (delivery_id,),
+            ).fetchone()
+        return self._notification_from_row(row) if row is not None else None
+
+    def claim_next_notification(
+        self,
+        lease_seconds: int = DEFAULT_NOTIFICATION_LEASE_SECONDS,
+        max_attempts: int = DEFAULT_NOTIFICATION_MAX_ATTEMPTS,
+    ) -> NotificationDelivery | None:
+        if lease_seconds <= 0:
+            raise ValueError("notification lease_seconds must be positive")
+        if max_attempts <= 0:
+            raise ValueError("notification max_attempts must be positive")
+
+        now = datetime.now(UTC)
+        now_text = now.isoformat()
+        lease_until = (now + timedelta(seconds=lease_seconds)).isoformat()
+        claim_token = uuid4().hex
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                UPDATE notification_outbox
+                SET status = CASE
+                        WHEN attempts >= ? THEN 'failed'
+                        ELSE 'pending'
+                    END,
+                    next_attempt_at = CASE
+                        WHEN attempts >= ? THEN NULL
+                        ELSE ?
+                    END,
+                    lease_until = NULL,
+                    claim_token = NULL,
+                    last_error = CASE
+                        WHEN attempts >= ? THEN 'notification delivery lease expired'
+                        ELSE 'notification delivery lease expired; retrying'
+                    END
+                WHERE status = 'running'
+                  AND (lease_until IS NULL OR lease_until <= ?)
+                """,
+                (max_attempts, max_attempts, now_text, max_attempts, now_text),
+            )
+            row = connection.execute(
+                """
+                SELECT id AS delivery_id, correlation_id, channel_index, channel,
+                       title, body, url, recipients_json, status, attempts,
+                       next_attempt_at, lease_until, claim_token, created_at,
+                       delivered_at, last_error
+                FROM notification_outbox
+                WHERE status = 'pending' AND next_attempt_at <= ?
+                ORDER BY id
+                LIMIT 1
+                """,
+                (now_text,),
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute(
+                """
+                UPDATE notification_outbox
+                SET status = 'running', attempts = attempts + 1,
+                    lease_until = ?, claim_token = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (lease_until, claim_token, row["delivery_id"]),
+            )
+            claimed = connection.execute(
+                """
+                SELECT id AS delivery_id, correlation_id, channel_index, channel,
+                       title, body, url, recipients_json, status, attempts,
+                       next_attempt_at, lease_until, claim_token, created_at,
+                       delivered_at, last_error
+                FROM notification_outbox WHERE id = ?
+                """,
+                (row["delivery_id"],),
+            ).fetchone()
+        assert claimed is not None
+        return self._notification_from_row(claimed)
+
+    def claim_notification(
+        self,
+        delivery_id: int,
+        lease_seconds: int = DEFAULT_NOTIFICATION_LEASE_SECONDS,
+        max_attempts: int = DEFAULT_NOTIFICATION_MAX_ATTEMPTS,
+    ) -> NotificationDelivery | None:
+        if lease_seconds <= 0:
+            raise ValueError("notification lease_seconds must be positive")
+        if max_attempts <= 0:
+            raise ValueError("notification max_attempts must be positive")
+
+        now = datetime.now(UTC)
+        now_text = now.isoformat()
+        lease_until = (now + timedelta(seconds=lease_seconds)).isoformat()
+        claim_token = uuid4().hex
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                UPDATE notification_outbox
+                SET status = CASE
+                        WHEN attempts >= ? THEN 'failed'
+                        ELSE 'pending'
+                    END,
+                    next_attempt_at = CASE
+                        WHEN attempts >= ? THEN NULL
+                        ELSE ?
+                    END,
+                    lease_until = NULL,
+                    claim_token = NULL,
+                    last_error = CASE
+                        WHEN attempts >= ? THEN 'notification delivery lease expired'
+                        ELSE 'notification delivery lease expired; retrying'
+                    END
+                WHERE id = ? AND status = 'running'
+                  AND (lease_until IS NULL OR lease_until <= ?)
+                """,
+                (max_attempts, max_attempts, now_text, max_attempts, delivery_id, now_text),
+            )
+            row = connection.execute(
+                """
+                SELECT id AS delivery_id, correlation_id, channel_index, channel,
+                       title, body, url, recipients_json, status, attempts,
+                       next_attempt_at, lease_until, claim_token, created_at,
+                       delivered_at, last_error
+                FROM notification_outbox
+                WHERE id = ? AND status = 'pending' AND next_attempt_at <= ?
+                """,
+                (delivery_id, now_text),
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute(
+                """
+                UPDATE notification_outbox
+                SET status = 'running', attempts = attempts + 1,
+                    lease_until = ?, claim_token = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (lease_until, claim_token, delivery_id),
+            )
+            claimed = connection.execute(
+                """
+                SELECT id AS delivery_id, correlation_id, channel_index, channel,
+                       title, body, url, recipients_json, status, attempts,
+                       next_attempt_at, lease_until, claim_token, created_at,
+                       delivered_at, last_error
+                FROM notification_outbox WHERE id = ?
+                """,
+                (delivery_id,),
+            ).fetchone()
+        assert claimed is not None
+        return self._notification_from_row(claimed)
+
+    def finish_notification(
+        self,
+        delivery_id: int,
+        delivered: bool,
+        detail: str | None = None,
+        claim_token: str | None = None,
+        max_attempts: int = DEFAULT_NOTIFICATION_MAX_ATTEMPTS,
+        retry_delay_seconds: float = 1.0,
+    ) -> bool:
+        if max_attempts <= 0:
+            raise ValueError("notification max_attempts must be positive")
+        if retry_delay_seconds < 0:
+            raise ValueError("notification retry_delay_seconds cannot be negative")
+        now = datetime.now(UTC)
+        now_text = now.isoformat()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            query = "SELECT attempts FROM notification_outbox WHERE id = ? AND status = 'running'"
+            parameters: tuple[object, ...] = (delivery_id,)
+            if claim_token is not None:
+                query += " AND claim_token = ?"
+                parameters += (claim_token,)
+            row = connection.execute(query, parameters).fetchone()
+            if row is None:
+                return False
+
+            attempts = int(row["attempts"])
+            if delivered:
+                status = "delivered"
+                next_attempt_at = None
+                delivered_at = now_text
+                last_error = None
+            elif attempts >= max_attempts:
+                status = "failed"
+                next_attempt_at = None
+                delivered_at = None
+                last_error = detail or "notification delivery failed"
+            else:
+                status = "pending"
+                delay = retry_delay_seconds * (2 ** max(attempts - 1, 0))
+                next_attempt_at = (now + timedelta(seconds=delay)).isoformat()
+                delivered_at = None
+                last_error = detail or "notification delivery failed; retrying"
+            update_query = (
+                "UPDATE notification_outbox SET status = ?, next_attempt_at = ?, "
+                "lease_until = NULL, claim_token = NULL, delivered_at = ?, last_error = ? "
+                "WHERE id = ? AND status = 'running'"
+            )
+            update_parameters: tuple[object, ...] = (
+                status,
+                next_attempt_at,
+                delivered_at,
+                last_error,
+                delivery_id,
+            )
+            if claim_token is not None:
+                update_query += " AND claim_token = ?"
+                update_parameters += (claim_token,)
+            update = connection.execute(update_query, update_parameters)
+        return update.rowcount == 1
+
+    @staticmethod
+    def _notification_from_row(row: sqlite3.Row) -> NotificationDelivery:
+        values = dict(row)
+        values["recipients"] = tuple(json.loads(values.pop("recipients_json")))
+        return NotificationDelivery(**values)
 
     def record_auto_fix(
         self,

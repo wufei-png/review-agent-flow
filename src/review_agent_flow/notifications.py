@@ -17,6 +17,7 @@ class NotificationEvent:
     body: str
     url: str | None = None
     recipients: tuple[str, ...] = ()
+    correlation_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -70,8 +71,29 @@ class FanoutNotifier:
     def __init__(self, notifiers: tuple[Notifier, ...] = ()) -> None:
         self.notifiers = notifiers
 
+    def channel_specs(self) -> tuple[tuple[int, str], ...]:
+        return tuple(
+            (index, str(getattr(notifier, "channel", f"channel-{index}")))
+            for index, notifier in enumerate(self.notifiers)
+        )
+
+    def notify_channel(self, event: NotificationEvent, channel_index: int) -> NotificationResult:
+        if channel_index < 0 or channel_index >= len(self.notifiers):
+            return NotificationResult(
+                f"channel-{channel_index}", False, "notification channel is not configured"
+            )
+        notifier = self.notifiers[channel_index]
+        try:
+            return notifier.notify(event)
+        except Exception as exc:  # noqa: BLE001 - one channel must not stop fanout
+            channel = str(getattr(notifier, "channel", f"channel-{channel_index}"))
+            return NotificationResult(channel, False, str(exc))
+
     def notify(self, event: NotificationEvent) -> tuple[NotificationResult, ...]:
-        return tuple(notifier.notify(event) for notifier in self.notifiers)
+        return tuple(
+            self.notify_channel(event, channel_index)
+            for channel_index, _channel in self.channel_specs()
+        )
 
 
 def notifiers_from_policy(channels: tuple[dict[str, object], ...]) -> FanoutNotifier:

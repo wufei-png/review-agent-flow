@@ -109,3 +109,95 @@ def test_auto_fix_merge_before_relation_write_is_preserved(tmp_path) -> None:
     assert relation.status == "merged"
     assert relation.merged_sha == "merged-parent-sha"
     assert store.is_suppressed_parent_sha("42", 1, "merged-parent-sha") is True
+
+
+def test_notification_outbox_is_idempotent_per_channel(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "review.db")
+    first = store.enqueue_notifications(
+        "review-run:1:human",
+        "Review requested",
+        "Please review",
+        "https://mr",
+        ("alice",),
+        ((0, "feishu"), (1, "wecom")),
+    )
+    duplicate = store.enqueue_notifications(
+        "review-run:1:human",
+        "Review requested",
+        "Please review",
+        "https://mr",
+        ("alice",),
+        ((0, "feishu"), (1, "wecom")),
+    )
+    assert [item.delivery_id for item in duplicate] == [item.delivery_id for item in first]
+    claimed = store.claim_next_notification()
+    assert claimed is not None
+    assert claimed.channel == "feishu"
+    assert claimed.recipients == ("alice",)
+    assert claimed.attempts == 1
+    assert store.finish_notification(
+        claimed.delivery_id, True, claim_token=claimed.claim_token
+    )
+    next_delivery = store.claim_next_notification()
+    assert next_delivery is not None
+    assert next_delivery.channel == "wecom"
+
+
+def test_notification_outbox_retries_then_records_terminal_failure(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "review.db")
+    deliveries = store.enqueue_notifications(
+        "review-run:2:autofix",
+        "Auto-fix review",
+        "Please review",
+        None,
+        ("alice",),
+        ((0, "feishu"),),
+    )
+    delivery_id = deliveries[0].delivery_id
+    for attempt in range(3):
+        claimed = store.claim_next_notification()
+        assert claimed is not None
+        assert claimed.delivery_id == delivery_id
+        assert claimed.attempts == attempt + 1
+        assert store.finish_notification(
+            delivery_id,
+            False,
+            "timeout",
+            claim_token=claimed.claim_token,
+            retry_delay_seconds=0,
+        )
+    terminal = store.get_notification_delivery(delivery_id)
+    assert terminal is not None
+    assert terminal.status == "failed"
+    assert terminal.attempts == 3
+    assert terminal.last_error == "timeout"
+    assert store.claim_next_notification() is None
+
+
+def test_stale_notification_claim_cannot_finish_reclaimed_delivery(tmp_path) -> None:
+    database = tmp_path / "review.db"
+    store = SQLiteStore(database)
+    deliveries = store.enqueue_notifications(
+        "review-run:3:human",
+        "Review requested",
+        "Please review",
+        None,
+        (),
+        ((0, "feishu"),),
+    )
+    first = store.claim_next_notification(lease_seconds=60)
+    assert first is not None
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE notification_outbox SET lease_until = ? WHERE id = ?",
+            ("2000-01-01T00:00:00+00:00", deliveries[0].delivery_id),
+        )
+    reclaimed = store.claim_next_notification(lease_seconds=60)
+    assert reclaimed is not None
+    assert reclaimed.claim_token != first.claim_token
+    assert store.finish_notification(
+        deliveries[0].delivery_id, True, claim_token=first.claim_token
+    ) is False
+    assert store.finish_notification(
+        deliveries[0].delivery_id, True, claim_token=reclaimed.claim_token
+    ) is True

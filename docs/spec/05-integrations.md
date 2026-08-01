@@ -19,6 +19,8 @@ The adapter should use `python-gitlab` behind a narrow interface so the domain a
 
 The first release supports both Feishu and WeCom. A Project may configure both channels. Normal human review can notify configured reviewers; Auto-fix MR notifications go only to the original parent MR creator. Channel credentials and identity mappings are runtime secrets/configuration, not committed policy content. Notification payloads include the event title, body and optional URL.
 
+The Worker writes one SQLite outbox record per configured channel before attempting delivery. A channel failure does not fail or roll back the Review Run, and does not prevent another channel from being delivered. Failed deliveries retry up to three attempts with exponential delay and remain auditable as `failed` after the final attempt. Delivery is at-least-once across a Worker crash between provider delivery and outbox acknowledgement, so providers may receive a duplicate.
+
 Each notifier should implement a small common interface such as:
 
 ```python

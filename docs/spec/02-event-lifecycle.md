@@ -8,7 +8,7 @@
 4. 若 Project 启用 Pipeline Gate，Worker 将对应 Run 延后到下一次可检查时间；等待中的 Run 不阻塞后续已就绪 Run。
 5. Store 以 `(project_id, mr_iid, sha, kind=normal)` 去重并创建 `pending` Review Run。
 6. Worker 以租约 claim 一个可执行的 pending Run，创建该 SHA 的独立 worktree；租约过期的 Run 最多自动恢复三次。
-7. Worker 按 Policy 触发 Human Review 和/或 Agent Review。两条路径互不依赖。
+7. Worker 按 Policy 将 Human 通知写入按渠道拆分的 outbox，并触发 Human Review 和/或 Agent Review；通知投递失败不改变 Review Run 状态，两条路径互不依赖。
 8. Agent 直接提交 Note；如果 Policy 允许并且 Agent 判断需要修复，则创建 Auto-fix MR。
 9. Worker 记录成功、失败或取消，清理 worktree。
 
