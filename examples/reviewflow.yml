@@ -1,0 +1,23 @@
+version: 1
+
+pipeline_gate: true
+
+human:
+  enabled: true
+  reviewers:
+    - gitlab-username
+
+ai:
+  enabled: false
+  command:
+    - opencode
+    - run
+  skill: .gitlab/review-agent/SKILL.md
+  auto_fix: false
+
+notifications:
+  channels:
+    - type: feishu
+      webhook_env: FEISHU_WEBHOOK
+    - type: wecom
+      webhook_env: WECOM_WEBHOOK

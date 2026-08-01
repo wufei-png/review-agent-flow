@@ -1,0 +1,48 @@
+"""FastAPI webhook surface."""
+
+from __future__ import annotations
+
+import hmac
+import os
+from typing import Any
+
+from fastapi import FastAPI, Header, HTTPException
+
+from .store import SQLiteStore
+
+
+def create_app(store: SQLiteStore | None = None, webhook_secret: str | None = None) -> FastAPI:
+    store = store or SQLiteStore(os.getenv("REVIEW_AGENT_FLOW_DB", "review-agent-flow.sqlite3"))
+    webhook_secret = webhook_secret or os.getenv("GITLAB_WEBHOOK_SECRET")
+    app = FastAPI(title="Review Agent Flow", version="0.1.0")
+
+    @app.get("/health")
+    def health() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @app.post("/webhooks/gitlab")
+    def gitlab_webhook(
+        payload: dict[str, Any],
+        x_gitlab_token: str | None = Header(default=None),
+        x_gitlab_event: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        if webhook_secret is not None and not hmac.compare_digest(x_gitlab_token or "", webhook_secret):
+            raise HTTPException(status_code=401, detail="invalid GitLab webhook token")
+        if x_gitlab_event not in {None, "Merge Request Hook"}:
+            return {"accepted": False, "reason": "unsupported event"}
+
+        attrs = payload.get("object_attributes") or {}
+        project = payload.get("project") or {}
+        last_commit = attrs.get("last_commit") or {}
+        project_id = str(project.get("id") or payload.get("project_id") or "")
+        mr_iid = attrs.get("iid")
+        sha = last_commit.get("id") or attrs.get("last_commit_id")
+        if not project_id or not isinstance(mr_iid, int) or not sha:
+            return {"accepted": False, "reason": "missing project, MR IID, or SHA"}
+        if attrs.get("work_in_progress") is True:
+            return {"accepted": False, "reason": "draft merge request"}
+
+        run = store.enqueue(project_id, mr_iid, str(sha))
+        return {"accepted": True, "run_id": run.run_id, "status": run.status}
+
+    return app
