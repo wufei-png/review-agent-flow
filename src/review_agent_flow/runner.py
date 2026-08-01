@@ -18,6 +18,7 @@ class AgentContext:
     worktree: Path
     skill_path: Path | None = None
     gitlab_token: str | None = None
+    auto_fix_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,7 @@ class LocalCliAgentRunner:
                 "REVIEW_AGENT_FLOW_MR_IID": str(context.mr_iid),
                 "REVIEW_AGENT_FLOW_SHA": context.sha,
                 "REVIEW_AGENT_FLOW_GITLAB_URL": context.gitlab_url,
+                "REVIEW_AGENT_FLOW_AUTO_FIX_ENABLED": str(context.auto_fix_enabled).lower(),
             }
         )
         if context.skill_path is not None:

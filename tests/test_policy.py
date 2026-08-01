@@ -45,3 +45,10 @@ def test_rejects_invalid_policy(tmp_path: Path) -> None:
     path.write_text("ai:\n  enabled: maybe\n", encoding="utf-8")
     with pytest.raises(PolicyError):
         load_policy(path)
+
+
+def test_ai_enabled_requires_a_command(tmp_path: Path) -> None:
+    path = tmp_path / "reviewflow.yml"
+    path.write_text("ai:\n  enabled: true\n", encoding="utf-8")
+    with pytest.raises(PolicyError, match="ai.command"):
+        load_policy(path)

@@ -8,6 +8,7 @@ from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException
 
+from .events import parse_webhook
 from .store import SQLiteStore
 
 
@@ -28,21 +29,25 @@ def create_app(store: SQLiteStore | None = None, webhook_secret: str | None = No
     ) -> dict[str, Any]:
         if webhook_secret is not None and not hmac.compare_digest(x_gitlab_token or "", webhook_secret):
             raise HTTPException(status_code=401, detail="invalid GitLab webhook token")
-        if x_gitlab_event not in {None, "Merge Request Hook"}:
-            return {"accepted": False, "reason": "unsupported event"}
-
-        attrs = payload.get("object_attributes") or {}
-        project = payload.get("project") or {}
-        last_commit = attrs.get("last_commit") or {}
-        project_id = str(project.get("id") or payload.get("project_id") or "")
-        mr_iid = attrs.get("iid")
-        sha = last_commit.get("id") or attrs.get("last_commit_id")
-        if not project_id or not isinstance(mr_iid, int) or not sha:
-            return {"accepted": False, "reason": "missing project, MR IID, or SHA"}
-        if attrs.get("work_in_progress") is True:
-            return {"accepted": False, "reason": "draft merge request"}
-
-        run = store.enqueue(project_id, mr_iid, str(sha))
-        return {"accepted": True, "run_id": run.run_id, "status": run.status}
+        decision = parse_webhook(x_gitlab_event, payload)
+        if not decision.accepted:
+            return {"accepted": False, "reason": decision.reason}
+        assert decision.project_id is not None
+        assert decision.mr_iid is not None
+        assert decision.sha is not None
+        if decision.kind == "autofix_merged":
+            store.mark_auto_fix_merged(decision.project_id, decision.mr_iid, decision.sha)
+            return {
+                "accepted": True,
+                "kind": decision.kind,
+                "merged_sha": decision.sha,
+            }
+        run = store.enqueue(decision.project_id, decision.mr_iid, decision.sha, decision.kind or "normal")
+        return {
+            "accepted": True,
+            "kind": decision.kind,
+            "run_id": run.run_id,
+            "status": run.status,
+        }
 
     return app

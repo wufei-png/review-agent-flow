@@ -72,6 +72,14 @@ def _as_reviewers(value: Any) -> tuple[str, ...]:
     return tuple(value)
 
 
+def _as_optional_string(value: Any, field_name: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise PolicyError(f"{field_name} must be a non-empty string")
+    return value
+
+
 def load_policy(path: str | Path | None = None) -> ReviewPolicy:
     """Load an optional Project policy, falling back to safe defaults."""
 
@@ -100,6 +108,17 @@ def load_policy(path: str | Path | None = None) -> ReviewPolicy:
     if not isinstance(channels, list) or not all(isinstance(item, dict) for item in channels):
         raise PolicyError("notifications.channels must be a list of mappings")
 
+    ai_policy = AIPolicy(
+        enabled=_as_bool(ai.get("enabled"), "ai.enabled", False),
+        command=_as_command(ai.get("command")),
+        skill_path=_as_optional_string(ai.get("skill"), "ai.skill"),
+        auto_fix=_as_bool(ai.get("auto_fix"), "ai.auto_fix", False),
+    )
+    if ai_policy.enabled and not ai_policy.command:
+        raise PolicyError("ai.command is required when ai.enabled is true")
+    if ai_policy.auto_fix and not ai_policy.enabled:
+        raise PolicyError("ai.auto_fix requires ai.enabled to be true")
+
     return ReviewPolicy(
         version=version,
         pipeline_gate=_as_bool(raw.get("pipeline_gate"), "pipeline_gate", False),
@@ -107,12 +126,7 @@ def load_policy(path: str | Path | None = None) -> ReviewPolicy:
             enabled=_as_bool(human.get("enabled"), "human.enabled", True),
             reviewers=_as_reviewers(human.get("reviewers")),
         ),
-        ai=AIPolicy(
-            enabled=_as_bool(ai.get("enabled"), "ai.enabled", False),
-            command=_as_command(ai.get("command")),
-            skill_path=ai.get("skill") if isinstance(ai.get("skill"), str) else None,
-            auto_fix=_as_bool(ai.get("auto_fix"), "ai.auto_fix", False),
-        ),
+        ai=ai_policy,
         notifications=NotificationPolicy(channels=tuple(channels)),
     )
 
