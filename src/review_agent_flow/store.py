@@ -1057,6 +1057,21 @@ class SQLiteStore:
             )
         return cursor.rowcount == 1
 
+    def mark_worktree_not_created(self, cleanup_id: int, detail: str) -> bool:
+        """Retain a failed reservation without authorizing deletion of its path."""
+
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE worktree_cleanup
+                SET status = 'skipped', cleaned_at = ?, last_error = ?,
+                    next_attempt_at = NULL, lease_until = NULL, claim_token = NULL
+                WHERE id = ? AND status = 'active'
+                """,
+                (self._now().isoformat(), detail, cleanup_id),
+            )
+        return cursor.rowcount == 1
+
     def mark_worktree_cleaned(self, cleanup_id: int, claim_token: str | None = None) -> bool:
         query = (
             "UPDATE worktree_cleanup SET status = 'cleaned', cleaned_at = ?, "

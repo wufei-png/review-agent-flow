@@ -46,4 +46,5 @@
 - A Pipeline Hook never creates a standalone Run; when Gate is enabled it wakes an existing deferred normal Run for the same SHA.
 - A title/branch-only Auto-fix lookalike follows the normal path; only a server-owned intent/relation enters the Auto-fix path.
 - Auto-fix reconciliation verifies the Run/SHA marker, abandons a terminal intent with no child MR, paginates trusted Review Bot Note markers, and prunes missing worktree metadata.
+- Policy schema v2 makes stable notification channel IDs explicit; v1 policies require an intentional config update before loading.
 - A missing local SHA is fetched only through the explicit locked and bounded `ensure_sha` step before worktree creation.

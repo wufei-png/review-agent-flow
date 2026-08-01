@@ -17,7 +17,7 @@ def test_loads_project_policy(tmp_path: Path) -> None:
     path.parent.mkdir()
     path.write_text(
         """
-version: 1
+version: 2
 pipeline_gate: true
 human:
   reviewers: [alice, bob]
@@ -62,4 +62,11 @@ def test_rejects_unknown_version_one_fields(tmp_path: Path) -> None:
     path = tmp_path / "reviewflow.yml"
     path.write_text("pipeline_gat: true\n", encoding="utf-8")
     with pytest.raises(PolicyError, match="unknown fields"):
+        load_policy(path)
+
+
+def test_requires_explicit_policy_schema_upgrade(tmp_path: Path) -> None:
+    path = tmp_path / "reviewflow.yml"
+    path.write_text("version: 1\n", encoding="utf-8")
+    with pytest.raises(PolicyError, match="unsupported policy version: 1"):
         load_policy(path)

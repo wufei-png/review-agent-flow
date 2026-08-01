@@ -24,7 +24,7 @@ from .store import (
     SQLiteStore,
     auto_fix_intent_marker,
 )
-from .worktree import GitWorktreeManager
+from .worktree import GitWorktreeManager, WorktreeError
 
 DEFAULT_REVIEW_AGENT_SKILL = (
     Path(__file__).resolve().parent / "defaults" / "review-agent" / "SKILL.md"
@@ -76,6 +76,8 @@ class ReviewWorker:
         self.retry_delay_seconds = retry_delay_seconds
         self.notification_lease_seconds = notification_lease_seconds
         self.notification_max_attempts = notification_max_attempts
+        if not project_id or not project_id.strip():
+            raise ValueError("project_id is required for a ReviewWorker")
         self.project_id = project_id
         self.sha_ensurer = sha_ensurer or GitShaEnsurer(repository)
         self.worktree_cleanup_lease_seconds = worktree_cleanup_lease_seconds
@@ -89,8 +91,10 @@ class ReviewWorker:
         if run is None:
             return None
 
+        auto_fix_intent = None
+        agent_started = False
         try:
-            if self.project_id is not None and run.project_id != self.project_id:
+            if run.project_id != self.project_id:
                 raise ValueError("Review Run belongs to a different configured Project")
             merge_request = self.gitlab.get_merge_request(run.project_id, run.mr_iid)
             if merge_request.draft:
@@ -139,7 +143,6 @@ class ReviewWorker:
                 return WorkerResult(run.run_id, "succeeded", detail="human path only")
 
             self.sha_ensurer.ensure_sha(run.sha)
-            auto_fix_intent = None
             if self.policy.ai.auto_fix:
                 auto_fix_intent = self.store.create_auto_fix_intent(
                     parent_project_id=run.project_id,
@@ -152,70 +155,105 @@ class ReviewWorker:
                 )
 
             worktree_id = str(run.run_id) if run.attempts <= 1 else f"{run.run_id}-attempt-{run.attempts}"
-            worktree = self.worktrees.create(run.sha, worktree_id)
-            try:
-                cleanup_record = self.store.register_worktree(run.run_id, worktree, run.sha)
-            except Exception:
-                try:
-                    self.worktrees.remove(worktree)
-                except Exception:
-                    LOGGER.exception(
-                        "worktree cleanup after registration failure failed for Run %s",
-                        run.run_id,
-                    )
-                raise
+            worktree = self.worktrees.path_for(worktree_id)
+            if worktree.exists():
+                raise WorktreeError(f"worktree path already exists: {worktree}")
+            cleanup_record = self.store.register_worktree(run.run_id, worktree, run.sha)
             agent_result: AgentResult | None = None
             run_status = "succeeded"
             detail = ""
             auto_fix_created = False
             auto_fix_reconciliation_complete = not self.policy.ai.auto_fix
+            worktree_created = False
+            retry_reason: str | None = None
             try:
-                marker = f"ReviewFlow-Run-ID:{run.run_id} SHA:{run.sha}"
-                has_marker = False
-                has_note_marker = getattr(self.gitlab, "has_note_marker", None)
-                if callable(has_note_marker):
-                    has_marker = bool(
-                        has_note_marker(run.project_id, run.mr_iid, marker)
-                    )
-                if has_marker:
-                    agent_result = AgentResult(
-                        returncode=0,
-                        stdout="",
-                        stderr="review marker already exists; skipped duplicate Agent run",
-                    )
-                else:
-                    agent_result = self._run_agent(
-                        run,
-                        merge_request,
-                        worktree,
-                        auto_fix_intent,
-                        marker,
-                    )
-                if agent_result.returncode != 0:
-                    run_status = "failed"
-                    detail = agent_result.stderr[-4000:] or "Agent failed"
-                auto_fix_created = self._record_auto_fix_if_created(run, merge_request)
-                auto_fix_reconciliation_complete = True
+                try:
+                    self.worktrees.create(run.sha, worktree_id)
+                except Exception as exc:
+                    self.store.mark_worktree_not_created(cleanup_record.cleanup_id, str(exc))
+                    raise
+                worktree_created = True
+                if self.policy.ai.auto_fix:
+                    try:
+                        auto_fix_created = self._record_auto_fix_if_created(run, merge_request)
+                    except Exception as exc:  # noqa: BLE001 - external GitLab lookup is retryable
+                        retry_reason = f"Auto-fix reconciliation lookup failed: {exc}"
+                if retry_reason is None:
+                    marker = f"ReviewFlow-Run-ID:{run.run_id} SHA:{run.sha}"
+                    has_marker = False
+                    has_note_marker = getattr(self.gitlab, "has_note_marker", None)
+                    if callable(has_note_marker):
+                        has_marker = bool(
+                            has_note_marker(run.project_id, run.mr_iid, marker)
+                        )
+                    if has_marker and (not self.policy.ai.auto_fix or auto_fix_created):
+                        agent_result = AgentResult(
+                            returncode=0,
+                            stdout="",
+                            stderr=(
+                                "review marker and Auto-fix MR already exist; "
+                                "skipped duplicate Agent run"
+                                if auto_fix_created
+                                else "review marker already exists; skipped duplicate Agent run"
+                            ),
+                        )
+                    else:
+                        agent_started = True
+                        agent_result = self._run_agent(
+                            run,
+                            merge_request,
+                            worktree,
+                            auto_fix_intent,
+                            marker,
+                        )
+                    if agent_result.returncode != 0:
+                        run_status = "failed"
+                        detail = agent_result.stderr[-4000:] or "Agent failed"
+                    if self.policy.ai.auto_fix and agent_started:
+                        try:
+                            auto_fix_created = (
+                                self._record_auto_fix_if_created(run, merge_request)
+                                or auto_fix_created
+                            )
+                        except Exception as exc:  # noqa: BLE001 - external GitLab lookup is retryable
+                            retry_reason = f"Auto-fix reconciliation lookup failed: {exc}"
+                    if retry_reason is None:
+                        auto_fix_reconciliation_complete = True
+                if retry_reason is not None:
+                    run_status = "deferred"
+                    detail = retry_reason
             except Exception as exc:
                 run_status = "failed"
                 detail = str(exc)
                 LOGGER.exception("Agent side-effect reconciliation failed for Run %s", run.run_id)
             finally:
-                try:
-                    self.worktrees.remove(worktree)
-                    self.store.mark_worktree_cleaned(cleanup_record.cleanup_id)
-                except Exception as exc:
-                    cleanup_detail = str(exc)
-                    self.store.mark_worktree_cleanup_pending(
-                        cleanup_record.cleanup_id, cleanup_detail
-                    )
-                    detail = f"{detail}; worktree cleanup pending: {cleanup_detail}".strip("; ")
-                    LOGGER.exception("worktree cleanup failed for Run %s", run.run_id)
+                if worktree_created:
+                    try:
+                        self.worktrees.remove(worktree)
+                        self.store.mark_worktree_cleaned(cleanup_record.cleanup_id)
+                    except Exception as exc:
+                        cleanup_detail = str(exc)
+                        self.store.mark_worktree_cleanup_pending(
+                            cleanup_record.cleanup_id, cleanup_detail
+                        )
+                        detail = f"{detail}; worktree cleanup pending: {cleanup_detail}".strip("; ")
+                        LOGGER.exception("worktree cleanup failed for Run %s", run.run_id)
+
+            if retry_reason is not None:
+                self.store.requeue(
+                    run.run_id,
+                    retry_reason,
+                    delay_seconds=self.retry_delay_seconds,
+                    claim_token=run.claim_token,
+                )
+                return WorkerResult(run.run_id, "deferred", agent_result, detail)
 
             if (
                 auto_fix_intent is not None
-                and auto_fix_reconciliation_complete
-                and not auto_fix_created
+                and (
+                    (not agent_started and run_status == "failed")
+                    or (auto_fix_reconciliation_complete and not auto_fix_created)
+                )
             ):
                 self.store.abandon_auto_fix_intent(run.run_id)
 
@@ -227,6 +265,11 @@ class ReviewWorker:
             )
             return WorkerResult(run.run_id, run_status, agent_result, detail)
         except Exception as exc:  # noqa: BLE001 - a failed Run must be persisted
+            if auto_fix_intent is not None and not agent_started:
+                try:
+                    self.store.abandon_auto_fix_intent(run.run_id)
+                except Exception:
+                    LOGGER.exception("failed to abandon unused Auto-fix intent for Run %s", run.run_id)
             self.store.finish(run.run_id, "failed", str(exc), claim_token=run.claim_token)
             return WorkerResult(run.run_id, "failed", detail=str(exc))
 

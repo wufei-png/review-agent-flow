@@ -78,7 +78,7 @@ review-agent-flow worker --once
 
 Docker 镜像默认启动 Webhook API；API 需要 `GITLAB_WEBHOOK_SECRET`、`REVIEW_AGENT_FLOW_PROJECT_ID`，并可用 `REVIEW_AGENT_FLOW_PIPELINE_GATE=true|false` 配置 Pipeline Hook 唤醒行为。Worker 建议作为同镜像的独立进程或独立容器运行，并共享数据库、Project checkout 和 worktree 根目录。`GITLAB_REVIEW_BOT_USERNAME` 用于只信任 Review Bot 的 Note marker；未配置时会安全地重复执行，而不会把任意用户 Note 当作完成证明。Repository 必须可写、非 shallow；Worker 在创建 worktree 前会对缺失 SHA 加仓库锁并限时 fetch/recheck。
 
-当前 SQLite 为 schema v2 的新结构；没有历史数据库迁移契约。升级前应备份并重建旧数据库，避免旧的 channel index 被错误映射。
+当前 Policy schema 为 v2（通知 channel 必须有稳定 ID），SQLite 为 schema v2 的新结构；没有历史配置或数据库迁移契约。升级前应显式更新旧 Policy，并备份后重建旧数据库，避免旧的 channel index 被错误映射。
 
 ## License
 

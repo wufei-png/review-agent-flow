@@ -2,6 +2,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from review_agent_flow.gitlab import CreatedMergeRequest, MergeRequest, Pipeline
 from review_agent_flow.notifications import FanoutNotifier, NotificationEvent, NotificationResult
 from review_agent_flow.policy import AIPolicy, HumanPolicy, ReviewPolicy
@@ -101,6 +103,7 @@ def test_worker_runs_agent_in_exact_sha_worktree_and_cleans_it(tmp_path: Path) -
         policy,
         repository,
         "https://gitlab",
+        project_id="42",
         notifier=notifier,
     )
     result = worker.process_one()
@@ -132,6 +135,7 @@ def test_worker_abandons_auto_fix_intent_when_no_child_mr_is_found(tmp_path: Pat
         ),
         repository,
         "https://gitlab",
+        project_id="42",
     )
 
     result = worker.process_one()
@@ -141,7 +145,123 @@ def test_worker_abandons_auto_fix_intent_when_no_child_mr_is_found(tmp_path: Pat
     assert intent is not None and intent.status == "abandoned"
 
 
-def test_worktree_registration_failure_is_compensated(tmp_path: Path) -> None:
+def test_worker_retries_agent_for_auto_fix_when_only_note_exists(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    sha = _git_repository(repository)
+    mr = MergeRequest("42", 1, "Improve validation", "alice", "feature", "main", sha, "https://mr")
+
+    class RecoveringGitLab(FakeGitLab):
+        def __init__(self, merge_request: MergeRequest) -> None:
+            super().__init__(merge_request)
+            self.lookups = 0
+
+        def has_note_marker(self, project_id: str, mr_iid: int, marker: str) -> bool:
+            return True
+
+        def find_merge_request_by_source_branch(
+            self,
+            project_id: str,
+            source_branch: str,
+            target_branch: str,
+            marker: str | None = None,
+        ) -> CreatedMergeRequest | None:
+            self.lookups += 1
+            if self.lookups == 1:
+                return None
+            return CreatedMergeRequest(
+                project_id,
+                2,
+                "[ReviewFlow Auto-Fix] Improve validation",
+                source_branch,
+                target_branch,
+                "auto-fix-url",
+                marker or "",
+            )
+
+    store = SQLiteStore(tmp_path / "review.db")
+    run = store.enqueue("42", 1, sha)
+    worker = ReviewWorker(
+        store,
+        RecoveringGitLab(mr),
+        GitWorktreeManager(repository, tmp_path / "worktrees"),
+        ReviewPolicy(
+            ai=AIPolicy(
+                enabled=True,
+                auto_fix=True,
+                command=(sys.executable, "-c", "print('recovered')"),
+            )
+        ),
+        repository,
+        "https://gitlab",
+        project_id="42",
+    )
+
+    result = worker.process_one()
+
+    assert result is not None and result.status == "succeeded"
+    assert result.agent_result is not None
+    assert result.agent_result.stdout.strip() == "recovered"
+    intent = store.get_auto_fix_intent(run.run_id)
+    assert intent is not None and intent.status == "created"
+
+
+def test_auto_fix_lookup_failure_requeues_without_running_agent(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    sha = _git_repository(repository)
+    mr = MergeRequest("42", 1, "Improve validation", "alice", "feature", "main", sha, "https://mr")
+
+    class FailingLookupGitLab(FakeGitLab):
+        def find_merge_request_by_source_branch(
+            self,
+            project_id: str,
+            source_branch: str,
+            target_branch: str,
+            marker: str | None = None,
+        ) -> CreatedMergeRequest | None:
+            raise RuntimeError("GitLab unavailable")
+
+    store = SQLiteStore(tmp_path / "review.db")
+    run = store.enqueue("42", 1, sha)
+    worker = ReviewWorker(
+        store,
+        FailingLookupGitLab(mr),
+        GitWorktreeManager(repository, tmp_path / "worktrees"),
+        ReviewPolicy(
+            ai=AIPolicy(
+                enabled=True,
+                auto_fix=True,
+                command=(sys.executable, "-c", "raise SystemExit('Agent must not run')"),
+            )
+        ),
+        repository,
+        "https://gitlab",
+        project_id="42",
+        retry_delay_seconds=0,
+    )
+
+    result = worker.process_one()
+
+    assert result is not None and result.status == "deferred"
+    assert result.agent_result is None
+    assert store.get_auto_fix_intent(run.run_id).status == "planned"
+    assert store.claim_next().run_id == run.run_id
+
+
+def test_worker_requires_project_binding(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="project_id"):
+        ReviewWorker(
+            SQLiteStore(tmp_path / "review.db"),
+            object(),
+            object(),
+            ReviewPolicy(),
+            tmp_path,
+            "https://gitlab",
+        )
+
+
+def test_worktree_registration_failure_does_not_create_an_untracked_worktree(tmp_path: Path) -> None:
     repository = tmp_path / "repo"
     repository.mkdir()
     sha = _git_repository(repository)
@@ -161,22 +281,63 @@ def test_worktree_registration_failure_is_compensated(tmp_path: Path) -> None:
             super().remove(path)
 
     store = FailingStore(tmp_path / "review.db")
-    store.enqueue("42", 1, sha)
+    run = store.enqueue("42", 1, sha)
     worktrees = RecordingManager(repository, tmp_path / "worktrees")
     worker = ReviewWorker(
         store,
         FakeGitLab(mr),
         worktrees,
-        ReviewPolicy(ai=AIPolicy(enabled=True, command=(sys.executable, "-c", "print('reviewed')"))),
+        ReviewPolicy(
+            ai=AIPolicy(
+                enabled=True,
+                auto_fix=True,
+                command=(sys.executable, "-c", "print('reviewed')"),
+            )
+        ),
         repository,
         "https://gitlab",
+        project_id="42",
     )
 
     result = worker.process_one()
 
     assert result is not None and result.status == "failed"
-    assert worktrees.removed == [tmp_path / "worktrees" / "run-1"]
-    assert not worktrees.removed[0].exists()
+    assert worktrees.removed == []
+    assert not worktrees.path_for("1").exists()
+    assert store.get_auto_fix_intent(run.run_id).status == "abandoned"
+
+
+def test_preexisting_worktree_is_not_deleted_on_path_conflict(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    sha = _git_repository(repository)
+    mr = MergeRequest("42", 1, "Improve validation", "alice", "feature", "main", sha, "https://mr")
+    worktrees = GitWorktreeManager(repository, tmp_path / "worktrees")
+    existing = worktrees.create(sha, "1")
+    store = SQLiteStore(tmp_path / "review.db")
+    store.enqueue("42", 1, sha)
+    worker = ReviewWorker(
+        store,
+        FakeGitLab(mr),
+        worktrees,
+        ReviewPolicy(
+            ai=AIPolicy(
+                enabled=True,
+                auto_fix=True,
+                command=(sys.executable, "-c", "print('reviewed')"),
+            )
+        ),
+        repository,
+        "https://gitlab",
+        project_id="42",
+    )
+
+    result = worker.process_one()
+
+    assert result is not None and result.status == "failed"
+    assert existing.exists()
+    assert store.get_worktree_record(1) is None
+    assert store.get_auto_fix_intent(1).status == "abandoned"
 
 
 def test_worktree_cleanup_failure_is_retried_without_rerunning_agent(tmp_path: Path) -> None:
@@ -210,6 +371,7 @@ def test_worktree_cleanup_failure_is_retried_without_rerunning_agent(tmp_path: P
         ),
         repository,
         "https://gitlab",
+        project_id="42",
         retry_delay_seconds=0,
     )
     result = worker.process_one()
@@ -246,6 +408,7 @@ def test_worker_uses_packaged_skill_when_project_skill_is_missing(tmp_path: Path
         policy,
         repository,
         "https://gitlab",
+        project_id="42",
     )
     result = worker.process_one()
     assert result is not None
@@ -271,6 +434,7 @@ def test_worker_requeues_draft_mr_before_human_or_ai_paths(tmp_path: Path) -> No
         ReviewPolicy(human=HumanPolicy(enabled=True, reviewers=("alice",))),
         repository,
         "https://gitlab",
+        project_id="42",
         notifier=notifier,
         retry_delay_seconds=3600,
     )
@@ -294,6 +458,7 @@ def test_notification_failure_does_not_fail_review_run_and_is_retried(tmp_path: 
         ReviewPolicy(human=HumanPolicy(enabled=True, reviewers=("alice",))),
         repository,
         "https://gitlab",
+        project_id="42",
         notifier=notifier,
         retry_delay_seconds=0,
     )
@@ -337,6 +502,7 @@ def test_notification_channels_are_isolated_and_terminal_failure_is_audited(tmp_
         ReviewPolicy(human=HumanPolicy(enabled=True, reviewers=("alice",))),
         repository,
         "https://gitlab",
+        project_id="42",
         notifier=notifier,
         retry_delay_seconds=0,
     )

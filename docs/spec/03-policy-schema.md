@@ -5,7 +5,7 @@ The optional file is `.gitlab/reviewflow.yml`. If absent, the service uses the s
 ## Example
 
 ```yaml
-version: 1
+version: 2
 
 pipeline_gate: true
 
@@ -36,7 +36,7 @@ notifications:
 
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `version` | integer | `1` | Schema version; unknown versions are rejected |
+| `version` | integer | `2` | Schema version; unknown versions are rejected |
 | `pipeline_gate` | boolean | `false` | Wait for the latest successful Pipeline before a normal Run |
 | `human.enabled` | boolean | `true` | Enable human notification/review path |
 | `human.reviewers` | list of strings | `[]` | GitLab usernames; no CODEOWNERS lookup in v0.1 |
@@ -50,7 +50,7 @@ notifications:
 | `notifications.channels[].webhook_env` | non-empty string | required | Runtime environment variable containing the webhook URL |
 | `notifications.channels[].user_ids` | mapping of strings | `{}` | Optional GitLab username to provider user-ID mapping |
 
-For version 1, unknown fields and malformed known fields must fail startup or policy loading rather than silently changing behavior. Future schema versions may define their own compatibility rules.
+For version 2, unknown fields and malformed known fields must fail startup or policy loading rather than silently changing behavior. Version 1 policies are intentionally outside the current contract; add explicit channel IDs and update the version before loading them. Future schema versions may define their own compatibility rules.
 
 ## Precedence
 

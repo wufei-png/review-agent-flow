@@ -21,9 +21,12 @@ class GitWorktreeManager:
         if self.timeout_seconds <= 0:
             raise ValueError("worktree timeout_seconds must be positive")
 
+    def path_for(self, run_id: str) -> Path:
+        return self.root / f"run-{run_id}"
+
     def create(self, sha: str, run_id: str) -> Path:
         self.root.mkdir(parents=True, exist_ok=True)
-        target = self.root / f"run-{run_id}"
+        target = self.path_for(run_id)
         if target.exists():
             raise WorktreeError(f"worktree path already exists: {target}")
         self._git("worktree", "add", "--detach", str(target), sha)
