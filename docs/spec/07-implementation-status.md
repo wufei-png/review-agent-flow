@@ -23,7 +23,7 @@
 
 1. Add real GitLab sandbox verification for Note, branch and Auto-fix MR APIs.
 2. Add Pipeline webhook fixtures for GitLab versions used by deployments.
-3. Add retry/backoff and durable lease expiry for long-running Worker claims.
+3. Add configurable retry/backoff policy and durable notification delivery records.
 4. Add full recipient identity lookup/mapping for Feishu and WeCom.
 5. Add real Agent CLI contract tests and Auto-fix MR creation fixtures.
 6. Add Postgres/Redis implementations when multi-instance deployment is required.
@@ -39,3 +39,5 @@
 - Auto-fix MR notification targets only the parent MR creator.
 - Auto-fix merge suppresses exactly one parent SHA; a later user SHA triggers normally.
 - Feishu and WeCom can both be configured without changing the core workflow.
+- A deferred Pipeline Gate or Draft Run does not block later eligible Runs.
+- An expired Worker claim is recovered at most three times and stale claim tokens cannot finish a reclaimed Run.

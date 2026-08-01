@@ -29,6 +29,7 @@ ai:
 notifications:
   channels:
     - type: feishu
+      webhook_env: FEISHU_WEBHOOK
 """,
         encoding="utf-8",
     )
@@ -38,6 +39,7 @@ notifications:
     assert policy.ai.command == ("opencode", "run")
     assert policy.ai.auto_fix is True
     assert policy.notifications.channels[0]["type"] == "feishu"
+    assert policy.notifications.channels[0]["webhook_env"] == "FEISHU_WEBHOOK"
 
 
 def test_rejects_invalid_policy(tmp_path: Path) -> None:
@@ -51,4 +53,11 @@ def test_ai_enabled_requires_a_command(tmp_path: Path) -> None:
     path = tmp_path / "reviewflow.yml"
     path.write_text("ai:\n  enabled: true\n", encoding="utf-8")
     with pytest.raises(PolicyError, match="ai.command"):
+        load_policy(path)
+
+
+def test_rejects_unknown_version_one_fields(tmp_path: Path) -> None:
+    path = tmp_path / "reviewflow.yml"
+    path.write_text("pipeline_gat: true\n", encoding="utf-8")
+    with pytest.raises(PolicyError, match="unknown fields"):
         load_policy(path)

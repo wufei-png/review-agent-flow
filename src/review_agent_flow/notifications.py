@@ -39,7 +39,7 @@ class WebhookNotifier:
         self.user_ids = user_ids or {}
 
     def notify(self, event: NotificationEvent) -> NotificationResult:
-        content = event.body
+        content = f"{event.title}\n{event.body}" if event.title else event.body
         if event.url:
             content = f"{content}\n{event.url}"
         payload = self._payload(content, event.recipients)

@@ -60,12 +60,24 @@ def _user_username(payload: dict[str, Any], attrs: dict[str, Any]) -> str | None
 def parse_webhook(event_name: str | None, payload: dict[str, Any]) -> WebhookDecision:
     """Parse supported GitLab hooks without making network calls."""
 
+    decisions = parse_webhooks(event_name, payload)
+    for decision in decisions:
+        if decision.accepted:
+            return decision
+    return decisions[0]
+
+
+def parse_webhooks(
+    event_name: str | None, payload: dict[str, Any]
+) -> tuple[WebhookDecision, ...]:
+    """Parse a GitLab hook into one decision per affected Merge Request."""
+
     normalized = (event_name or "Merge Request Hook").strip()
     if normalized == "Merge Request Hook":
-        return _parse_merge_request(payload)
+        return (_parse_merge_request(payload),)
     if normalized == "Pipeline Hook":
         return _parse_pipeline(payload)
-    return WebhookDecision(False, f"unsupported event: {normalized}")
+    return (WebhookDecision(False, f"unsupported event: {normalized}"),)
 
 
 def _parse_merge_request(payload: dict[str, Any]) -> WebhookDecision:
@@ -123,37 +135,65 @@ def _parse_merge_request(payload: dict[str, Any]) -> WebhookDecision:
     )
 
 
-def _parse_pipeline(payload: dict[str, Any]) -> WebhookDecision:
+def _parse_pipeline(payload: dict[str, Any]) -> tuple[WebhookDecision, ...]:
     attrs = payload.get("object_attributes") or {}
     project_id = _project_id(payload)
     status = attrs.get("status")
-    merge_request = payload.get("merge_request") or attrs.get("merge_request") or {}
-    if isinstance(merge_request, list):
-        merge_request = merge_request[0] if merge_request else {}
-    if not isinstance(merge_request, dict):
-        merge_request = {}
-    mr_iid = _int_or_none(
-        merge_request.get("iid") or attrs.get("merge_request_iid") or payload.get("merge_request_iid")
-    )
     sha = attrs.get("sha") or attrs.get("commit_sha")
     if status != "success":
-        return WebhookDecision(False, f"pipeline status is not success: {status}")
-    if not project_id or mr_iid is None or not sha:
-        return WebhookDecision(False, "pipeline has no project, MR IID, or SHA")
-    merge_request = payload.get("merge_request") or attrs.get("merge_request") or {}
-    title = str(merge_request.get("title") or attrs.get("title") or "")
-    source_branch = merge_request.get("source_branch") or attrs.get("ref")
-    branch_match = AUTO_FIX_BRANCH_RE.match(str(source_branch or ""))
-    is_auto_fix = title.startswith(AUTO_FIX_TITLE_PREFIX) or branch_match is not None
-    parent_mr_iid = int(branch_match.group("mr_iid")) if branch_match else None
-    return WebhookDecision(
-        accepted=True,
-        reason="successful auto-fix pipeline" if is_auto_fix else "successful pipeline",
-        kind="autofix" if is_auto_fix else "normal",
-        project_id=project_id,
-        mr_iid=mr_iid,
-        sha=str(sha),
-        title=title,
-        source_branch=str(source_branch) if source_branch else None,
-        parent_mr_iid=parent_mr_iid,
-    )
+        return (WebhookDecision(False, f"pipeline status is not success: {status}"),)
+    if not project_id or not sha:
+        return (WebhookDecision(False, "pipeline has no project or SHA"),)
+
+    raw_merge_requests = payload.get("merge_request") or attrs.get("merge_request")
+    if isinstance(raw_merge_requests, dict):
+        merge_requests = [raw_merge_requests]
+    elif isinstance(raw_merge_requests, list):
+        merge_requests = [item for item in raw_merge_requests if isinstance(item, dict)]
+    else:
+        merge_requests = []
+    if not merge_requests:
+        return (WebhookDecision(False, "pipeline has no Merge Request"),)
+
+    decisions: list[WebhookDecision] = []
+    for merge_request in merge_requests:
+        mr_iid = _int_or_none(
+            merge_request.get("iid")
+            or attrs.get("merge_request_iid")
+            or payload.get("merge_request_iid")
+        )
+        if mr_iid is None:
+            decisions.append(
+                WebhookDecision(False, "pipeline has no MR IID", project_id=project_id)
+            )
+            continue
+        if merge_request.get("work_in_progress") is True or merge_request.get("draft") is True:
+            decisions.append(
+                WebhookDecision(
+                    False,
+                    "draft merge request",
+                    project_id=project_id,
+                    mr_iid=mr_iid,
+                )
+            )
+            continue
+
+        title = str(merge_request.get("title") or attrs.get("title") or "")
+        source_branch = merge_request.get("source_branch") or attrs.get("ref")
+        branch_match = AUTO_FIX_BRANCH_RE.match(str(source_branch or ""))
+        is_auto_fix = title.startswith(AUTO_FIX_TITLE_PREFIX) or branch_match is not None
+        parent_mr_iid = int(branch_match.group("mr_iid")) if branch_match else None
+        decisions.append(
+            WebhookDecision(
+                accepted=True,
+                reason="successful auto-fix pipeline" if is_auto_fix else "successful pipeline",
+                kind="autofix" if is_auto_fix else "normal",
+                project_id=project_id,
+                mr_iid=mr_iid,
+                sha=str(sha),
+                title=title,
+                source_branch=str(source_branch) if source_branch else None,
+                parent_mr_iid=parent_mr_iid,
+            )
+        )
+    return tuple(decisions)

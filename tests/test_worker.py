@@ -87,3 +87,61 @@ def test_worker_runs_agent_in_exact_sha_worktree_and_cleans_it(tmp_path: Path) -
     assert result.agent_result.stdout.strip() == "reviewed"
     assert not (tmp_path / "worktrees" / "run-1").exists()
     assert notifier.events[0].recipients == ("alice",)
+
+
+def test_worker_uses_packaged_skill_when_project_skill_is_missing(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    sha = _git_repository(repository)
+    mr = MergeRequest("42", 1, "Improve validation", "alice", "feature", "main", sha, "https://mr")
+    store = SQLiteStore(tmp_path / "review.db")
+    store.enqueue("42", 1, sha)
+    policy = ReviewPolicy(
+        ai=AIPolicy(
+            enabled=True,
+            command=(
+                sys.executable,
+                "-c",
+                "import os; print(os.environ['REVIEW_AGENT_FLOW_SKILL'])",
+            ),
+            skill_path=".gitlab/review-agent/missing.md",
+        )
+    )
+    worker = ReviewWorker(
+        store,
+        FakeGitLab(mr),
+        GitWorktreeManager(repository, tmp_path / "worktrees"),
+        policy,
+        repository,
+        "https://gitlab",
+    )
+    result = worker.process_one()
+    assert result is not None
+    assert result.status == "succeeded"
+    assert result.agent_result is not None
+    assert result.agent_result.stdout.strip().endswith("defaults/review-agent/SKILL.md")
+
+
+def test_worker_requeues_draft_mr_before_human_or_ai_paths(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    sha = _git_repository(repository)
+    mr = MergeRequest(
+        "42", 1, "Draft change", "alice", "feature", "main", sha, "https://mr", draft=True
+    )
+    store = SQLiteStore(tmp_path / "review.db")
+    run = store.enqueue("42", 1, sha)
+    notifier = RecordingNotifier()
+    worker = ReviewWorker(
+        store,
+        FakeGitLab(mr),
+        GitWorktreeManager(repository, tmp_path / "worktrees"),
+        ReviewPolicy(human=HumanPolicy(enabled=True, reviewers=("alice",))),
+        repository,
+        "https://gitlab",
+        notifier=notifier,
+        retry_delay_seconds=3600,
+    )
+    result = worker.process_one()
+    assert result == result.__class__(run.run_id, "deferred", detail="draft merge request")
+    assert notifier.events == []

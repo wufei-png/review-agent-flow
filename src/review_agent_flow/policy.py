@@ -42,6 +42,20 @@ class ReviewPolicy:
     notifications: NotificationPolicy = field(default_factory=NotificationPolicy)
 
 
+def _reject_unknown(mapping: dict[str, Any], allowed: set[str], field_name: str) -> None:
+    unknown = sorted(set(mapping) - allowed)
+    if unknown:
+        raise PolicyError(f"{field_name} contains unknown fields: {', '.join(unknown)}")
+
+
+def _as_mapping(value: Any, field_name: str) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise PolicyError(f"{field_name} must be a mapping")
+    return value
+
+
 def _as_bool(value: Any, field_name: str, default: bool) -> bool:
     if value is None:
         return default
@@ -55,7 +69,7 @@ def _as_command(value: Any) -> tuple[str, ...]:
         return ()
     if isinstance(value, str):
         command = tuple(shlex.split(value))
-    elif isinstance(value, list) and all(isinstance(item, str) for item in value):
+    elif isinstance(value, list) and all(isinstance(item, str) and item for item in value):
         command = tuple(value)
     else:
         raise PolicyError("ai.command must be a string or a list of strings")
@@ -70,6 +84,43 @@ def _as_reviewers(value: Any) -> tuple[str, ...]:
     if not isinstance(value, list) or not all(isinstance(item, str) and item for item in value):
         raise PolicyError("human.reviewers must be a list of non-empty strings")
     return tuple(value)
+
+
+def _as_channels(value: Any) -> tuple[dict[str, Any], ...]:
+    if not isinstance(value, list):
+        raise PolicyError("notifications.channels must be a list of mappings")
+    channels: list[dict[str, Any]] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            raise PolicyError(f"notifications.channels[{index}] must be a mapping")
+        _reject_unknown(
+            item,
+            {"type", "webhook_env", "user_ids"},
+            f"notifications.channels[{index}]",
+        )
+        channel_type = item.get("type")
+        if channel_type not in {"feishu", "wecom"}:
+            raise PolicyError(
+                f"notifications.channels[{index}].type must be 'feishu' or 'wecom'"
+            )
+        webhook_env = item.get("webhook_env")
+        if not isinstance(webhook_env, str) or not webhook_env:
+            raise PolicyError(
+                f"notifications.channels[{index}].webhook_env must be a non-empty string"
+            )
+        user_ids = item.get("user_ids", {})
+        if not isinstance(user_ids, dict) or not all(
+            isinstance(key, str)
+            and key
+            and isinstance(user_id, str)
+            and user_id
+            for key, user_id in user_ids.items()
+        ):
+            raise PolicyError(
+                f"notifications.channels[{index}].user_ids must map non-empty strings"
+            )
+        channels.append(item)
+    return tuple(channels)
 
 
 def _as_optional_string(value: Any, field_name: str) -> str | None:
@@ -91,22 +142,26 @@ def load_policy(path: str | Path | None = None) -> ReviewPolicy:
     if not policy_path.is_file():
         raise PolicyError(f"policy path is not a file: {policy_path}")
 
-    raw = yaml.safe_load(policy_path.read_text(encoding="utf-8")) or {}
+    loaded = yaml.safe_load(policy_path.read_text(encoding="utf-8"))
+    raw = {} if loaded is None else loaded
     if not isinstance(raw, dict):
         raise PolicyError("policy root must be a mapping")
+    _reject_unknown(
+        raw,
+        {"version", "pipeline_gate", "human", "ai", "notifications"},
+        "policy",
+    )
     version = raw.get("version", 1)
-    if version != 1:
+    if isinstance(version, bool) or not isinstance(version, int) or version != 1:
         raise PolicyError(f"unsupported policy version: {version}")
 
-    human = raw.get("human") or {}
-    ai = raw.get("ai") or {}
-    notifications = raw.get("notifications") or {}
-    if not isinstance(human, dict) or not isinstance(ai, dict) or not isinstance(notifications, dict):
-        raise PolicyError("human, ai, and notifications must be mappings")
-
-    channels = notifications.get("channels", [])
-    if not isinstance(channels, list) or not all(isinstance(item, dict) for item in channels):
-        raise PolicyError("notifications.channels must be a list of mappings")
+    human = _as_mapping(raw.get("human"), "human")
+    ai = _as_mapping(raw.get("ai"), "ai")
+    notifications = _as_mapping(raw.get("notifications"), "notifications")
+    _reject_unknown(human, {"enabled", "reviewers"}, "human")
+    _reject_unknown(ai, {"enabled", "command", "skill", "auto_fix"}, "ai")
+    _reject_unknown(notifications, {"channels"}, "notifications")
+    channels = _as_channels(notifications.get("channels", []))
 
     ai_policy = AIPolicy(
         enabled=_as_bool(ai.get("enabled"), "ai.enabled", False),
@@ -127,7 +182,7 @@ def load_policy(path: str | Path | None = None) -> ReviewPolicy:
             reviewers=_as_reviewers(human.get("reviewers")),
         ),
         ai=ai_policy,
-        notifications=NotificationPolicy(channels=tuple(channels)),
+        notifications=NotificationPolicy(channels=channels),
     )
 
 

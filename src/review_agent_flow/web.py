@@ -8,7 +8,7 @@ from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException
 
-from .events import parse_webhook
+from .events import parse_webhooks
 from .store import SQLiteStore
 
 
@@ -29,25 +29,41 @@ def create_app(store: SQLiteStore | None = None, webhook_secret: str | None = No
     ) -> dict[str, Any]:
         if webhook_secret is not None and not hmac.compare_digest(x_gitlab_token or "", webhook_secret):
             raise HTTPException(status_code=401, detail="invalid GitLab webhook token")
-        decision = parse_webhook(x_gitlab_event, payload)
-        if not decision.accepted:
-            return {"accepted": False, "reason": decision.reason}
-        assert decision.project_id is not None
-        assert decision.mr_iid is not None
-        assert decision.sha is not None
-        if decision.kind == "autofix_merged":
-            store.mark_auto_fix_merged(decision.project_id, decision.mr_iid, decision.sha)
-            return {
-                "accepted": True,
-                "kind": decision.kind,
-                "merged_sha": decision.sha,
-            }
-        run = store.enqueue(decision.project_id, decision.mr_iid, decision.sha, decision.kind or "normal")
-        return {
-            "accepted": True,
-            "kind": decision.kind,
-            "run_id": run.run_id,
-            "status": run.status,
-        }
+        decisions = parse_webhooks(x_gitlab_event, payload)
+        responses: list[dict[str, Any]] = []
+        for decision in decisions:
+            if not decision.accepted:
+                responses.append({"accepted": False, "reason": decision.reason})
+                continue
+            assert decision.project_id is not None
+            assert decision.mr_iid is not None
+            assert decision.sha is not None
+            if decision.kind == "autofix_merged":
+                store.mark_auto_fix_merged(decision.project_id, decision.mr_iid, decision.sha)
+                responses.append(
+                    {
+                        "accepted": True,
+                        "kind": decision.kind,
+                        "merged_sha": decision.sha,
+                    }
+                )
+                continue
+            run = store.enqueue(
+                decision.project_id,
+                decision.mr_iid,
+                decision.sha,
+                decision.kind or "normal",
+            )
+            responses.append(
+                {
+                    "accepted": True,
+                    "kind": decision.kind,
+                    "run_id": run.run_id,
+                    "status": run.status,
+                }
+            )
+        if len(responses) == 1:
+            return responses[0]
+        return {"accepted": any(item["accepted"] for item in responses), "decisions": responses}
 
     return app

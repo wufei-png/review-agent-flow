@@ -50,3 +50,27 @@ def test_auto_fix_merge_marks_only_the_resulting_sha(tmp_path) -> None:
     assert response.status_code == 200
     assert response.json()["kind"] == "autofix_merged"
     assert store.is_suppressed_parent_sha("42", 1, "merged-parent-sha") is True
+
+
+def test_pipeline_hook_accepts_each_ready_merge_request_in_a_list(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "review.db")
+    client = TestClient(create_app(store))
+    payload = {
+        "project": {"id": 42},
+        "object_attributes": {"status": "success", "sha": "abc"},
+        "merge_request": [
+            {"iid": 1, "title": "Ready", "source_branch": "feature/one"},
+            {"iid": 2, "title": "Draft", "draft": True, "source_branch": "feature/two"},
+            {"iid": 3, "title": "Ready too", "source_branch": "feature/three"},
+        ],
+    }
+    response = client.post(
+        "/webhooks/gitlab",
+        json=payload,
+        headers={"X-Gitlab-Event": "Pipeline Hook"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["accepted"] is True
+    assert [item["run_id"] for item in body["decisions"] if item["accepted"]] == [1, 2]
+    assert body["decisions"][1]["accepted"] is False

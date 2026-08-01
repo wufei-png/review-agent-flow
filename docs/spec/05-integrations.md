@@ -17,7 +17,7 @@ The adapter should use `python-gitlab` behind a narrow interface so the domain a
 
 ## Human notifications
 
-The first release supports both Feishu and WeCom. A Project may configure both channels. Normal human review can notify configured reviewers; Auto-fix MR notifications go only to the original parent MR creator. Channel credentials and identity mappings are runtime secrets/configuration, not committed policy content.
+The first release supports both Feishu and WeCom. A Project may configure both channels. Normal human review can notify configured reviewers; Auto-fix MR notifications go only to the original parent MR creator. Channel credentials and identity mappings are runtime secrets/configuration, not committed policy content. Notification payloads include the event title, body and optional URL.
 
 Each notifier should implement a small common interface such as:
 

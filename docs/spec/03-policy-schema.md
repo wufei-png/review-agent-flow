@@ -43,8 +43,11 @@ notifications:
 | `ai.skill` | string | `null` | Project Skill path overriding the built-in Skill |
 | `ai.auto_fix` | boolean | `false` | Allow Agent to create Auto-fix MR |
 | `notifications.channels` | list of mappings | `[]` | Feishu/WeCom channel definitions |
+| `notifications.channels[].type` | `feishu` or `wecom` | required | Notification provider |
+| `notifications.channels[].webhook_env` | non-empty string | required | Runtime environment variable containing the webhook URL |
+| `notifications.channels[].user_ids` | mapping of strings | `{}` | Optional GitLab username to provider user-ID mapping |
 
-Unknown fields should be ignored only when they belong to a future schema version. For version 1, malformed known fields must fail startup or policy loading rather than silently changing behavior.
+For version 1, unknown fields and malformed known fields must fail startup or policy loading rather than silently changing behavior. Future schema versions may define their own compatibility rules.
 
 ## Precedence
 

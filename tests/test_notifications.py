@@ -1,4 +1,7 @@
-from review_agent_flow.notifications import WebhookNotifier
+import json
+
+from review_agent_flow import notifications
+from review_agent_flow.notifications import NotificationEvent, WebhookNotifier
 
 
 def test_feishu_payload_escapes_user_text_and_keeps_mentions() -> None:
@@ -7,3 +10,27 @@ def test_feishu_payload_escapes_user_text_and_keeps_mentions() -> None:
     text = payload["content"]["text"]
     assert "&lt;untrusted&gt;" in text
     assert '<at user_id="ou_alice"></at>' in text
+
+
+def test_notification_title_is_sent_to_webhook(monkeypatch) -> None:
+    captured = {}
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+        def read(self):
+            return b"{}"
+
+    def fake_urlopen(request, timeout):
+        captured["payload"] = json.loads(request.data)
+        return Response()
+
+    monkeypatch.setattr(notifications, "urlopen", fake_urlopen)
+    notifier = WebhookNotifier("feishu", "https://example.invalid")
+    result = notifier.notify(NotificationEvent(title="MR title", body="review body"))
+    assert result.delivered is True
+    assert "MR title" in captured["payload"]["content"]["text"]

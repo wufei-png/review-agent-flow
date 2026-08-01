@@ -11,8 +11,15 @@ from .gitlab import GitLabClient
 from .notifications import FanoutNotifier, NotificationEvent
 from .policy import ReviewPolicy
 from .runner import AgentContext, AgentResult, LocalCliAgentRunner
-from .store import ReviewRun, SQLiteStore
+from .store import (
+    DEFAULT_LEASE_SECONDS,
+    DEFAULT_MAX_ATTEMPTS,
+    ReviewRun,
+    SQLiteStore,
+)
 from .worktree import GitWorktreeManager
+
+DEFAULT_REVIEW_AGENT_SKILL = Path(__file__).resolve().parent / "defaults" / "review-agent" / "SKILL.md"
 
 
 @dataclass(frozen=True)
@@ -35,6 +42,9 @@ class ReviewWorker:
         gitlab_token: str | None = None,
         notifier: FanoutNotifier | None = None,
         agent_timeout_seconds: int = 1800,
+        lease_seconds: int = DEFAULT_LEASE_SECONDS,
+        max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+        retry_delay_seconds: float = 5.0,
     ) -> None:
         self.store = store
         self.gitlab = gitlab
@@ -45,49 +55,74 @@ class ReviewWorker:
         self.gitlab_token = gitlab_token
         self.notifier = notifier or FanoutNotifier()
         self.agent_timeout_seconds = agent_timeout_seconds
+        self.lease_seconds = lease_seconds
+        self.max_attempts = max_attempts
+        self.retry_delay_seconds = retry_delay_seconds
 
     def process_one(self) -> WorkerResult | None:
-        run = self.store.claim_next()
+        run = self.store.claim_next(
+            lease_seconds=self.lease_seconds,
+            max_attempts=self.max_attempts,
+        )
         if run is None:
             return None
 
         try:
             merge_request = self.gitlab.get_merge_request(run.project_id, run.mr_iid)
+            if merge_request.draft:
+                self.store.requeue(
+                    run.run_id,
+                    "draft merge request",
+                    delay_seconds=self.retry_delay_seconds,
+                    claim_token=run.claim_token,
+                )
+                return WorkerResult(run.run_id, "deferred", detail="draft merge request")
             if run.kind == "autofix":
                 parent = parse_auto_fix_branch(merge_request.source_branch)
                 if parent is None:
                     raise ValueError("auto-fix MR source branch does not identify its parent MR")
                 parent_merge_request = self.gitlab.get_merge_request(run.project_id, parent[0])
                 self._notify_autofix(parent_merge_request, merge_request)
-                self.store.finish(run.run_id, "succeeded")
+                self.store.finish(run.run_id, "succeeded", claim_token=run.claim_token)
                 return WorkerResult(run.run_id, "succeeded", detail="auto-fix MR notification")
 
             if self.policy.pipeline_gate:
                 pipeline = self.gitlab.get_latest_pipeline(run.project_id, run.sha)
                 if pipeline is None or pipeline.status != "success":
-                    self.store.requeue(run.run_id, "waiting for successful pipeline")
+                    self.store.requeue(
+                        run.run_id,
+                        "waiting for successful pipeline",
+                        delay_seconds=self.retry_delay_seconds,
+                        claim_token=run.claim_token,
+                    )
                     return WorkerResult(run.run_id, "deferred", detail="pipeline gate")
 
             self._notify_humans(merge_request)
             if not self.policy.ai.enabled or self.store.is_suppressed_parent_sha(
                 run.project_id, run.mr_iid, run.sha
             ):
-                self.store.finish(run.run_id, "succeeded")
+                self.store.finish(run.run_id, "succeeded", claim_token=run.claim_token)
                 return WorkerResult(run.run_id, "succeeded", detail="human path only")
 
-            worktree = self.worktrees.create(run.sha, str(run.run_id))
+            worktree_id = str(run.run_id) if run.attempts <= 1 else f"{run.run_id}-attempt-{run.attempts}"
+            worktree = self.worktrees.create(run.sha, worktree_id)
             try:
                 result = self._run_agent(run, merge_request, worktree)
                 if result.returncode != 0:
-                    self.store.finish(run.run_id, "failed", result.stderr[-4000:] or "Agent failed")
+                    self.store.finish(
+                        run.run_id,
+                        "failed",
+                        result.stderr[-4000:] or "Agent failed",
+                        claim_token=run.claim_token,
+                    )
                     return WorkerResult(run.run_id, "failed", result, "Agent process failed")
                 self._record_auto_fix_if_created(run, merge_request)
-                self.store.finish(run.run_id, "succeeded")
+                self.store.finish(run.run_id, "succeeded", claim_token=run.claim_token)
                 return WorkerResult(run.run_id, "succeeded", result)
             finally:
                 self.worktrees.remove(worktree)
         except Exception as exc:  # noqa: BLE001 - a failed Run must be persisted
-            self.store.finish(run.run_id, "failed", str(exc))
+            self.store.finish(run.run_id, "failed", str(exc), claim_token=run.claim_token)
             return WorkerResult(run.run_id, "failed", detail=str(exc))
 
     def run_forever(self, poll_interval_seconds: float = 5.0) -> None:
@@ -99,10 +134,12 @@ class ReviewWorker:
     def _run_agent(self, run: ReviewRun, merge_request, worktree: Path) -> AgentResult:
         command = self.policy.ai.command
         runner = LocalCliAgentRunner(command, self.agent_timeout_seconds)
-        skill_path = None
+        skill_path = DEFAULT_REVIEW_AGENT_SKILL
         if self.policy.ai.skill_path:
             configured = Path(self.policy.ai.skill_path)
-            skill_path = configured if configured.is_absolute() else worktree / configured
+            configured_path = configured if configured.is_absolute() else worktree / configured
+            if configured_path.is_file():
+                skill_path = configured_path
         return runner.run(
             AgentContext(
                 project_id=run.project_id,

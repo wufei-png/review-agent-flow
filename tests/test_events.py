@@ -1,4 +1,4 @@
-from review_agent_flow.events import parse_auto_fix_branch, parse_webhook
+from review_agent_flow.events import parse_auto_fix_branch, parse_webhook, parse_webhooks
 
 
 def _merge_request_payload(**attrs):
@@ -67,3 +67,21 @@ def test_auto_fix_merge_event_carries_the_resulting_parent_sha() -> None:
     assert decision.accepted is True
     assert decision.kind == "autofix_merged"
     assert decision.merged_sha == "merged-parent-sha"
+
+
+def test_pipeline_hook_fans_out_merge_request_list_and_skips_drafts() -> None:
+    decisions = parse_webhooks(
+        "Pipeline Hook",
+        {
+            "project": {"id": 42},
+            "object_attributes": {"status": "success", "sha": "abc"},
+            "merge_request": [
+                {"iid": 1, "title": "Ready", "source_branch": "feature/one"},
+                {"iid": 2, "title": "Draft", "draft": True, "source_branch": "feature/two"},
+                {"iid": 3, "title": "Ready too", "source_branch": "feature/three"},
+            ],
+        },
+    )
+    assert [decision.mr_iid for decision in decisions if decision.accepted] == [1, 3]
+    assert decisions[1].accepted is False
+    assert decisions[1].reason == "draft merge request"

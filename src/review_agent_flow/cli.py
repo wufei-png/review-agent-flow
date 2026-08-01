@@ -39,8 +39,10 @@ def _required(value: str | None, env_name: str) -> str:
 def _run_worker(args: argparse.Namespace) -> int:
     gitlab_url = _required(args.gitlab_url, "GITLAB_URL")
     gitlab_token = _required(args.gitlab_token, "GITLAB_TOKEN")
-    repository = Path(_required(args.repository, "REVIEW_AGENT_FLOW_REPOSITORY"))
+    repository = Path(_required(args.repository, "REVIEW_AGENT_FLOW_REPOSITORY")).expanduser().resolve()
     policy_path = Path(args.policy or os.getenv("REVIEW_AGENT_FLOW_POLICY", ".gitlab/reviewflow.yml"))
+    if not policy_path.is_absolute():
+        policy_path = repository / policy_path
     policy = load_policy(policy_path)
     store = SQLiteStore(args.db or os.getenv("REVIEW_AGENT_FLOW_DB", "review-agent-flow.sqlite3"))
     worker = ReviewWorker(
@@ -56,6 +58,8 @@ def _run_worker(args: argparse.Namespace) -> int:
         gitlab_token=gitlab_token,
         notifier=notifiers_from_policy(policy.notifications.channels),
         agent_timeout_seconds=args.agent_timeout,
+        lease_seconds=args.agent_timeout + 60,
+        retry_delay_seconds=args.poll_interval,
     )
     if args.once:
         result = worker.process_one()
