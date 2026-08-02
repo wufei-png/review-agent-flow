@@ -56,3 +56,9 @@ existing redaction helper.
 **Review Agent Skill**: 指导 Agent 读取上下文、提交 Note、创建 Auto-fix MR 的默认能力说明。Project 可用 `.gitlab/review-agent/SKILL.md` 覆盖。
 
 **Trusted Execution Environment**: 部署者信任 Worker 主机和 Agent 能力的运行边界。核心不默认裁剪 Agent 工具、网络或凭据权限。
+
+**Runtime Boundary**: ReviewFlow 中 Project/MR/SHA 评审编排以及 Effect Receipt、Worker Lease 语义所拥有的独立版本与依赖边界。相似的工程辅助能力不因此自动成为本项目的运行时依赖。
+_Avoid_: Shared Runtime, Common Runtime
+
+**Thin Protocol**: 跨项目用于表达最小、可独立演化语义的文档层约定；它不包含任一项目的领域模型、安全默认值或 Python 运行时实现。
+_Avoid_: Shared Runtime Library, Shared Domain Model
