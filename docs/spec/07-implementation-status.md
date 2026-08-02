@@ -20,6 +20,11 @@
 | Default Skill | `src/review_agent_flow/defaults/review-agent/SKILL.md` |
 | Unit tests | `tests/` |
 
+| P1 area | Implementation |
+| --- | --- |
+| Structured failure ledger, bounded transient retry and lease heartbeat | store.py, worker.py, runner.py |
+| Effect Receipt persistence and Auto-fix reconciliation | store.py, worker.py, gitlab_client.py |
+
 ## Remaining implementation
 
 1. Add real GitLab sandbox verification for Note, branch and Auto-fix MR APIs.
@@ -46,4 +51,8 @@
 - Feishu and WeCom can both be configured without changing the core workflow.
 - A deferred Pipeline Gate or Draft Run does not block later eligible Runs.
 - An expired Worker claim is recovered at most three times and stale claim tokens cannot finish a reclaimed Run.
+- An unexpired claim token can heartbeat a long Agent execution; an old token cannot renew or finish it.
+- GitLab/API 429/5xx/network and temporary worktree failures requeue with bounded backoff; Agent non-zero and timeout remain terminal.
+- Agent execution, expected Note/Auto-fix output, and Auto-fix reconciliation are queryable Effect Receipts with redacted errors and no required JSON Agent output.
+- Auto-fix reconciliation observes opened, closed, and merged states after the Agent process; a merged relation suppresses only its resulting parent SHA.
 - Notification delivery failure leaves the Review Run successful, retries per channel up to three times, and records terminal failure for audit.

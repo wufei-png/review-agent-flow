@@ -18,6 +18,8 @@
 
 **Review Run**: 对一个 MR 的一个 SHA 执行的一次评审尝试。每个 Run 使用独立 Git worktree，并按 Project/MR/SHA 幂等。
 
+**Effect Receipt**: 连接 Review Run、预期外部副作用和平台已观察身份/状态的持久记录。它用于重放与对账，不代表外部平台操作具备 exactly-once 语义。
+
 **Auto-fix Merge Request**: Agent 创建的独立 MR，目标为原 MR 的 source branch，使用 `[ReviewFlow Auto-Fix]` 标题前缀和 `autofix/MR-<iid>/run-<run-id>` 分支，只通知原 MR 创建者。
 
 ## Execution

@@ -243,3 +243,95 @@ def test_stale_notification_claim_cannot_finish_reclaimed_delivery(tmp_path) -> 
     assert store.finish_notification(
         deliveries[0].delivery_id, True, claim_token=reclaimed.claim_token
     ) is True
+
+
+def test_review_lease_heartbeat_requires_current_unexpired_claim_token(tmp_path) -> None:
+    database = tmp_path / "review.db"
+    store = SQLiteStore(database)
+    run = store.enqueue("42", 1, SHA)
+    claimed = store.claim_next(lease_seconds=60)
+    assert claimed is not None and claimed.claim_token
+    old_lease = claimed.lease_until
+
+    assert store.extend_lease(run.run_id, claimed.claim_token, lease_seconds=120) is True
+    renewed = store.get_review_run(run.run_id)
+    assert renewed is not None
+    assert renewed.lease_until != old_lease
+    assert store.extend_lease(run.run_id, "stale-token", lease_seconds=120) is False
+
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE review_runs SET lease_until = ? WHERE id = ?",
+            ("2000-01-01T00:00:00+00:00", run.run_id),
+        )
+    assert store.extend_lease(run.run_id, claimed.claim_token, lease_seconds=120) is False
+    takeover = store.claim_next(lease_seconds=60)
+    assert takeover is not None
+    assert takeover.claim_token != claimed.claim_token
+    assert store.finish(run.run_id, "succeeded", claim_token=claimed.claim_token) is False
+
+
+def test_effect_receipt_is_idempotent_queryable_and_redacted(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("GITLAB_TOKEN", "super-secret-token")
+    store = SQLiteStore(tmp_path / "review.db")
+    run = store.enqueue("42", 1, SHA)
+    receipt = store.create_effect_receipt(
+        run.run_id,
+        "agent_execution",
+        "review-run:1:agent",
+        state="running",
+        detail="Agent execution",
+    )
+    duplicate = store.create_effect_receipt(
+        run.run_id,
+        "agent_execution",
+        "review-run:1:agent",
+        state="planned",
+    )
+    assert duplicate.receipt_id == receipt.receipt_id
+    assert store.update_effect_receipt(
+        receipt.receipt_id,
+        state="failed",
+        external_identity="https://gitlab.example/api?access_token=super-secret-token",
+        error="authorization: Bearer super-secret-token glpat-abc123",
+    )
+    saved = store.get_effect_receipt(receipt.receipt_id)
+    assert saved is not None
+    assert saved.state == "failed"
+    assert "super-secret-token" not in (saved.external_identity or "")
+    assert "glpat-abc123" not in (saved.error or "")
+    assert "Bearer super-secret-token" not in (saved.error or "")
+    assert store.list_effect_receipts(run.run_id)[0].attempt == 1
+
+
+def test_runtime_redaction_secret_covers_plain_audit_text(tmp_path) -> None:
+    token = "runtime-store-token-123"
+    store = SQLiteStore(tmp_path / "review.db", redaction_secrets=(token,))
+    run = store.enqueue("42", 1, SHA)
+    claimed = store.claim_next()
+    assert claimed is not None
+
+    receipt = store.create_effect_receipt(
+        run.run_id,
+        "agent_execution",
+        "plain-effect",
+        state="failed",
+        error=f"plain text {token} without assignment or URL",
+    )
+    assert store.finish(
+        run.run_id,
+        "failed",
+        f"plain text {token} without assignment or URL",
+        claim_token=claimed.claim_token,
+        failure_class="agent_exit",
+    )
+
+    saved_run = store.get_review_run(run.run_id)
+    assert saved_run is not None
+    assert token not in (saved_run.error or "")
+    failures = store.list_failures(run.run_id)
+    assert len(failures) == 1
+    assert token not in (failures[0].error or "")
+    saved_receipt = store.get_effect_receipt(receipt.receipt_id)
+    assert saved_receipt is not None
+    assert token not in (saved_receipt.error or "")

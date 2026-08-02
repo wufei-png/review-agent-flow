@@ -27,6 +27,7 @@ class MergeRequest:
     web_url: str
     draft: bool = False
     state: str = "opened"
+    merged_sha: str | None = None
 
 
 @dataclass(frozen=True)
@@ -45,6 +46,8 @@ class CreatedMergeRequest:
     source_branch: str
     target_branch: str
     web_url: str
+    state: str = "opened"
+    merged_sha: str | None = None
 
 
 class GitLabClient(Protocol):

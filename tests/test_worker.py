@@ -39,6 +39,32 @@ class FakeGitLab:
         return None
 
 
+class RetryableGitLab(FakeGitLab):
+    def __init__(self, mr: MergeRequest, failures: int = 1, status_code: int = 503):
+        super().__init__(mr)
+        self.failures = failures
+        self.status_code = status_code
+
+    def get_merge_request(self, project_id: str, mr_iid: int) -> MergeRequest:
+        if self.failures:
+            self.failures -= 1
+            error = RuntimeError(f"GitLab HTTP {self.status_code}: super-secret-token")
+            error.status_code = self.status_code
+            raise error
+        return self.mr
+
+
+class EventualAutoFixGitLab(FakeGitLab):
+    def __init__(self, mr: MergeRequest):
+        super().__init__(mr)
+        self.auto_fix: CreatedMergeRequest | None = None
+
+    def find_merge_request_by_source_branch(
+        self, project_id: str, source_branch: str, target_branch: str
+    ) -> CreatedMergeRequest | None:
+        return self.auto_fix
+
+
 class RecordingNotifier(FanoutNotifier):
     def __init__(self) -> None:
         super().__init__()
@@ -346,3 +372,187 @@ def test_worker_claims_only_its_bound_project(tmp_path: Path) -> None:
     assert worker.process_one() is None
     pending = store.claim_next(project_id="99")
     assert pending is not None
+
+
+def test_retryable_gitlab_failure_requeues_then_fails_at_attempt_cap(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    sha = "e" * 40
+    mr = MergeRequest("42", 1, "Retry me", "alice", "feature", "main", sha, "https://mr")
+    store = SQLiteStore(tmp_path / "review.db")
+    run = store.enqueue("42", 1, sha)
+    worker = ReviewWorker(
+        store,
+        RetryableGitLab(mr, failures=2, status_code=503),
+        GitWorktreeManager(repository, tmp_path / "worktrees"),
+        ReviewPolicy(),
+        repository,
+        "https://gitlab",
+        gitlab_token="super-secret-token",
+        project_id="42",
+        max_attempts=2,
+        retry_delay_seconds=0,
+    )
+
+    first = worker.process_one()
+    assert first is not None and first.status == "deferred"
+    pending = store.get_review_run(run.run_id)
+    assert pending is not None
+    assert pending.status == "pending"
+    assert pending.failure_class == "gitlab_server_error"
+    assert pending.retryable is True
+    assert "super-secret-token" not in (pending.error or "")
+    assert len(store.list_failures(run.run_id)) == 1
+
+    second = worker.process_one()
+    assert second is not None and second.status == "failed"
+    terminal = store.get_review_run(run.run_id)
+    assert terminal is not None
+    assert terminal.status == "failed"
+    assert terminal.attempts == 2
+    assert terminal.failure_class == "gitlab_server_error"
+    assert len(store.list_failures(run.run_id)) == 2
+    assert worker.process_one() is None
+
+
+def test_agent_nonzero_exit_is_terminal_and_recorded_without_retry(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    sha = _git_repository(repository)
+    mr = MergeRequest("42", 1, "Agent failure", "alice", "feature", "main", sha, "https://mr")
+    store = SQLiteStore(tmp_path / "review.db")
+    run = store.enqueue("42", 1, sha)
+    token = "runtime-agent-token-123"
+    worker = ReviewWorker(
+        store,
+        FakeGitLab(mr),
+        GitWorktreeManager(repository, tmp_path / "worktrees"),
+        ReviewPolicy(
+            ai=AIPolicy(
+                enabled=True,
+                command=(
+                    sys.executable,
+                    "-c",
+                    "import os, sys; sys.stderr.write(os.environ['GITLAB_TOKEN']); sys.exit(7)",
+                ),
+            )
+        ),
+        repository,
+        "https://gitlab",
+        gitlab_token=token,
+        project_id="42",
+        retry_delay_seconds=0,
+    )
+
+    result = worker.process_one()
+    assert result is not None and result.status == "failed"
+    saved = store.get_review_run(run.run_id)
+    assert saved is not None
+    assert saved.status == "failed"
+    assert saved.failure_class == "agent_exit"
+    assert saved.retryable is False
+    assert token not in (result.agent_result.stderr if result.agent_result else "")
+    assert token not in (saved.error or "")
+    failures = store.list_failures(run.run_id)
+    assert len(failures) == 1
+    assert token not in (failures[0].error or "")
+    assert worker.process_one() is None
+    agent_receipt = store.list_effect_receipts(run.run_id, "agent_execution")
+    assert len(agent_receipt) == 1
+    assert agent_receipt[0].state == "failed"
+    assert token not in (agent_receipt[0].error or "")
+
+
+def test_agent_receipts_and_eventual_merged_autofix_reconciliation(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    sha = _git_repository(repository)
+    mr = MergeRequest("42", 1, "Auto-fix", "alice", "feature", "main", sha, "https://mr")
+    gitlab = EventualAutoFixGitLab(mr)
+    store = SQLiteStore(tmp_path / "review.db")
+    run = store.enqueue("42", 1, sha)
+    worker = ReviewWorker(
+        store,
+        gitlab,
+        GitWorktreeManager(repository, tmp_path / "worktrees"),
+        ReviewPolicy(
+            ai=AIPolicy(
+                enabled=True,
+                auto_fix=True,
+                command=(sys.executable, "-c", "print('reviewed')"),
+            )
+        ),
+        repository,
+        "https://gitlab",
+        gitlab_token="super-secret-token",
+        project_id="42",
+        retry_delay_seconds=0,
+    )
+
+    first = worker.process_one()
+    assert first is not None and first.status == "succeeded"
+    receipts = store.list_effect_receipts(run.run_id)
+    assert {receipt.effect_kind for receipt in receipts} == {
+        "agent_execution",
+        "note_expected",
+        "autofix_expected",
+        "autofix_reconciliation",
+    }
+    assert next(receipt for receipt in receipts if receipt.effect_kind == "agent_execution").state == "succeeded"
+    assert next(receipt for receipt in receipts if receipt.effect_kind == "autofix_reconciliation").state == "pending"
+
+    gitlab.auto_fix = CreatedMergeRequest(
+        "42",
+        9,
+        "[ReviewFlow Auto-Fix] Auto-fix",
+        "autofix/MR-1/run-1",
+        "feature",
+        "https://gitlab/merge_requests/9?access_token=super-secret-token",
+        state="merged",
+        merged_sha="f" * 40,
+    )
+    reconciled = worker.process_one()
+    assert reconciled is not None and reconciled.status == "succeeded"
+    relation = store.record_auto_fix(
+        "42", 1, sha, run.run_id, "42", 9, status="merged", merged_sha="f" * 40
+    )
+    assert relation.status == "merged"
+    assert store.is_suppressed_parent_sha("42", 1, "f" * 40) is True
+    reconciliation = store.list_effect_receipts(run.run_id, "autofix_reconciliation")
+    assert reconciliation[0].state == "observed"
+    assert "super-secret-token" not in (reconciliation[0].detail or "")
+
+
+def test_closed_autofix_is_reconciled_without_parent_sha_suppression(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    sha = _git_repository(repository)
+    mr = MergeRequest("42", 1, "Closed Auto-fix", "alice", "feature", "main", sha, "https://mr")
+    gitlab = EventualAutoFixGitLab(mr)
+    store = SQLiteStore(tmp_path / "review.db")
+    store.enqueue("42", 1, sha)
+    worker = ReviewWorker(
+        store,
+        gitlab,
+        GitWorktreeManager(repository, tmp_path / "worktrees"),
+        ReviewPolicy(
+            ai=AIPolicy(enabled=True, auto_fix=True, command=(sys.executable, "-c", "print('ok')"))
+        ),
+        repository,
+        "https://gitlab",
+        project_id="42",
+        retry_delay_seconds=0,
+    )
+    assert worker.process_one() is not None
+    gitlab.auto_fix = CreatedMergeRequest(
+        "42",
+        10,
+        "[ReviewFlow Auto-Fix] Closed",
+        "autofix/MR-1/run-1",
+        "feature",
+        "https://gitlab/merge_requests/10",
+        state="closed",
+    )
+    result = worker.process_one()
+    assert result is not None and result.status == "succeeded"
+    assert store.is_suppressed_parent_sha("42", 1, sha) is False

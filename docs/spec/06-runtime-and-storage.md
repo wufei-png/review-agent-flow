@@ -32,6 +32,16 @@ The Store must atomically claim an eligible pending Run so two Workers cannot ex
 
 Each running Run has a lease expiration and opaque claim token. A Worker clears the lease when it finishes or defers the Run. If a Worker dies, the next claim operation recovers an expired Run to `pending`; after three claims without a terminal update, the Store marks it `failed` with a lease-expiry diagnostic. A Worker claims only its configured Project, cancels a Run whose MR is closed/merged, and atomically cancels and requeues the latest SHA when the MR head has advanced. Ordinary Agent non-zero exits are terminal failures and are not automatically retried.
 
+Transient GitLab/API connection failures, HTTP 429/5xx responses, and
+temporary worktree/transport failures have stable failure_class values and
+are requeued with capped exponential backoff. Configuration/policy failures,
+invalid SHA, closed/merged state, and Agent failures are terminal. The
+review_run_failures ledger retains the failure class, retryable flag, claim
+attempt and redacted diagnostic for each recorded failure. A long-running
+Agent uses a synchronous subprocess poll to extend its unexpired lease; this
+heartbeat does not create an uncontrolled background thread, and an old token
+cannot extend or finish a reclaimed Run.
+
 ## Required storage records
 
 `review_runs` must retain at least:
@@ -48,6 +58,14 @@ Each running Run has a lease expiration and opaque claim token. A Worker clears 
 An `auto_fix_merge_events` table retains an Auto-fix merge event that arrives before its relation is written, so the later relation write can apply the merge suppression atomically.
 
 `notification_outbox` must retain one record per notification/channel with the correlation ID, rendered event fields, channel identity, attempt count, lease, next-attempt time, final status and last error. `pending -> running -> delivered` or `failed` is independent of the Review Run state.
+
+effect_receipts is created by SQLite initialization and retains at least
+run_id, effect_kind, deterministic dedupe_key, current attempt, state, safe
+external identity/detail, created_at, updated_at, next_attempt_at, and
+redacted error. Receipts can be planned, running, succeeded, pending,
+observed, not_observed, or failed. Secrets and Agent JSON output are never
+required in this table. Auto-fix reconciliation uses a short receipt lease
+and can remain pending across Worker cycles.
 
 ## Deployment defaults
 

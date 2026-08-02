@@ -33,3 +33,17 @@ def test_runner_exposes_run_id(tmp_path: Path) -> None:
         timeout_seconds=5,
     ).run(AgentContext("42", 7, 11, SHA, "https://gitlab.example", tmp_path))
     assert result.stdout.strip() == "11"
+
+
+def test_runner_heartbeats_during_long_agent_without_a_background_thread(tmp_path: Path) -> None:
+    heartbeats: list[int] = []
+    result = LocalCliAgentRunner(
+        [sys.executable, "-c", "import time; time.sleep(0.2)"],
+        timeout_seconds=2,
+    ).run(
+        AgentContext("42", 7, 11, SHA, "https://gitlab.example", tmp_path),
+        heartbeat=lambda: heartbeats.append(1) is None,
+        heartbeat_interval_seconds=0.05,
+    )
+    assert result.returncode == 0
+    assert heartbeats

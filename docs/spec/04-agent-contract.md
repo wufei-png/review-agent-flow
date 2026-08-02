@@ -26,6 +26,20 @@ The Worker invokes the configured command with `shell=False`, the Review Run wor
 
 The command receives no required JSON output contract. The Agent uses the worktree and GitLab context to submit Notes itself. The Worker only needs process status, stdout/stderr for diagnostics, timeout handling and lifecycle state.
 
+The Worker persists Effect Receipts for Agent execution, the expected
+Agent-owned Note, and (when enabled) the expected Auto-fix MR. These receipts
+are an audit and reconciliation surface, not an Agent response schema. A
+successful Agent process does not prove that a Note or Auto-fix MR was
+observed; the Worker records that distinction and later reconciles the
+deterministic Auto-fix branch.
+
+Auto-fix reconciliation queries the deterministic branch across opened,
+closed, and merged Merge Requests. A delayed or temporarily invisible MR
+remains a pending receipt for a later Worker cycle. If the MR is merged, the
+relation stores its resulting merge SHA and suppresses only that exact parent
+SHA. This is at-least-once processing with reconciliation, not exactly-once
+external side effects.
+
 ## Worktree
 
 The Worker creates a detached worktree at the exact SHA. The Agent must not modify the parent source branch directly. Auto-fix output is created on `autofix/MR-<iid>/run-<run-id>` and pushed as a separate MR targeting the parent source branch.

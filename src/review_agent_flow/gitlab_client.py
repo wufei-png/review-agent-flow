@@ -28,6 +28,9 @@ class PythonGitLabClient(GitLabClient):
         state = str(getattr(mr, "state", "opened") or "opened")
         if state == "opened" and getattr(mr, "merged_at", None):
             state = "merged"
+        merged_sha = getattr(mr, "merge_commit_sha", None) or getattr(
+            mr, "merged_commit_sha", None
+        )
         return MergeRequest(
             project_id=str(project_id),
             iid=mr_iid,
@@ -39,6 +42,7 @@ class PythonGitLabClient(GitLabClient):
             web_url=str(mr.web_url),
             draft=bool(getattr(mr, "draft", False) or getattr(mr, "work_in_progress", False)),
             state=state,
+            merged_sha=str(merged_sha) if merged_sha else None,
         )
 
     def get_latest_pipeline(self, project_id: str, sha: str) -> Pipeline | None:
@@ -83,11 +87,17 @@ class PythonGitLabClient(GitLabClient):
         self, project_id: str, source_branch: str, target_branch: str
     ) -> CreatedMergeRequest | None:
         mrs = self._project(project_id).mergerequests.list(
-            state="opened", source_branch=source_branch, target_branch=target_branch
+            state="all", source_branch=source_branch, target_branch=target_branch, per_page=100
         )
         if not mrs:
             return None
         mr = mrs[0]
+        state = str(getattr(mr, "state", "opened") or "opened")
+        if state == "opened" and getattr(mr, "merged_at", None):
+            state = "merged"
+        merged_sha = getattr(mr, "merge_commit_sha", None) or getattr(
+            mr, "merged_commit_sha", None
+        )
         return CreatedMergeRequest(
             project_id=str(project_id),
             iid=int(mr.iid),
@@ -95,4 +105,6 @@ class PythonGitLabClient(GitLabClient):
             source_branch=str(mr.source_branch),
             target_branch=str(mr.target_branch),
             web_url=str(mr.web_url),
+            state=state,
+            merged_sha=str(merged_sha) if merged_sha else None,
         )
