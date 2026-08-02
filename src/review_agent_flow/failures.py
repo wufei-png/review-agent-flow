@@ -47,10 +47,18 @@ def classify_exception(
     detail = redact(str(error) or error.__class__.__name__, secrets=secrets)
     error_name = f"{error.__class__.__module__}.{error.__class__.__name__}".lower()
     status = _status_code(error)
-    if status == 429 or "too many requests" in detail.lower() or "rate limit" in detail.lower():
+    if status == 429:
         return FailureInfo("gitlab_rate_limited", True, detail)
+    if status is not None and 400 <= status <= 499:
+        return FailureInfo("gitlab_api", False, detail)
     if status is not None and 500 <= status <= 599:
         return FailureInfo("gitlab_server_error", True, detail)
+    if status is None and (
+        "too many requests" in detail.lower() or "rate limit" in detail.lower()
+    ):
+        return FailureInfo("gitlab_rate_limited", True, detail)
+    if isinstance(error, URLError):
+        return FailureInfo("gitlab_network", True, detail)
     if isinstance(error, WorktreeError):
         return FailureInfo("worktree_transport", True, detail)
     if isinstance(error, (FileNotFoundError, PermissionError)):
@@ -59,7 +67,7 @@ def classify_exception(
         return FailureInfo("policy_error", False, detail)
     if isinstance(error, ValueError):
         return FailureInfo("policy_error", False, detail)
-    if isinstance(error, (ConnectionError, TimeoutError, URLError)):
+    if isinstance(error, (ConnectionError, TimeoutError)):
         return FailureInfo("gitlab_network", True, detail)
     if any(
         marker in error_name

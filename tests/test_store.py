@@ -125,6 +125,126 @@ def test_project_scoped_claim_does_not_recover_another_project_lease(tmp_path) -
     assert row == ("running", 3, "2000-01-01T00:00:00+00:00")
 
 
+def test_effect_receipt_claim_reclaim_is_project_scoped(tmp_path) -> None:
+    database = tmp_path / "review.db"
+    store = SQLiteStore(database)
+    project_a_run = store.enqueue("A", 1, SHA)
+    project_b_run = store.enqueue("B", 1, OLD_SHA)
+    project_a_receipt = store.create_effect_receipt(
+        project_a_run.run_id,
+        "autofix_reconciliation",
+        "autofix/MR-1/run-1",
+        state="pending",
+    )
+    project_b_receipt = store.create_effect_receipt(
+        project_b_run.run_id,
+        "autofix_reconciliation",
+        "autofix/MR-1/run-2",
+        state="running",
+    )
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            UPDATE effect_receipts
+            SET lease_until = ?, claim_token = ?
+            WHERE id = ?
+            """,
+            ("2000-01-01T00:00:00+00:00", "project-b-token", project_b_receipt.receipt_id),
+        )
+
+    claimed = store.claim_pending_effect_receipts(
+        "autofix_reconciliation",
+        project_id="A",
+    )
+
+    assert [receipt.receipt_id for receipt in claimed] == [project_a_receipt.receipt_id]
+    assert claimed[0].state == "running"
+    with sqlite3.connect(database) as connection:
+        row = connection.execute(
+            "SELECT state, claim_token FROM effect_receipts WHERE id = ?",
+            (project_b_receipt.receipt_id,),
+        ).fetchone()
+    assert row == ("running", "project-b-token")
+
+
+def test_effect_receipt_crash_reclaim_stops_at_max_attempts(tmp_path) -> None:
+    database = tmp_path / "review.db"
+    store = SQLiteStore(database)
+    run = store.enqueue("42", 1, SHA)
+    receipt = store.create_effect_receipt(
+        run.run_id,
+        "autofix_reconciliation",
+        "autofix/MR-1/run-1",
+        state="pending",
+    )
+
+    first_claim = store.claim_pending_effect_receipts(
+        "autofix_reconciliation", max_attempts=3, project_id="42"
+    )
+    assert len(first_claim) == 1
+    assert first_claim[0].attempt == 2
+
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE effect_receipts SET lease_until = ? WHERE id = ?",
+            ("2000-01-01T00:00:00+00:00", receipt.receipt_id),
+        )
+
+    second_claim = store.claim_pending_effect_receipts(
+        "autofix_reconciliation", max_attempts=3, project_id="42"
+    )
+    assert len(second_claim) == 1
+    assert second_claim[0].attempt == 3
+
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE effect_receipts SET lease_until = ? WHERE id = ?",
+            ("2000-01-01T00:00:00+00:00", receipt.receipt_id),
+        )
+
+    assert (
+        store.claim_pending_effect_receipts(
+            "autofix_reconciliation", max_attempts=3, project_id="42"
+        )
+        == ()
+    )
+    exhausted = store.get_effect_receipt(receipt.receipt_id)
+    assert exhausted is not None
+    assert exhausted.state == "not_observed"
+    assert exhausted.attempt == 3
+    assert exhausted.claim_token is None
+    assert exhausted.lease_until is None
+    assert exhausted.error == "effect receipt attempt limit reached after lease expiry"
+
+
+def test_pending_effect_receipt_at_max_attempts_is_not_claimed(tmp_path) -> None:
+    database = tmp_path / "review.db"
+    store = SQLiteStore(database)
+    run = store.enqueue("42", 1, SHA)
+    receipt = store.create_effect_receipt(
+        run.run_id,
+        "autofix_reconciliation",
+        "autofix/MR-1/run-1",
+        state="pending",
+    )
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE effect_receipts SET attempt = ?, next_attempt_at = NULL WHERE id = ?",
+            (2, receipt.receipt_id),
+        )
+
+    assert (
+        store.claim_pending_effect_receipts(
+            "autofix_reconciliation", max_attempts=2, project_id="42"
+        )
+        == ()
+    )
+    exhausted = store.get_effect_receipt(receipt.receipt_id)
+    assert exhausted is not None
+    assert exhausted.state == "not_observed"
+    assert exhausted.next_attempt_at is None
+
+
 def test_auto_fix_merge_suppresses_only_the_merged_parent_sha(tmp_path) -> None:
     store = SQLiteStore(tmp_path / "review.db")
     run = store.enqueue("42", 1, SHA)
@@ -136,6 +256,26 @@ def test_auto_fix_merge_suppresses_only_the_merged_parent_sha(tmp_path) -> None:
     assert store.is_suppressed_parent_sha("42", 1, LATER_SHA) is False
 
 
+def test_closed_auto_fix_merged_sha_is_not_recorded_or_suppressed(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "review.db")
+    run = store.enqueue("42", 1, SHA)
+
+    relation = store.record_auto_fix(
+        "42",
+        1,
+        SHA,
+        run.run_id,
+        "42",
+        9,
+        status="closed",
+        merged_sha=MERGED_SHA,
+    )
+
+    assert relation.status == "closed"
+    assert relation.merged_sha is None
+    assert store.is_suppressed_parent_sha("42", 1, MERGED_SHA) is False
+
+
 def test_auto_fix_merge_before_relation_write_is_preserved(tmp_path) -> None:
     store = SQLiteStore(tmp_path / "review.db")
     store.mark_auto_fix_merged("42", 9, MERGED_SHA)
@@ -144,6 +284,29 @@ def test_auto_fix_merge_before_relation_write_is_preserved(tmp_path) -> None:
     assert relation.status == "merged"
     assert relation.merged_sha == MERGED_SHA
     assert store.is_suppressed_parent_sha("42", 1, MERGED_SHA) is True
+
+
+def test_merged_auto_fix_sha_is_backfilled_without_changing_existing_sha(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "review.db")
+    run = store.enqueue("42", 1, SHA)
+    initial = store.record_auto_fix(
+        "42", 1, SHA, run.run_id, "42", 9, status="merged"
+    )
+    assert initial.status == "merged"
+    assert initial.merged_sha is None
+
+    backfilled = store.record_auto_fix(
+        "42", 1, SHA, run.run_id, "42", 9, status="merged", merged_sha=MERGED_SHA
+    )
+    assert backfilled.status == "merged"
+    assert backfilled.merged_sha == MERGED_SHA
+    assert store.is_suppressed_parent_sha("42", 1, MERGED_SHA) is True
+
+    preserved = store.record_auto_fix(
+        "42", 1, SHA, run.run_id, "42", 9, status="merged", merged_sha=LATER_SHA
+    )
+    assert preserved.merged_sha == MERGED_SHA
+    assert store.is_suppressed_parent_sha("42", 1, LATER_SHA) is False
 
 
 def test_invalid_sha_is_rejected_before_enqueue(tmp_path) -> None:
@@ -269,6 +432,42 @@ def test_review_lease_heartbeat_requires_current_unexpired_claim_token(tmp_path)
     assert takeover is not None
     assert takeover.claim_token != claimed.claim_token
     assert store.finish(run.run_id, "succeeded", claim_token=claimed.claim_token) is False
+
+
+def test_expired_run_token_cannot_update_receipt_or_finish(tmp_path) -> None:
+    database = tmp_path / "review.db"
+    store = SQLiteStore(database)
+    run = store.enqueue("42", 1, SHA)
+    claimed = store.claim_next(lease_seconds=60)
+    assert claimed is not None and claimed.claim_token
+    receipt = store.create_effect_receipt(
+        run.run_id,
+        "agent_execution",
+        "review-run:1:agent",
+        state="running",
+    )
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE review_runs SET lease_until = ? WHERE id = ?",
+            ("2000-01-01T00:00:00+00:00", run.run_id),
+        )
+
+    assert (
+        store.update_effect_receipt(
+            receipt.receipt_id,
+            state="succeeded",
+            run_id=run.run_id,
+            run_claim_token=claimed.claim_token,
+        )
+        is False
+    )
+    assert store.finish(run.run_id, "succeeded", claim_token=claimed.claim_token) is False
+    saved_receipt = store.get_effect_receipt(receipt.receipt_id)
+    assert saved_receipt is not None
+    assert saved_receipt.state == "running"
+    saved_run = store.get_review_run(run.run_id)
+    assert saved_run is not None
+    assert saved_run.status == "running"
 
 
 def test_effect_receipt_is_idempotent_queryable_and_redacted(tmp_path, monkeypatch) -> None:

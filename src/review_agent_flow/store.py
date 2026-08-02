@@ -8,6 +8,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from urllib.parse import quote
 from uuid import uuid4
 
 from .gitlab import is_valid_sha
@@ -106,15 +107,21 @@ class SQLiteStore:
         self,
         path: str | Path,
         redaction_secrets: Iterable[str] | None = None,
+        read_only: bool = False,
     ) -> None:
         self.path = str(path)
+        self._read_only = read_only
         self._redaction_secrets: set[str] = set()
         if isinstance(redaction_secrets, str):
             self.add_redaction_secret(redaction_secrets)
         elif redaction_secrets is not None:
             for secret in redaction_secrets:
                 self.add_redaction_secret(secret)
-        self._initialize()
+        if self._read_only:
+            if not Path(self.path).is_file():
+                raise FileNotFoundError(self.path)
+        else:
+            self._initialize()
 
     def add_redaction_secret(self, secret: str | None) -> None:
         """Register a runtime credential before writing audit diagnostics."""
@@ -130,10 +137,15 @@ class SQLiteStore:
         )
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=30)
+        if self._read_only:
+            database_uri = f"file:{quote(str(Path(self.path).resolve()), safe='/')}?mode=ro"
+            connection = sqlite3.connect(database_uri, timeout=30, uri=True)
+        else:
+            connection = sqlite3.connect(self.path, timeout=30)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA journal_mode = WAL")
+        if not self._read_only:
+            connection.execute("PRAGMA journal_mode = WAL")
         return connection
 
     def readiness_probe(self) -> dict[str, str | None]:
@@ -583,6 +595,21 @@ class SQLiteStore:
 
     heartbeat = extend_lease
 
+    def has_active_lease(self, run_id: int, claim_token: str | None) -> bool:
+        if not claim_token:
+            return False
+        now_text = datetime.now(UTC).isoformat()
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT 1 FROM review_runs
+                WHERE id = ? AND status = 'running' AND claim_token = ?
+                  AND lease_until IS NOT NULL AND lease_until > ?
+                """,
+                (run_id, claim_token, now_text),
+            ).fetchone()
+        return row is not None
+
     def finish(
         self,
         run_id: int,
@@ -599,6 +626,7 @@ class SQLiteStore:
             failure_class = None
             retryable = False
         with self._connect() as connection:
+            now_text = datetime.now(UTC).isoformat()
             query = (
                 "UPDATE review_runs SET status = ?, finished_at = ?, error = ?, "
                 "failure_class = ?, retryable = ?, lease_until = NULL, claim_token = NULL "
@@ -606,15 +634,18 @@ class SQLiteStore:
             )
             parameters: tuple[object, ...] = (
                 status,
-                datetime.now(UTC).isoformat(),
+                now_text,
                 safe_error,
                 failure_class,
                 int(retryable),
                 run_id,
             )
             if claim_token is not None:
-                query += " AND status = 'running' AND claim_token = ?"
-                parameters += (claim_token,)
+                query += (
+                    " AND status = 'running' AND claim_token = ?"
+                    " AND lease_until IS NOT NULL AND lease_until > ?"
+                )
+                parameters += (claim_token, now_text)
             cursor = connection.execute(query, parameters)
             if cursor.rowcount == 1 and failure_class is not None:
                 row = connection.execute(
@@ -641,7 +672,9 @@ class SQLiteStore:
     ) -> bool:
         if delay_seconds < 0:
             raise ValueError("delay_seconds cannot be negative")
-        next_attempt_at = (datetime.now(UTC) + timedelta(seconds=delay_seconds)).isoformat()
+        now = datetime.now(UTC)
+        now_text = now.isoformat()
+        next_attempt_at = (now + timedelta(seconds=delay_seconds)).isoformat()
         with self._connect() as connection:
             query = (
                 "UPDATE review_runs SET status = 'pending', error = ?, finished_at = NULL, "
@@ -656,8 +689,11 @@ class SQLiteStore:
                 run_id,
             )
             if claim_token is not None:
-                query += " AND status = 'running' AND claim_token = ?"
-                parameters += (claim_token,)
+                query += (
+                    " AND status = 'running' AND claim_token = ?"
+                    " AND lease_until IS NOT NULL AND lease_until > ?"
+                )
+                parameters += (claim_token, now_text)
             cursor = connection.execute(query, parameters)
             if cursor.rowcount == 1 and failure_class is not None:
                 row = connection.execute(
@@ -734,6 +770,16 @@ class SQLiteStore:
                     failure_class,
                     True,
                     safe_reason,
+                )
+                connection.execute(
+                    """
+                    UPDATE effect_receipts
+                    SET state = 'not_observed',
+                        error = COALESCE(error, ?),
+                        updated_at = ?, lease_until = NULL, claim_token = NULL
+                    WHERE run_id = ? AND state = 'running'
+                    """,
+                    (safe_reason, now.isoformat(), run_id),
                 )
         return updated.rowcount == 1 and not exhausted
 
@@ -860,9 +906,14 @@ class SQLiteStore:
         error: str | None = None,
         next_attempt_at: str | None = None,
         claim_token: str | None = None,
+        run_id: int | None = None,
+        run_claim_token: str | None = None,
     ) -> bool:
         if not state:
             raise ValueError("effect state cannot be empty")
+        if (run_id is None) != (run_claim_token is None):
+            raise ValueError("run_id and run_claim_token must be provided together")
+        now_text = datetime.now(UTC).isoformat()
         query = (
             "UPDATE effect_receipts SET state = ?, external_identity = ?, detail = ?, "
             "error = ?, next_attempt_at = ?, updated_at = ?, lease_until = NULL, "
@@ -874,12 +925,23 @@ class SQLiteStore:
             self._redact(detail) if detail else None,
             self._redact(error) if error else None,
             next_attempt_at,
-            datetime.now(UTC).isoformat(),
+            now_text,
             receipt_id,
         )
         if claim_token is not None:
             query += " AND state = 'running' AND claim_token = ?"
             parameters += (claim_token,)
+        if run_id is not None and run_claim_token is not None:
+            query += (
+                " AND run_id = ? AND EXISTS ("
+                "SELECT 1 FROM review_runs "
+                "WHERE review_runs.id = effect_receipts.run_id "
+                "AND review_runs.id = ? AND review_runs.status = 'running' "
+                "AND review_runs.claim_token = ? "
+                "AND review_runs.lease_until IS NOT NULL "
+                "AND review_runs.lease_until > ?)"
+            )
+            parameters += (run_id, run_id, run_claim_token, now_text)
         with self._connect() as connection:
             cursor = connection.execute(query, parameters)
         return cursor.rowcount == 1
@@ -889,6 +951,8 @@ class SQLiteStore:
         effect_kind: str,
         limit: int = 1,
         lease_seconds: int = DEFAULT_EFFECT_LEASE_SECONDS,
+        project_id: str | None = None,
+        max_attempts: int | None = None,
     ) -> tuple[EffectReceipt, ...]:
         if not effect_kind:
             raise ValueError("effect_kind cannot be empty")
@@ -896,42 +960,129 @@ class SQLiteStore:
             raise ValueError("effect receipt limit must be positive")
         if lease_seconds <= 0:
             raise ValueError("effect receipt lease_seconds must be positive")
+        if max_attempts is not None and max_attempts <= 0:
+            raise ValueError("effect receipt max_attempts must be positive")
+        if project_id is not None and not project_id.strip():
+            raise ValueError("project_id cannot be empty")
         now = datetime.now(UTC)
         now_text = now.isoformat()
         lease_until = (now + timedelta(seconds=lease_seconds)).isoformat()
+        project_scope = ""
+        project_parameters: tuple[object, ...] = ()
+        if project_id is not None:
+            project_scope = (
+                " AND EXISTS ("
+                "SELECT 1 FROM review_runs "
+                "WHERE review_runs.id = effect_receipts.run_id "
+                "AND review_runs.project_id = ?)"
+            )
+            project_parameters = (project_id,)
+        if max_attempts is None:
+            reclaim_state = "'pending'"
+            reclaim_next_attempt = "?"
+            reclaim_error = "error"
+            reclaim_parameters: tuple[object, ...] = (now_text, now_text)
+        else:
+            reclaim_state = "CASE WHEN attempt >= ? THEN 'not_observed' ELSE 'pending' END"
+            reclaim_next_attempt = "CASE WHEN attempt >= ? THEN NULL ELSE ? END"
+            reclaim_error = (
+                "CASE WHEN attempt >= ? THEN "
+                "COALESCE(error, 'effect receipt attempt limit reached after lease expiry') "
+                "ELSE error END"
+            )
+            reclaim_parameters = (
+                max_attempts,
+                max_attempts,
+                now_text,
+                now_text,
+                max_attempts,
+            )
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute(
-                """
+                f"""
                 UPDATE effect_receipts
-                SET state = 'pending', next_attempt_at = ?, lease_until = NULL,
-                    claim_token = NULL, updated_at = ?
+                SET state = {reclaim_state}, next_attempt_at = {reclaim_next_attempt},
+                    lease_until = NULL, claim_token = NULL, updated_at = ?,
+                    error = {reclaim_error}
                 WHERE effect_kind = ? AND state = 'running'
                   AND (lease_until IS NULL OR lease_until <= ?)
+                  {project_scope}
                 """,
-                (now_text, now_text, effect_kind, now_text),
+                (
+                    *reclaim_parameters,
+                    effect_kind,
+                    now_text,
+                    *project_parameters,
+                ),
+            )
+            if max_attempts is not None:
+                connection.execute(
+                    f"""
+                    UPDATE effect_receipts
+                    SET state = 'not_observed', next_attempt_at = NULL,
+                        lease_until = NULL, claim_token = NULL, updated_at = ?,
+                        error = COALESCE(
+                            error, 'effect receipt attempt limit reached'
+                        )
+                    WHERE effect_kind = ? AND state = 'pending' AND attempt >= ?
+                      {project_scope}
+                    """,
+                    (
+                        now_text,
+                        effect_kind,
+                        max_attempts,
+                        *project_parameters,
+                    ),
+                )
+            attempt_scope = (
+                " AND effect_receipts.attempt < ?" if max_attempts is not None else ""
             )
             rows = connection.execute(
-                """
-                SELECT id FROM effect_receipts
-                WHERE effect_kind = ? AND state = 'pending'
-                  AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
-                ORDER BY id LIMIT ?
+                f"""
+                SELECT effect_receipts.id FROM effect_receipts
+                JOIN review_runs ON review_runs.id = effect_receipts.run_id
+                WHERE effect_receipts.effect_kind = ? AND effect_receipts.state = 'pending'
+                  AND (effect_receipts.next_attempt_at IS NULL
+                       OR effect_receipts.next_attempt_at <= ?)
+                  {"AND review_runs.project_id = ?" if project_id is not None else ""}
+                  {attempt_scope}
+                ORDER BY effect_receipts.id LIMIT ?
                 """,
-                (effect_kind, now_text, limit),
+                (
+                    effect_kind,
+                    now_text,
+                    *(project_parameters or ()),
+                    *((max_attempts,) if max_attempts is not None else ()),
+                    limit,
+                ),
             ).fetchall()
             claimed_rows: list[sqlite3.Row] = []
             for row in rows:
                 token = uuid4().hex
-                connection.execute(
-                    """
+                claim_attempt_scope = (
+                    " AND attempt < ?" if max_attempts is not None else ""
+                )
+                claimed_update = connection.execute(
+                    f"""
                     UPDATE effect_receipts
                     SET state = 'running', attempt = attempt + 1,
                         lease_until = ?, claim_token = ?, updated_at = ?
                     WHERE id = ? AND state = 'pending'
+                      {project_scope}
+                      {claim_attempt_scope}
                     """,
-                    (lease_until, token, now_text, row["id"]),
+                    (
+                        lease_until,
+                        token,
+                        now_text,
+                        row["id"],
+                        *project_parameters,
+                        *((max_attempts,) if max_attempts is not None else ()),
+                    ),
                 )
+                if claimed_update.rowcount != 1:
+                    continue
                 claimed = connection.execute(
                     """
                     SELECT id AS receipt_id, run_id, effect_kind, dedupe_key, attempt, state,
@@ -980,8 +1131,11 @@ class SQLiteStore:
                 run_id,
             )
             if claim_token is not None:
-                update_query += " AND claim_token = ?"
-                update_parameters += (claim_token,)
+                update_query += (
+                    " AND claim_token = ?"
+                    " AND lease_until IS NOT NULL AND lease_until > ?"
+                )
+                update_parameters += (claim_token, created_at)
             updated = connection.execute(update_query, update_parameters)
             if updated.rowcount != 1:
                 return None
@@ -1312,14 +1466,49 @@ class SQLiteStore:
         auto_fix_mr_iid: int,
         status: str = "opened",
         merged_sha: str | None = None,
-    ) -> AutoFixRelation:
+        run_claim_token: str | None = None,
+        effect_receipt_id: int | None = None,
+        effect_claim_token: str | None = None,
+    ) -> AutoFixRelation | None:
         if not is_valid_sha(parent_sha):
             raise ValueError("invalid SHA: expected 40 or 64 hexadecimal characters")
         if status not in {"opened", "closed", "merged"}:
             raise ValueError(f"invalid Auto-fix status: {status}")
-        if merged_sha is not None and not is_valid_sha(merged_sha):
+        if status != "merged":
+            merged_sha = None
+        elif merged_sha is not None and not is_valid_sha(merged_sha):
             raise ValueError("invalid SHA: expected 40 or 64 hexadecimal characters")
+        if (effect_receipt_id is None) != (effect_claim_token is None):
+            raise ValueError(
+                "effect_receipt_id and effect_claim_token must be provided together"
+            )
         with self._connect() as connection:
+            if run_claim_token is not None or effect_receipt_id is not None:
+                now_text = datetime.now(UTC).isoformat()
+                connection.execute("BEGIN IMMEDIATE")
+                if run_claim_token is not None:
+                    active = connection.execute(
+                        """
+                        SELECT 1 FROM review_runs
+                        WHERE id = ? AND status = 'running' AND claim_token = ?
+                          AND lease_until IS NOT NULL AND lease_until > ?
+                        """,
+                        (run_id, run_claim_token, now_text),
+                    ).fetchone()
+                    if active is None:
+                        return None
+                if effect_receipt_id is not None and effect_claim_token is not None:
+                    active_receipt = connection.execute(
+                        """
+                        SELECT 1 FROM effect_receipts
+                        WHERE id = ? AND run_id = ? AND state = 'running'
+                          AND claim_token = ? AND lease_until IS NOT NULL
+                          AND lease_until > ?
+                        """,
+                        (effect_receipt_id, run_id, effect_claim_token, now_text),
+                    ).fetchone()
+                    if active_receipt is None:
+                        return None
             connection.execute(
                 """
                 INSERT INTO auto_fix_mrs(
@@ -1335,7 +1524,12 @@ class SQLiteStore:
                         WHEN auto_fix_mrs.status = 'merged' THEN 'merged'
                         ELSE excluded.status
                     END,
-                    merged_sha = COALESCE(auto_fix_mrs.merged_sha, excluded.merged_sha)
+                    merged_sha = CASE
+                        WHEN auto_fix_mrs.status = 'merged'
+                            THEN COALESCE(auto_fix_mrs.merged_sha, excluded.merged_sha)
+                        WHEN excluded.status = 'merged' THEN excluded.merged_sha
+                        ELSE NULL
+                    END
                 """,
                 (
                     parent_project_id,
@@ -1425,7 +1619,8 @@ class SQLiteStore:
             row = connection.execute(
                 """
                 SELECT 1 FROM auto_fix_mrs
-                WHERE parent_project_id = ? AND parent_mr_iid = ? AND merged_sha = ?
+                WHERE parent_project_id = ? AND parent_mr_iid = ?
+                  AND status = 'merged' AND merged_sha = ?
                 LIMIT 1
                 """,
                 (project_id, mr_iid, sha),

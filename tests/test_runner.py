@@ -1,7 +1,10 @@
+import os
 import sys
 from pathlib import Path
 
-from review_agent_flow.runner import AgentContext, LocalCliAgentRunner
+import pytest
+
+from review_agent_flow.runner import AgentContext, LeaseLostError, LocalCliAgentRunner
 
 SHA = "a" * 40
 
@@ -47,3 +50,32 @@ def test_runner_heartbeats_during_long_agent_without_a_background_thread(tmp_pat
     )
     assert result.returncode == 0
     assert heartbeats
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process-group assertion requires POSIX")
+def test_runner_kills_agent_process_group_when_heartbeat_raises(tmp_path: Path) -> None:
+    marker = tmp_path / "descendant-finished"
+    child_code = (
+        "import pathlib, sys, time; time.sleep(0.3); "
+        "pathlib.Path(sys.argv[1]).write_text('descendant survived')"
+    )
+    parent_code = (
+        "import subprocess, sys, time; "
+        "subprocess.Popen([sys.executable, '-c', sys.argv[2], sys.argv[1]]); "
+        "time.sleep(5)"
+    )
+
+    def heartbeat() -> bool:
+        raise RuntimeError("heartbeat backend failed")
+
+    with pytest.raises(LeaseLostError):
+        LocalCliAgentRunner(
+            [sys.executable, "-c", parent_code, str(marker), child_code],
+            timeout_seconds=2,
+        ).run(
+            AgentContext("42", 7, 11, SHA, "https://gitlab.example", tmp_path),
+            heartbeat=heartbeat,
+            heartbeat_interval_seconds=0.05,
+        )
+
+    assert not marker.exists()

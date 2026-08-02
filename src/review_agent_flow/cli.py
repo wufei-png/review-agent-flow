@@ -76,7 +76,12 @@ def _run_status(args: argparse.Namespace) -> int:
     """Print one project-bound Review Run snapshot without contacting GitLab."""
 
     project_id = _required(args.project_id, "REVIEW_AGENT_FLOW_PROJECT_ID")
-    store = SQLiteStore(args.db or os.getenv("REVIEW_AGENT_FLOW_DB", "review-agent-flow.sqlite3"))
+    database = args.db or os.getenv("REVIEW_AGENT_FLOW_DB", "review-agent-flow.sqlite3")
+    try:
+        store = SQLiteStore(database, read_only=True)
+    except FileNotFoundError:
+        print(json.dumps({"status": "not_found"}, sort_keys=True))
+        return 1
     snapshot = store.get_project_bound_review_run_status(project_id, args.run_id)
     if snapshot is None:
         print(json.dumps({"status": "not_found"}, sort_keys=True))

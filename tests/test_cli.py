@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -68,3 +69,12 @@ def test_worker_entry_requires_a_bound_project(monkeypatch, tmp_path: Path) -> N
     monkeypatch.delenv("REVIEW_AGENT_FLOW_PROJECT_ID", raising=False)
     with pytest.raises(SystemExit, match="REVIEW_AGENT_FLOW_PROJECT_ID"):
         cli._run_worker(args)
+
+
+def test_status_does_not_create_missing_database(tmp_path: Path, capsys) -> None:
+    database = tmp_path / "missing-review.db"
+    args = SimpleNamespace(project_id="42", run_id=1, db=str(database))
+
+    assert cli._run_status(args) == 1
+    assert json.loads(capsys.readouterr().out) == {"status": "not_found"}
+    assert not database.exists()

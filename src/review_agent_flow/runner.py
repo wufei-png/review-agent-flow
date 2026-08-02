@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -35,6 +36,20 @@ class AgentResult:
 
 class LeaseLostError(RuntimeError):
     """Raised when the worker can no longer renew the Review Run lease."""
+
+
+def _terminate_process(process: subprocess.Popen) -> tuple[str | None, str | None]:
+    """Stop the Agent and wait for its process group to release inherited credentials."""
+
+    if os.name == "posix":
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            if process.poll() is None:
+                process.kill()
+    elif process.poll() is None:
+        process.kill()
+    return process.communicate()
 
 
 class LocalCliAgentRunner:
@@ -83,14 +98,14 @@ class LocalCliAgentRunner:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            start_new_session=os.name == "posix",
         )
         deadline = time.monotonic() + self.timeout_seconds
         interval = min(heartbeat_interval_seconds, float(self.timeout_seconds))
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                process.kill()
-                stdout, stderr = process.communicate()
+                stdout, stderr = _terminate_process(process)
                 return AgentResult(
                     returncode=124,
                     stdout=redact(stdout or "", secrets=redaction_secrets),
@@ -105,7 +120,16 @@ class LocalCliAgentRunner:
                     redact(stderr or "", secrets=redaction_secrets),
                 )
             except subprocess.TimeoutExpired:
-                if heartbeat is not None and not heartbeat():
-                    process.kill()
-                    process.communicate()
-                    raise LeaseLostError("Review Run lease was lost during Agent execution")
+                if heartbeat is not None:
+                    try:
+                        heartbeat_ok = heartbeat()
+                    except Exception as exc:
+                        _terminate_process(process)
+                        raise LeaseLostError(
+                            "Review Run lease heartbeat failed during Agent execution"
+                        ) from exc
+                    if not heartbeat_ok:
+                        _terminate_process(process)
+                        raise LeaseLostError(
+                            "Review Run lease was lost during Agent execution"
+                        )
