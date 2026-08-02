@@ -1,12 +1,17 @@
+import pytest
 from fastapi.testclient import TestClient
 
 from review_agent_flow.store import SQLiteStore
-from review_agent_flow.web import create_app
+from review_agent_flow.web import StartupConfigurationError, create_app
+
+SHA = "a" * 40
+MERGED_SHA = "b" * 40
+PIPELINE_SHA = "c" * 40
 
 
 def test_gitlab_webhook_is_idempotent_and_secret_checked(tmp_path) -> None:
     store = SQLiteStore(tmp_path / "review.db")
-    client = TestClient(create_app(store, webhook_secret="secret"))
+    client = TestClient(create_app(store, webhook_secret="secret", project_id="42"))
     payload = {
         "project": {"id": 42},
         "object_attributes": {
@@ -15,7 +20,7 @@ def test_gitlab_webhook_is_idempotent_and_secret_checked(tmp_path) -> None:
             "title": "Improve validation",
             "source_branch": "feature/validation",
             "target_branch": "main",
-            "last_commit": {"id": "abc"},
+            "last_commit": {"id": SHA},
             "work_in_progress": False,
         },
     }
@@ -30,9 +35,9 @@ def test_gitlab_webhook_is_idempotent_and_secret_checked(tmp_path) -> None:
 
 def test_auto_fix_merge_marks_only_the_resulting_sha(tmp_path) -> None:
     store = SQLiteStore(tmp_path / "review.db")
-    run = store.enqueue("42", 1, "parent-sha")
-    store.record_auto_fix("42", 1, "parent-sha", run.run_id, "42", 9)
-    client = TestClient(create_app(store))
+    run = store.enqueue("42", 1, SHA)
+    store.record_auto_fix("42", 1, SHA, run.run_id, "42", 9)
+    client = TestClient(create_app(store, webhook_secret="secret", project_id="42"))
     payload = {
         "project": {"id": 42},
         "object_attributes": {
@@ -41,23 +46,25 @@ def test_auto_fix_merge_marks_only_the_resulting_sha(tmp_path) -> None:
             "title": "[ReviewFlow Auto-Fix] Improve validation",
             "source_branch": "autofix/MR-1/run-1",
             "target_branch": "feature/validation",
-            "last_commit": {"id": "auto-fix-head"},
-            "merge_commit_sha": "merged-parent-sha",
+            "last_commit": {"id": SHA},
+            "merge_commit_sha": MERGED_SHA,
             "work_in_progress": False,
         },
     }
-    response = client.post("/webhooks/gitlab", json=payload)
+    response = client.post(
+        "/webhooks/gitlab", json=payload, headers={"X-Gitlab-Token": "secret"}
+    )
     assert response.status_code == 200
     assert response.json()["kind"] == "autofix_merged"
-    assert store.is_suppressed_parent_sha("42", 1, "merged-parent-sha") is True
+    assert store.is_suppressed_parent_sha("42", 1, MERGED_SHA) is True
 
 
 def test_pipeline_hook_accepts_each_ready_merge_request_in_a_list(tmp_path) -> None:
     store = SQLiteStore(tmp_path / "review.db")
-    client = TestClient(create_app(store))
+    client = TestClient(create_app(store, webhook_secret="secret", project_id="42"))
     payload = {
         "project": {"id": 42},
-        "object_attributes": {"status": "success", "sha": "abc"},
+        "object_attributes": {"status": "success", "sha": PIPELINE_SHA},
         "merge_request": [
             {"iid": 1, "title": "Ready", "source_branch": "feature/one"},
             {"iid": 2, "title": "Draft", "draft": True, "source_branch": "feature/two"},
@@ -67,10 +74,109 @@ def test_pipeline_hook_accepts_each_ready_merge_request_in_a_list(tmp_path) -> N
     response = client.post(
         "/webhooks/gitlab",
         json=payload,
-        headers={"X-Gitlab-Event": "Pipeline Hook"},
+        headers={"X-Gitlab-Event": "Pipeline Hook", "X-Gitlab-Token": "secret"},
     )
     assert response.status_code == 200
     body = response.json()
     assert body["accepted"] is True
     assert [item["run_id"] for item in body["decisions"] if item["accepted"]] == [1, 2]
     assert body["decisions"][1]["accepted"] is False
+
+
+def test_create_app_requires_secret_and_bound_project(monkeypatch, tmp_path) -> None:
+    monkeypatch.delenv("GITLAB_WEBHOOK_SECRET", raising=False)
+    monkeypatch.delenv("REVIEW_AGENT_FLOW_PROJECT_ID", raising=False)
+    store = SQLiteStore(tmp_path / "review.db")
+    with pytest.raises(StartupConfigurationError, match="GITLAB_WEBHOOK_SECRET"):
+        create_app(store, project_id="42")
+
+    with pytest.raises(StartupConfigurationError, match="REVIEW_AGENT_FLOW_PROJECT_ID"):
+        create_app(store, webhook_secret="secret")
+
+
+def test_explicit_empty_secret_does_not_enable_anonymous_mode(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("GITLAB_WEBHOOK_SECRET", "environment-secret")
+    store = SQLiteStore(tmp_path / "review.db")
+    with pytest.raises(StartupConfigurationError, match="GITLAB_WEBHOOK_SECRET"):
+        create_app(store, webhook_secret="", project_id="42")
+
+
+def test_webhook_rejects_a_different_project_without_enqueueing(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "review.db")
+    client = TestClient(create_app(store, webhook_secret="secret", project_id="42"))
+    response = client.post(
+        "/webhooks/gitlab",
+        json={
+            "project": {"id": 99},
+            "object_attributes": {
+                "action": "update",
+                "iid": 1,
+                "last_commit": {"id": SHA},
+                "work_in_progress": False,
+            },
+        },
+        headers={"X-Gitlab-Token": "secret", "X-Gitlab-Event": "Merge Request Hook"},
+    )
+    assert response.status_code == 403
+    assert store.claim_next() is None
+
+
+def test_webhook_rejects_project_mismatch_for_ignored_event(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "review.db")
+    client = TestClient(create_app(store, webhook_secret="secret", project_id="42"))
+    response = client.post(
+        "/webhooks/gitlab",
+        json={
+            "project": {"id": 99},
+            "object_attributes": {
+                "action": "close",
+                "iid": 1,
+                "last_commit": {"id": SHA},
+                "work_in_progress": False,
+            },
+        },
+        headers={"X-Gitlab-Token": "secret", "X-Gitlab-Event": "Merge Request Hook"},
+    )
+    assert response.status_code == 403
+    assert store.claim_next() is None
+
+
+def test_webhook_rejects_invalid_sha_without_enqueueing(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "review.db")
+    client = TestClient(create_app(store, webhook_secret="secret", project_id="42"))
+    response = client.post(
+        "/webhooks/gitlab",
+        json={
+            "project": {"id": 42},
+            "object_attributes": {
+                "action": "update",
+                "iid": 1,
+                "last_commit": {"id": "abc"},
+                "merge_commit_sha": MERGED_SHA,
+            },
+        },
+        headers={"X-Gitlab-Token": "secret", "X-Gitlab-Event": "Merge Request Hook"},
+    )
+    assert response.status_code == 200
+    assert response.json()["accepted"] is False
+    assert store.claim_next() is None
+
+
+def test_webhook_does_not_enqueue_merge_commit_as_normal_head(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "review.db")
+    client = TestClient(create_app(store, webhook_secret="secret", project_id="42"))
+    response = client.post(
+        "/webhooks/gitlab",
+        json={
+            "project": {"id": 42},
+            "object_attributes": {
+                "action": "update",
+                "iid": 1,
+                "merge_commit_sha": MERGED_SHA,
+            },
+        },
+        headers={"X-Gitlab-Token": "secret", "X-Gitlab-Event": "Merge Request Hook"},
+    )
+    assert response.status_code == 200
+    assert response.json()["accepted"] is False
+    assert store.claim_next() is None

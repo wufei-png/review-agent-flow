@@ -22,6 +22,11 @@
 
 ## Execution
 
+**Ingress Authentication**: A ReviewFlow deployment may accept GitLab webhook
+events only when its runtime authentication secret is configured and matches.
+An unset secret makes the deployment unusable for webhook intake rather than
+turning webhook requests into an anonymous mode.
+
 **AI Provider**: OpenAI-compatible API。核心只定义接口，部署文档推荐 LiteLLM，不内置模型厂商 SDK。
 
 **Agent Backend**: 本地 CLI 或本地 Agent 服务。它与 AI Provider 分离。

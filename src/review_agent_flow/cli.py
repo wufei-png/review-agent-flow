@@ -28,17 +28,16 @@ def _init_policy(path: Path, force: bool) -> int:
 
 
 def _required(value: str | None, env_name: str) -> str:
-    if value:
-        return value
-    from_environment = os.getenv(env_name)
-    if from_environment:
-        return from_environment
+    configured = value if value is not None else os.getenv(env_name)
+    if configured is not None and configured.strip():
+        return configured.strip()
     raise SystemExit(f"missing required option or environment variable: {env_name}")
 
 
 def _run_worker(args: argparse.Namespace) -> int:
     gitlab_url = _required(args.gitlab_url, "GITLAB_URL")
     gitlab_token = _required(args.gitlab_token, "GITLAB_TOKEN")
+    project_id = _required(args.project_id, "REVIEW_AGENT_FLOW_PROJECT_ID")
     repository = Path(_required(args.repository, "REVIEW_AGENT_FLOW_REPOSITORY")).expanduser().resolve()
     policy_path = Path(args.policy or os.getenv("REVIEW_AGENT_FLOW_POLICY", ".gitlab/reviewflow.yml"))
     if not policy_path.is_absolute():
@@ -60,6 +59,7 @@ def _run_worker(args: argparse.Namespace) -> int:
         agent_timeout_seconds=args.agent_timeout,
         lease_seconds=args.agent_timeout + 60,
         retry_delay_seconds=args.poll_interval,
+        project_id=project_id,
     )
     if args.once:
         result = worker.process_one()
@@ -81,6 +81,7 @@ def main(argv: list[str] | None = None) -> int:
     worker = subparsers.add_parser("worker", help="run the Review Run worker")
     worker.add_argument("--gitlab-url")
     worker.add_argument("--gitlab-token")
+    worker.add_argument("--project-id")
     worker.add_argument("--repository")
     worker.add_argument("--policy")
     worker.add_argument("--db")

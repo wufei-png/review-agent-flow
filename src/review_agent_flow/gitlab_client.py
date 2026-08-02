@@ -25,6 +25,9 @@ class PythonGitLabClient(GitLabClient):
         mr = self._project(project_id).mergerequests.get(mr_iid)
         diff_refs = getattr(mr, "diff_refs", {}) or {}
         author = getattr(mr, "author", {}) or {}
+        state = str(getattr(mr, "state", "opened") or "opened")
+        if state == "opened" and getattr(mr, "merged_at", None):
+            state = "merged"
         return MergeRequest(
             project_id=str(project_id),
             iid=mr_iid,
@@ -32,9 +35,10 @@ class PythonGitLabClient(GitLabClient):
             author_username=str(author.get("username") or ""),
             source_branch=str(mr.source_branch),
             target_branch=str(mr.target_branch),
-            sha=str(diff_refs.get("head_sha") or mr.sha),
+            sha=str(diff_refs.get("head_sha") or getattr(mr, "sha", "")),
             web_url=str(mr.web_url),
             draft=bool(getattr(mr, "draft", False) or getattr(mr, "work_in_progress", False)),
+            state=state,
         )
 
     def get_latest_pipeline(self, project_id: str, sha: str) -> Pipeline | None:

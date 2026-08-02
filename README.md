@@ -51,17 +51,24 @@ pytest
 启动 Webhook API：
 
 ```bash
+export GITLAB_WEBHOOK_SECRET='replace-with-a-random-secret'
+export REVIEW_AGENT_FLOW_PROJECT_ID=42
 uvicorn review_agent_flow.web:create_app --factory --host 127.0.0.1 --port 8080
 ```
+
+`GITLAB_WEBHOOK_SECRET` 和 `REVIEW_AGENT_FLOW_PROJECT_ID` 都是 API 启动所需的部署配置。Secret 缺失或为空时服务直接启动失败；请求 token 错误返回 `401`，其他 Project 返回 `403`，不会进入队列。测试或显式嵌入式调用可以向 `create_app(..., webhook_secret=..., project_id=...)` 传值，但不存在匿名 Webhook 模式。
 
 Worker 使用同一个 SQLite 数据库：
 
 ```bash
 export GITLAB_URL=https://gitlab.example.com
 export GITLAB_TOKEN=glpat-...
+export REVIEW_AGENT_FLOW_PROJECT_ID=42
 export REVIEW_AGENT_FLOW_REPOSITORY=/workspace/project
 review-agent-flow worker
 ```
+
+Worker 也必须绑定同一个 `REVIEW_AGENT_FLOW_PROJECT_ID`；可以用 `--project-id 42` 显式传入，CLI 参数优先于环境变量。它只领取该 Project 的任务，并在执行前确认 MR 仍处于打开状态且当前 head SHA 与 Run 完全一致。
 
 单次领取任务可用于调试：
 
@@ -69,7 +76,7 @@ review-agent-flow worker
 review-agent-flow worker --once
 ```
 
-Docker 镜像默认启动 Webhook API；Worker 建议作为同镜像的独立进程或独立容器运行，并共享数据库、Project checkout 和 worktree 根目录。
+Docker 镜像默认启动 Webhook API；运行容器时必须注入 `GITLAB_WEBHOOK_SECRET` 和 `REVIEW_AGENT_FLOW_PROJECT_ID`。Worker 建议作为同镜像的独立进程或独立容器运行，并共享数据库、Project checkout 和 worktree 根目录。
 
 ## License
 

@@ -4,10 +4,10 @@
 
 1. GitLab 发送 Merge Request Hook。
 2. Webhook 验证 token，读取 Project、MR IID、action、draft 状态和 head SHA。
-3. Draft MR 不创建运行；如果 Webhook 与 Worker 获取 MR 之间发生状态竞态，Worker 会重新排队而不发送通知或启动 Agent。
+3. Draft MR 不创建运行；如果 Webhook 与 Worker 获取 MR 之间发生状态竞态，Worker 会取消旧 Run、原子地重新排队最新 SHA，而不发送通知或启动 Agent。Closed 或 merged MR 直接取消 Run。
 4. 若 Project 启用 Pipeline Gate，Worker 将对应 Run 延后到下一次可检查时间；等待中的 Run 不阻塞后续已就绪 Run。
 5. Store 以 `(project_id, mr_iid, sha, kind=normal)` 去重并创建 `pending` Review Run。
-6. Worker 以租约 claim 一个可执行的 pending Run，创建该 SHA 的独立 worktree；租约过期的 Run 最多自动恢复三次。
+6. Worker 以绑定 Project 过滤并租约 claim 一个可执行的 pending Run，确认 MR 当前 head SHA 与 Run SHA 完全一致后创建该 SHA 的独立 worktree；租约过期的 Run 最多自动恢复三次。
 7. Worker 按 Policy 将 Human 通知写入按渠道拆分的 outbox，并触发 Human Review 和/或 Agent Review；通知投递失败不改变 Review Run 状态，两条路径互不依赖。
 8. Agent 直接提交 Note；如果 Policy 允许并且 Agent 判断需要修复，则创建 Auto-fix MR。
 9. Worker 记录成功、失败或取消，清理 worktree。

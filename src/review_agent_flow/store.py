@@ -9,6 +9,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
+from .gitlab import is_valid_sha
+
 DEFAULT_LEASE_SECONDS = 1860
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_NOTIFICATION_LEASE_SECONDS = 30
@@ -154,6 +156,10 @@ class SQLiteStore:
             connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def enqueue(self, project_id: str, mr_iid: int, sha: str, kind: str = "normal") -> ReviewRun:
+        if not project_id or not str(project_id).strip():
+            raise ValueError("project_id cannot be empty")
+        if not is_valid_sha(sha):
+            raise ValueError("invalid SHA: expected 40 or 64 hexadecimal characters")
         created_at = datetime.now(UTC).isoformat()
         with self._connect() as connection:
             connection.execute(
@@ -181,11 +187,14 @@ class SQLiteStore:
         self,
         lease_seconds: int = DEFAULT_LEASE_SECONDS,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+        project_id: str | None = None,
     ) -> ReviewRun | None:
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
         if max_attempts <= 0:
             raise ValueError("max_attempts must be positive")
+        if project_id is not None and not project_id.strip():
+            raise ValueError("project_id cannot be empty")
 
         now = datetime.now(UTC)
         now_text = now.isoformat()
@@ -193,8 +202,7 @@ class SQLiteStore:
         claim_token = uuid4().hex
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            connection.execute(
-                """
+            recovery_query = """
                 UPDATE review_runs
                 SET status = CASE
                         WHEN COALESCE(attempts, 0) >= ? THEN 'failed'
@@ -216,29 +224,33 @@ class SQLiteStore:
                     claim_token = NULL
                 WHERE status = 'running'
                   AND (lease_until IS NULL OR lease_until <= ?)
-                """,
-                (
-                    max_attempts,
-                    max_attempts,
-                    now_text,
-                    max_attempts,
-                    max_attempts,
-                    now_text,
-                    now_text,
-                ),
+            """
+            recovery_parameters: tuple[object, ...] = (
+                max_attempts,
+                max_attempts,
+                now_text,
+                max_attempts,
+                max_attempts,
+                now_text,
+                now_text,
             )
-            row = connection.execute(
-                """
+            if project_id is not None:
+                recovery_query += " AND project_id = ?"
+                recovery_parameters += (project_id,)
+            connection.execute(recovery_query, recovery_parameters)
+            select_query = """
                 SELECT id AS run_id, project_id, mr_iid, sha, kind, status,
                        attempts, lease_until, claim_token
                 FROM review_runs
                 WHERE status = 'pending'
                   AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
-                ORDER BY id
-                LIMIT 1
-                """,
-                (now_text,),
-            ).fetchone()
+            """
+            select_parameters: tuple[object, ...] = (now_text,)
+            if project_id is not None:
+                select_query += " AND project_id = ?"
+                select_parameters += (project_id,)
+            select_query += " ORDER BY id LIMIT 1"
+            row = connection.execute(select_query, select_parameters).fetchone()
             if row is None:
                 return None
             connection.execute(
@@ -303,6 +315,61 @@ class SQLiteStore:
                 parameters += (claim_token,)
             cursor = connection.execute(query, parameters)
         return cursor.rowcount == 1
+
+    def cancel_and_enqueue_latest(
+        self,
+        run_id: int,
+        project_id: str,
+        mr_iid: int,
+        sha: str,
+        kind: str,
+        reason: str,
+        claim_token: str | None = None,
+    ) -> ReviewRun | None:
+        """Cancel a stale claimed run and atomically make the current SHA pending."""
+
+        if not project_id or not project_id.strip():
+            raise ValueError("project_id cannot be empty")
+        if not is_valid_sha(sha):
+            raise ValueError("invalid SHA: expected 40 or 64 hexadecimal characters")
+        created_at = datetime.now(UTC).isoformat()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            update_query = (
+                "UPDATE review_runs SET status = 'cancelled', finished_at = ?, error = ?, "
+                "next_attempt_at = NULL, lease_until = NULL, claim_token = NULL "
+                "WHERE id = ? AND status = 'running'"
+            )
+            update_parameters: tuple[object, ...] = (
+                created_at,
+                reason,
+                run_id,
+            )
+            if claim_token is not None:
+                update_query += " AND claim_token = ?"
+                update_parameters += (claim_token,)
+            if connection.execute(update_query, update_parameters).rowcount != 1:
+                return None
+
+            connection.execute(
+                """
+                INSERT INTO review_runs(
+                    project_id, mr_iid, sha, kind, created_at, next_attempt_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, mr_iid, sha, kind) DO NOTHING
+                """,
+                (project_id, mr_iid, sha, kind, created_at, created_at),
+            )
+            row = connection.execute(
+                """
+                SELECT id AS run_id, project_id, mr_iid, sha, kind, status,
+                       attempts, lease_until, claim_token
+                FROM review_runs WHERE project_id = ? AND mr_iid = ? AND sha = ? AND kind = ?
+                """,
+                (project_id, mr_iid, sha, kind),
+            ).fetchone()
+        assert row is not None
+        return ReviewRun(**dict(row))
 
     def enqueue_notifications(
         self,
@@ -592,6 +659,8 @@ class SQLiteStore:
         auto_fix_project_id: str,
         auto_fix_mr_iid: int,
     ) -> AutoFixRelation:
+        if not is_valid_sha(parent_sha):
+            raise ValueError("invalid SHA: expected 40 or 64 hexadecimal characters")
         with self._connect() as connection:
             connection.execute(
                 """
@@ -650,6 +719,8 @@ class SQLiteStore:
         return AutoFixRelation(**dict(row))
 
     def mark_auto_fix_merged(self, auto_fix_project_id: str, auto_fix_mr_iid: int, merged_sha: str) -> None:
+        if not is_valid_sha(merged_sha):
+            raise ValueError("invalid SHA: expected 40 or 64 hexadecimal characters")
         with self._connect() as connection:
             cursor = connection.execute(
                 """

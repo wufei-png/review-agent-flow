@@ -30,7 +30,7 @@ pending -> running -> succeeded
 
 The Store must atomically claim an eligible pending Run so two Workers cannot execute the same Run. A Run is unique by `(project_id, mr_iid, sha, kind)`. A deferred Run has a `next_attempt_at` and does not block later eligible Runs.
 
-Each running Run has a lease expiration and opaque claim token. A Worker clears the lease when it finishes or defers the Run. If a Worker dies, the next claim operation recovers an expired Run to `pending`; after three claims without a terminal update, the Store marks it `failed` with a lease-expiry diagnostic. Ordinary Agent non-zero exits are terminal failures and are not automatically retried.
+Each running Run has a lease expiration and opaque claim token. A Worker clears the lease when it finishes or defers the Run. If a Worker dies, the next claim operation recovers an expired Run to `pending`; after three claims without a terminal update, the Store marks it `failed` with a lease-expiry diagnostic. A Worker claims only its configured Project, cancels a Run whose MR is closed/merged, and atomically cancels and requeues the latest SHA when the MR head has advanced. Ordinary Agent non-zero exits are terminal failures and are not automatically retried.
 
 ## Required storage records
 
@@ -55,4 +55,4 @@ An `auto_fix_merge_events` table retains an Auto-fix merge event that arrives be
 - One API process and one Worker are the reference deployment.
 - Database polling is the first queue implementation.
 - Postgres and Redis are future implementations behind interfaces, not v0.1 dependencies.
-- Webhook secret, GitLab token, Review Bot credentials and channel secrets are runtime inputs.
+- `GITLAB_WEBHOOK_SECRET` and `REVIEW_AGENT_FLOW_PROJECT_ID` are required API/Worker deployment inputs; GitLab token, Review Bot credentials and channel secrets are also runtime inputs.

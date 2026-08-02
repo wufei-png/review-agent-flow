@@ -33,8 +33,12 @@
 ## v0.1 acceptance criteria
 
 - A duplicate Webhook for the same Project/MR/SHA creates one Run.
+- Webhook startup fails without `GITLAB_WEBHOOK_SECRET` or `REVIEW_AGENT_FLOW_PROJECT_ID`.
+- Webhook and Worker reject or ignore work outside their configured Project.
+- Normal review intake accepts only a valid exact head SHA and never falls back to `merge_commit_sha`.
 - Two Worker claims cannot execute one pending Run twice.
 - A normal Run uses an exact-SHA worktree and always cleans it up.
+- A stale, closed or merged MR cannot trigger notification or Agent execution.
 - Agent command receives the documented environment and direct GitLab token context.
 - Auto-fix creates a separate MR and never writes directly to the parent source branch.
 - Auto-fix MR notification targets only the parent MR creator.

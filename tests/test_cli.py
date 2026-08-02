@@ -1,6 +1,8 @@
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from review_agent_flow import cli
 from review_agent_flow.policy import ReviewPolicy
 
@@ -34,6 +36,7 @@ def test_worker_resolves_relative_policy_from_repository(monkeypatch, tmp_path: 
     args = SimpleNamespace(
         gitlab_url="https://gitlab",
         gitlab_token="token",
+        project_id="42",
         repository=str(repository),
         policy=None,
         db=None,
@@ -44,3 +47,24 @@ def test_worker_resolves_relative_policy_from_repository(monkeypatch, tmp_path: 
     )
     assert cli._run_worker(args) == 0
     assert captured["policy_path"] == repository / ".gitlab/reviewflow.yml"
+    assert captured["worker"]["project_id"] == "42"
+
+
+def test_worker_entry_requires_a_bound_project(monkeypatch, tmp_path: Path) -> None:
+    repository = tmp_path / "project"
+    repository.mkdir()
+    args = SimpleNamespace(
+        gitlab_url="https://gitlab",
+        gitlab_token="token",
+        project_id=None,
+        repository=str(repository),
+        policy=None,
+        db=None,
+        worktrees=None,
+        agent_timeout=1800,
+        poll_interval=5.0,
+        once=True,
+    )
+    monkeypatch.delenv("REVIEW_AGENT_FLOW_PROJECT_ID", raising=False)
+    with pytest.raises(SystemExit, match="REVIEW_AGENT_FLOW_PROJECT_ID"):
+        cli._run_worker(args)

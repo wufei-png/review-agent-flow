@@ -2,7 +2,9 @@
 
 ## GitLab ingress
 
-The API accepts GitLab Merge Request Hooks at `POST /webhooks/gitlab` and checks `X-Gitlab-Token` when `GITLAB_WEBHOOK_SECRET` is configured. It must use the Project ID, MR IID and exact head SHA from the payload. Missing identity or SHA is rejected without enqueueing work.
+The API accepts GitLab Merge Request Hooks at `POST /webhooks/gitlab` only after `GITLAB_WEBHOOK_SECRET` and `REVIEW_AGENT_FLOW_PROJECT_ID` are configured. It checks `X-Gitlab-Token` on every request; a wrong token returns `401`, and a payload from another Project returns `403` without enqueueing work. The deployment is single-Project: the configured Project ID must match the payload Project ID.
+
+Normal Merge Request review runs use only `object_attributes.last_commit.id` or `object_attributes.last_commit_id`. `merge_commit_sha` is never a normal review fallback; it is reserved for the Auto-fix MR merge event. Every enqueued or suppression SHA must be a 40- or 64-character hexadecimal SHA. Missing or invalid Project/MR identity or SHA is rejected without enqueueing work.
 
 The current endpoint is intentionally small. The remaining GitLab adapter must provide:
 

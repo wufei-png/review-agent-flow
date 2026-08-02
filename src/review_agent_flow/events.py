@@ -6,6 +6,8 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from .gitlab import is_valid_sha
+
 AUTO_FIX_TITLE_PREFIX = "[ReviewFlow Auto-Fix]"
 AUTO_FIX_BRANCH_RE = re.compile(r"^autofix/MR-(?P<mr_iid>\d+)/run-(?P<run_id>\d+)$")
 
@@ -84,12 +86,8 @@ def _parse_merge_request(payload: dict[str, Any]) -> WebhookDecision:
     attrs = payload.get("object_attributes") or {}
     project_id = _project_id(payload)
     mr_iid = _int_or_none(attrs.get("iid"))
-    last_commit = attrs.get("last_commit") or {}
-    sha = last_commit.get("id") or attrs.get("last_commit_id") or attrs.get("merge_commit_sha")
-    if not project_id or mr_iid is None or not sha:
+    if not project_id or mr_iid is None:
         return WebhookDecision(False, "missing project, MR IID, or SHA")
-    if attrs.get("work_in_progress") is True or attrs.get("draft") is True:
-        return WebhookDecision(False, "draft merge request", project_id=project_id, mr_iid=mr_iid)
 
     title = str(attrs.get("title") or "")
     source_branch = attrs.get("source_branch")
@@ -98,20 +96,45 @@ def _parse_merge_request(payload: dict[str, Any]) -> WebhookDecision:
     is_auto_fix = title.startswith(AUTO_FIX_TITLE_PREFIX) or branch_match is not None
     parent_mr_iid = int(branch_match.group("mr_iid")) if branch_match else None
     action = attrs.get("action")
+
+    if attrs.get("work_in_progress") is True or attrs.get("draft") is True:
+        return WebhookDecision(False, "draft merge request", project_id=project_id, mr_iid=mr_iid)
+
     if action == "merge" and is_auto_fix:
-        merged_sha = attrs.get("merge_commit_sha") or attrs.get("last_commit_id") or sha
+        merged_sha = attrs.get("merge_commit_sha")
+        if not is_valid_sha(merged_sha):
+            return WebhookDecision(
+                False,
+                "auto-fix merge event has an invalid merge_commit_sha",
+                project_id=project_id,
+                mr_iid=mr_iid,
+            )
         return WebhookDecision(
             accepted=True,
             reason="auto-fix merge request merged",
             kind="autofix_merged",
             project_id=project_id,
             mr_iid=mr_iid,
-            sha=str(merged_sha),
+            sha=merged_sha,
             title=title,
             source_branch=str(source_branch) if source_branch else None,
             target_branch=str(target_branch) if target_branch else None,
             parent_mr_iid=parent_mr_iid,
-            merged_sha=str(merged_sha),
+            merged_sha=merged_sha,
+        )
+
+    last_commit = attrs.get("last_commit") or {}
+    if not isinstance(last_commit, dict):
+        last_commit = {}
+    sha = last_commit.get("id") or attrs.get("last_commit_id")
+    if not project_id or mr_iid is None or not sha:
+        return WebhookDecision(False, "missing project, MR IID, or SHA")
+    if not is_valid_sha(sha):
+        return WebhookDecision(
+            False,
+            "invalid Merge Request head SHA; expected 40 or 64 hexadecimal characters",
+            project_id=project_id,
+            mr_iid=mr_iid,
         )
     if action and action not in {"open", "reopen", "update"}:
         return WebhookDecision(
@@ -144,6 +167,14 @@ def _parse_pipeline(payload: dict[str, Any]) -> tuple[WebhookDecision, ...]:
         return (WebhookDecision(False, f"pipeline status is not success: {status}"),)
     if not project_id or not sha:
         return (WebhookDecision(False, "pipeline has no project or SHA"),)
+    if not is_valid_sha(sha):
+        return (
+            WebhookDecision(
+                False,
+                "invalid pipeline SHA; expected 40 or 64 hexadecimal characters",
+                project_id=project_id,
+            ),
+        )
 
     raw_merge_requests = payload.get("merge_request") or attrs.get("merge_request")
     if isinstance(raw_merge_requests, dict):

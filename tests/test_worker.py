@@ -2,6 +2,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from review_agent_flow.gitlab import CreatedMergeRequest, MergeRequest, Pipeline
 from review_agent_flow.notifications import FanoutNotifier, NotificationEvent, NotificationResult
 from review_agent_flow.policy import AIPolicy, HumanPolicy, ReviewPolicy
@@ -98,6 +100,7 @@ def test_worker_runs_agent_in_exact_sha_worktree_and_cleans_it(tmp_path: Path) -
         repository,
         "https://gitlab",
         notifier=notifier,
+        project_id="42",
     )
     result = worker.process_one()
     assert result is not None
@@ -133,6 +136,7 @@ def test_worker_uses_packaged_skill_when_project_skill_is_missing(tmp_path: Path
         policy,
         repository,
         "https://gitlab",
+        project_id="42",
     )
     result = worker.process_one()
     assert result is not None
@@ -160,6 +164,7 @@ def test_worker_requeues_draft_mr_before_human_or_ai_paths(tmp_path: Path) -> No
         "https://gitlab",
         notifier=notifier,
         retry_delay_seconds=3600,
+        project_id="42",
     )
     result = worker.process_one()
     assert result == result.__class__(run.run_id, "deferred", detail="draft merge request")
@@ -183,6 +188,7 @@ def test_notification_failure_does_not_fail_review_run_and_is_retried(tmp_path: 
         "https://gitlab",
         notifier=notifier,
         retry_delay_seconds=0,
+        project_id="42",
     )
     result = worker.process_one()
     assert result is not None
@@ -226,6 +232,7 @@ def test_notification_channels_are_isolated_and_terminal_failure_is_audited(tmp_
         "https://gitlab",
         notifier=notifier,
         retry_delay_seconds=0,
+        project_id="42",
     )
     result = worker.process_one()
     assert result is not None and result.status == "succeeded"
@@ -233,3 +240,109 @@ def test_notification_channels_are_isolated_and_terminal_failure_is_audited(tmp_
     assert worker.process_notifications(limit=2) == 2
     assert store.get_notification_delivery(1).status == "failed"
     assert store.get_notification_delivery(2).status == "delivered"
+
+
+def test_worker_cancels_stale_run_and_requeues_current_head_without_side_effects(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    old_sha = "a" * 40
+    current_sha = "b" * 40
+    mr = MergeRequest(
+        "42", 1, "Improve validation", "alice", "feature", "main", current_sha, "https://mr"
+    )
+    store = SQLiteStore(tmp_path / "review.db")
+    run = store.enqueue("42", 1, old_sha)
+    notifier = RecordingNotifier()
+    worker = ReviewWorker(
+        store,
+        FakeGitLab(mr),
+        GitWorktreeManager(repository, tmp_path / "worktrees"),
+        ReviewPolicy(
+            human=HumanPolicy(enabled=True, reviewers=("alice",)),
+            ai=AIPolicy(enabled=True, command=(sys.executable, "-c", "raise SystemExit(99)")),
+        ),
+        repository,
+        "https://gitlab",
+        notifier=notifier,
+        project_id="42",
+    )
+
+    result = worker.process_one()
+
+    assert result is not None
+    assert result.status == "cancelled"
+    assert "stale run SHA" in result.detail
+    assert notifier.events == []
+    requeued = store.claim_next(project_id="42")
+    assert requeued is not None
+    assert requeued.run_id != run.run_id
+    assert requeued.sha == current_sha
+
+
+@pytest.mark.parametrize("state", ["closed", "merged"])
+def test_worker_does_not_start_or_notify_for_closed_or_merged_mr(
+    state: str, tmp_path: Path
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    sha = "c" * 40
+    mr = MergeRequest(
+        "42",
+        1,
+        "Closed change",
+        "alice",
+        "feature",
+        "main",
+        sha,
+        "https://mr",
+        state=state,
+    )
+    store = SQLiteStore(tmp_path / "review.db")
+    run = store.enqueue("42", 1, sha)
+    notifier = RecordingNotifier()
+    worker = ReviewWorker(
+        store,
+        FakeGitLab(mr),
+        GitWorktreeManager(repository, tmp_path / "worktrees"),
+        ReviewPolicy(
+            human=HumanPolicy(enabled=True, reviewers=("alice",)),
+            ai=AIPolicy(enabled=True, command=(sys.executable, "-c", "raise SystemExit(99)")),
+        ),
+        repository,
+        "https://gitlab",
+        notifier=notifier,
+        project_id="42",
+    )
+
+    result = worker.process_one()
+
+    assert result is not None
+    assert result.run_id == run.run_id
+    assert result.status == "cancelled"
+    assert notifier.events == []
+    assert not (tmp_path / "worktrees" / "run-1").exists()
+
+
+def test_worker_claims_only_its_bound_project(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    sha = "d" * 40
+    store = SQLiteStore(tmp_path / "review.db")
+    store.enqueue("99", 1, sha)
+    worker = ReviewWorker(
+        store,
+        FakeGitLab(
+            MergeRequest("42", 1, "Different project", "alice", "feature", "main", sha, "https://mr")
+        ),
+        GitWorktreeManager(repository, tmp_path / "worktrees"),
+        ReviewPolicy(),
+        repository,
+        "https://gitlab",
+        project_id="42",
+    )
+
+    assert worker.process_one() is None
+    pending = store.claim_next(project_id="99")
+    assert pending is not None

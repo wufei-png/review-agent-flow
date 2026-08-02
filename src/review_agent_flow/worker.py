@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
 from .events import parse_auto_fix_branch
-from .gitlab import GitLabClient
+from .gitlab import GitLabClient, is_valid_sha
 from .notifications import FanoutNotifier, NotificationEvent, NotificationResult
 from .policy import ReviewPolicy
 from .runner import AgentContext, AgentResult, LocalCliAgentRunner
@@ -52,7 +53,16 @@ class ReviewWorker:
         retry_delay_seconds: float = 5.0,
         notification_lease_seconds: int = DEFAULT_NOTIFICATION_LEASE_SECONDS,
         notification_max_attempts: int = DEFAULT_NOTIFICATION_MAX_ATTEMPTS,
+        project_id: str | None = None,
     ) -> None:
+        configured_project_id = (
+            project_id if project_id is not None else os.getenv("REVIEW_AGENT_FLOW_PROJECT_ID")
+        )
+        if configured_project_id is None or not configured_project_id.strip():
+            raise RuntimeError(
+                "ReviewFlow startup configuration error: "
+                "REVIEW_AGENT_FLOW_PROJECT_ID must be set"
+            )
         self.store = store
         self.gitlab = gitlab
         self.worktrees = worktrees
@@ -67,17 +77,48 @@ class ReviewWorker:
         self.retry_delay_seconds = retry_delay_seconds
         self.notification_lease_seconds = notification_lease_seconds
         self.notification_max_attempts = notification_max_attempts
+        self.project_id = configured_project_id.strip()
 
     def process_one(self) -> WorkerResult | None:
         run = self.store.claim_next(
             lease_seconds=self.lease_seconds,
             max_attempts=self.max_attempts,
+            project_id=self.project_id,
         )
         if run is None:
             return None
 
         try:
             merge_request = self.gitlab.get_merge_request(run.project_id, run.mr_iid)
+            if merge_request.project_id != self.project_id:
+                detail = "GitLab Merge Request belongs to a different project"
+                self.store.finish(run.run_id, "cancelled", detail, claim_token=run.claim_token)
+                return WorkerResult(run.run_id, "cancelled", detail=detail)
+
+            state = str(merge_request.state or "opened").lower()
+            if state in {"closed", "merged"}:
+                detail = f"merge request is {state}"
+                self.store.finish(run.run_id, "cancelled", detail, claim_token=run.claim_token)
+                return WorkerResult(run.run_id, "cancelled", detail=detail)
+
+            if not is_valid_sha(merge_request.sha):
+                detail = "GitLab returned an invalid current Merge Request head SHA"
+                self.store.finish(run.run_id, "cancelled", detail, claim_token=run.claim_token)
+                return WorkerResult(run.run_id, "cancelled", detail=detail)
+
+            if merge_request.sha != run.sha:
+                detail = f"stale run SHA; current Merge Request head is {merge_request.sha}"
+                self.store.cancel_and_enqueue_latest(
+                    run_id=run.run_id,
+                    project_id=run.project_id,
+                    mr_iid=run.mr_iid,
+                    sha=merge_request.sha,
+                    kind=run.kind,
+                    reason=detail,
+                    claim_token=run.claim_token,
+                )
+                return WorkerResult(run.run_id, "cancelled", detail=detail)
+
             if merge_request.draft:
                 self.store.requeue(
                     run.run_id,

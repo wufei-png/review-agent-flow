@@ -2,8 +2,17 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Protocol
+
+_SHA_RE = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
+
+
+def is_valid_sha(value: object) -> bool:
+    """Return whether *value* is an exact Git SHA accepted by ReviewFlow."""
+
+    return isinstance(value, str) and _SHA_RE.fullmatch(value) is not None
 
 
 @dataclass(frozen=True)
@@ -17,6 +26,7 @@ class MergeRequest:
     sha: str
     web_url: str
     draft: bool = False
+    state: str = "opened"
 
 
 @dataclass(frozen=True)
