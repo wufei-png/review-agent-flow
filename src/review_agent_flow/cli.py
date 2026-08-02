@@ -72,6 +72,19 @@ def _run_worker(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_status(args: argparse.Namespace) -> int:
+    """Print one project-bound Review Run snapshot without contacting GitLab."""
+
+    project_id = _required(args.project_id, "REVIEW_AGENT_FLOW_PROJECT_ID")
+    store = SQLiteStore(args.db or os.getenv("REVIEW_AGENT_FLOW_DB", "review-agent-flow.sqlite3"))
+    snapshot = store.get_project_bound_review_run_status(project_id, args.run_id)
+    if snapshot is None:
+        print(json.dumps({"status": "not_found"}, sort_keys=True))
+        return 1
+    print(json.dumps(snapshot, sort_keys=True))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="review-agent-flow")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -89,9 +102,15 @@ def main(argv: list[str] | None = None) -> int:
     worker.add_argument("--agent-timeout", type=int, default=1800)
     worker.add_argument("--poll-interval", type=float, default=5.0)
     worker.add_argument("--once", action="store_true")
+    status = subparsers.add_parser("status", help="query one project-bound Review Run")
+    status.add_argument("--run-id", type=int, required=True)
+    status.add_argument("--project-id")
+    status.add_argument("--db")
     args = parser.parse_args(argv)
     if args.command == "init":
         return _init_policy(Path(args.path), args.force)
     if args.command == "worker":
         return _run_worker(args)
+    if args.command == "status":
+        return _run_status(args)
     return 0

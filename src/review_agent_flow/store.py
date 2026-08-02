@@ -136,6 +136,37 @@ class SQLiteStore:
         connection.execute("PRAGMA journal_mode = WAL")
         return connection
 
+    def readiness_probe(self) -> dict[str, str | None]:
+        """Run a bounded, non-destructive SQLite read/write health probe.
+
+        The write is confined to a temporary table owned by this connection,
+        so readiness does not insert, update, or delete application records.
+        ``quick_check`` covers the persistent database read path while the
+        temporary table covers the connection's write path.
+        """
+
+        try:
+            with self._connect() as connection:
+                quick_check = connection.execute("PRAGMA quick_check(1)").fetchone()
+                if quick_check is None or str(quick_check[0]).lower() != "ok":
+                    detail = str(quick_check[0]) if quick_check is not None else "no result"
+                    return {"status": "not_ready", "diagnostic": f"sqlite quick_check: {detail}"}
+                connection.execute("SAVEPOINT reviewflow_readiness_probe")
+                connection.execute(
+                    "CREATE TEMP TABLE reviewflow_readiness_probe (value INTEGER NOT NULL)"
+                )
+                connection.execute("INSERT INTO reviewflow_readiness_probe(value) VALUES (1)")
+                row = connection.execute(
+                    "SELECT value FROM reviewflow_readiness_probe WHERE value = 1"
+                ).fetchone()
+                connection.execute("DROP TABLE reviewflow_readiness_probe")
+                connection.execute("RELEASE SAVEPOINT reviewflow_readiness_probe")
+                if row is None:
+                    return {"status": "not_ready", "diagnostic": "sqlite probe read returned no row"}
+        except (OSError, sqlite3.Error) as exc:
+            return {"status": "not_ready", "diagnostic": self._redact(exc, max_length=1000)}
+        return {"status": "ok", "diagnostic": None}
+
     def _initialize(self) -> None:
         with self._connect() as connection:
             connection.executescript(
@@ -326,6 +357,84 @@ class SQLiteStore:
                 (run_id,),
             ).fetchone()
         return self._review_run_from_row(row) if row is not None else None
+
+    def get_project_bound_review_run_status(
+        self, project_id: str, run_id: int
+    ) -> dict[str, object] | None:
+        """Return a read-only, credential-free Review Run status snapshot.
+
+        The project comparison happens before any failure or receipt details
+        are returned.  The response is deliberately assembled from a
+        whitelist rather than serializing ``ReviewRun`` or ``EffectReceipt``
+        directly, because those internal records contain lease claim tokens.
+        """
+
+        if not project_id or not project_id.strip() or run_id <= 0:
+            return None
+        run = self.get_review_run(run_id)
+        if run is None or run.project_id != project_id:
+            return None
+
+        failures = self.list_failures(run_id)
+        failure_items = [
+            {
+                "failure_id": failure.failure_id,
+                "attempt": failure.attempt,
+                "failure_class": failure.failure_class,
+                "retryable": failure.retryable,
+                "error": self._redact(failure.error, max_length=2000)
+                if failure.error
+                else None,
+                "recorded_at": failure.recorded_at,
+            }
+            for failure in failures[-20:]
+        ]
+        latest_failure = failure_items[-1] if failure_items else None
+        receipt_items = [
+            {
+                "receipt_id": receipt.receipt_id,
+                "effect_kind": receipt.effect_kind,
+                "attempt": receipt.attempt,
+                "state": receipt.state,
+                "external_identity": self._redact(receipt.external_identity, max_length=1000)
+                if receipt.external_identity
+                else None,
+                "detail": self._redact(receipt.detail, max_length=1000)
+                if receipt.detail
+                else None,
+                "error": self._redact(receipt.error, max_length=2000)
+                if receipt.error
+                else None,
+                "updated_at": receipt.updated_at,
+            }
+            for receipt in self.list_effect_receipts(run_id)[-50:]
+        ]
+        return {
+            "run_id": run.run_id,
+            "project_id": run.project_id,
+            "mr_iid": run.mr_iid,
+            "sha": run.sha,
+            "kind": run.kind,
+            "status": run.status,
+            "attempt": run.attempts,
+            "attempts": run.attempts,
+            "failure": latest_failure,
+            "failures": failure_items,
+            "effect_receipts": receipt_items,
+            "diagnostic": {
+                "error": self._redact(run.error, max_length=2000) if run.error else None,
+                "failure_class": run.failure_class,
+                "retryable": run.retryable,
+                "next_attempt_at": run.next_attempt_at,
+            },
+            "created_at": run.created_at,
+            "finished_at": run.finished_at,
+        }
+
+    def get_review_run_status(self, project_id: str, run_id: int) -> dict[str, object] | None:
+        """Compatibility alias for the project-bound status snapshot."""
+
+        return self.get_project_bound_review_run_status(project_id, run_id)
 
     def claim_next(
         self,

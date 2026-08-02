@@ -27,6 +27,7 @@ from .store import (
     ReviewRun,
     SQLiteStore,
 )
+from .structured_logging import log_event
 from .worktree import GitWorktreeManager
 
 DEFAULT_REVIEW_AGENT_SKILL = Path(__file__).resolve().parent / "defaults" / "review-agent" / "SKILL.md"
@@ -92,10 +93,44 @@ class ReviewWorker:
         self.project_id = configured_project_id.strip()
 
     def _redaction_secrets(self) -> tuple[str, ...]:
-        return (self.gitlab_token,) if self.gitlab_token else ()
+        return tuple(
+            secret
+            for secret in (
+                self.gitlab_token,
+                os.getenv("GITLAB_WEBHOOK_SECRET"),
+                os.getenv("FEISHU_WEBHOOK"),
+                os.getenv("WECOM_WEBHOOK"),
+            )
+            if secret and not secret.isspace()
+        )
 
     def _redact(self, value: object) -> str:
         return redact(value, secrets=self._redaction_secrets())
+
+    def _log_run(
+        self,
+        run: ReviewRun,
+        *,
+        status: str,
+        event: str = "worker.run",
+        level: int = logging.INFO,
+        diagnostic: object | None = None,
+        **fields: object,
+    ) -> None:
+        log_event(
+            LOGGER,
+            level,
+            secrets=self._redaction_secrets(),
+            event=event,
+            status=status,
+            correlation_id=f"review-run:{run.run_id}",
+            run_id=run.run_id,
+            project_id=run.project_id,
+            mr_iid=run.mr_iid,
+            diagnostic=self._redact(diagnostic) if diagnostic is not None else None,
+            attempt=run.attempts,
+            **fields,
+        )
 
     def process_one(self) -> WorkerResult | None:
         run = self.store.claim_next(
@@ -104,7 +139,17 @@ class ReviewWorker:
             project_id=self.project_id,
         )
         if run is None:
-            return self.reconcile_auto_fixes(limit=1)
+            reconciliation = self.reconcile_auto_fixes(limit=1)
+            log_event(
+                LOGGER,
+                logging.INFO,
+                secrets=self._redaction_secrets(),
+                event="worker.poll",
+                status="reconciled" if reconciliation is not None else "idle",
+            )
+            return reconciliation
+
+        self._log_run(run, status="running", event="worker.run.claimed")
 
         try:
             merge_request = self.gitlab.get_merge_request(run.project_id, run.mr_iid)
@@ -137,6 +182,12 @@ class ReviewWorker:
                     failure_class="stale_sha",
                     retryable=False,
                 )
+                self._log_run(
+                    run,
+                    status="cancelled",
+                    diagnostic=detail,
+                    failure_class="stale_sha",
+                )
                 return WorkerResult(run.run_id, "cancelled", detail=detail)
 
             if merge_request.draft:
@@ -146,6 +197,7 @@ class ReviewWorker:
                     delay_seconds=self.retry_delay_seconds,
                     claim_token=run.claim_token,
                 )
+                self._log_run(run, status="deferred", diagnostic="draft merge request")
                 return WorkerResult(run.run_id, "deferred", detail="draft merge request")
             if run.kind == "autofix":
                 parent = parse_auto_fix_branch(merge_request.source_branch)
@@ -156,6 +208,7 @@ class ReviewWorker:
                 parent_merge_request = self.gitlab.get_merge_request(run.project_id, parent[0])
                 self._notify_autofix(run, parent_merge_request, merge_request)
                 self.store.finish(run.run_id, "succeeded", claim_token=run.claim_token)
+                self._log_run(run, status="succeeded", diagnostic="auto-fix MR notification")
                 return WorkerResult(run.run_id, "succeeded", detail="auto-fix MR notification")
 
             if self.policy.pipeline_gate:
@@ -167,6 +220,7 @@ class ReviewWorker:
                         delay_seconds=self.retry_delay_seconds,
                         claim_token=run.claim_token,
                     )
+                    self._log_run(run, status="deferred", diagnostic="pipeline gate")
                     return WorkerResult(run.run_id, "deferred", detail="pipeline gate")
 
             self._notify_humans(run, merge_request)
@@ -174,6 +228,7 @@ class ReviewWorker:
                 run.project_id, run.mr_iid, run.sha
             ):
                 self.store.finish(run.run_id, "succeeded", claim_token=run.claim_token)
+                self._log_run(run, status="succeeded", diagnostic="human path only")
                 return WorkerResult(run.run_id, "succeeded", detail="human path only")
 
             worktree_id = str(run.run_id) if run.attempts <= 1 else f"{run.run_id}-attempt-{run.attempts}"
@@ -192,6 +247,13 @@ class ReviewWorker:
                     )
                     self._mark_unobserved_effects(receipts, detail)
                     self._finish_terminal(run, "failed", detail, "agent_timeout")
+                    self._log_run(
+                        run,
+                        status="failed",
+                        level=logging.WARNING,
+                        diagnostic=detail,
+                        failure_class="agent_timeout",
+                    )
                     return WorkerResult(run.run_id, "failed", result, "Agent timed out")
                 if result.returncode != 0:
                     detail = self._redact(result.stderr[-4000:] or "Agent failed")
@@ -210,6 +272,13 @@ class ReviewWorker:
                         failure_class="agent_exit",
                         retryable=False,
                     )
+                    self._log_run(
+                        run,
+                        status="failed",
+                        level=logging.WARNING,
+                        diagnostic=detail,
+                        failure_class="agent_exit",
+                    )
                     return WorkerResult(run.run_id, "failed", result, "Agent process failed")
                 self.store.update_effect_receipt(
                     agent_receipt.receipt_id,
@@ -218,11 +287,18 @@ class ReviewWorker:
                 )
                 self._record_auto_fix_if_created(run, merge_request)
                 self.store.finish(run.run_id, "succeeded", claim_token=run.claim_token)
+                self._log_run(run, status="succeeded", diagnostic="Agent process exited successfully")
                 return WorkerResult(run.run_id, "succeeded", result)
             finally:
                 self.worktrees.remove(worktree)
         except LeaseLostError as exc:
-            LOGGER.warning("Review Run %s lost its lease: %s", run.run_id, self._redact(exc))
+            self._log_run(
+                run,
+                status="deferred",
+                level=logging.WARNING,
+                diagnostic=exc,
+                failure_class="lease_lost",
+            )
             return WorkerResult(run.run_id, "deferred", detail="Review Run lease lost")
         except Exception as exc:  # noqa: BLE001 - a failed Run must be persisted
             failure = classify_exception(exc, secrets=self._redaction_secrets())
@@ -244,7 +320,7 @@ class ReviewWorker:
         failure_class: str,
         retryable: bool = False,
     ) -> bool:
-        return self.store.finish(
+        updated = self.store.finish(
             run.run_id,
             status,
             self._redact(detail),
@@ -252,10 +328,19 @@ class ReviewWorker:
             failure_class=failure_class,
             retryable=retryable,
         )
+        self._log_run(
+            run,
+            status=status if updated else "not_updated",
+            level=logging.WARNING if status == "failed" else logging.INFO,
+            diagnostic=detail,
+            failure_class=failure_class,
+            persisted=updated,
+        )
+        return updated
 
     def _retry_or_fail(self, run: ReviewRun, failure: FailureInfo) -> bool:
         delay = self._backoff(run.attempts)
-        return self.store.retry_or_fail(
+        requeued = self.store.retry_or_fail(
             run.run_id,
             failure.failure_class,
             failure.detail,
@@ -263,6 +348,16 @@ class ReviewWorker:
             max_attempts=self.max_attempts,
             claim_token=run.claim_token,
         )
+        self._log_run(
+            run,
+            status="deferred" if requeued else "failed",
+            level=logging.WARNING,
+            diagnostic=failure.detail,
+            failure_class=failure.failure_class,
+            retryable=True,
+            persisted=requeued,
+        )
+        return requeued
 
     def _backoff(self, attempt: int) -> float:
         base = max(0.0, self.retry_delay_seconds)
@@ -434,6 +529,16 @@ class ReviewWorker:
                 error="Review Run no longer exists",
                 claim_token=receipt.claim_token,
             )
+            log_event(
+                LOGGER,
+                logging.ERROR,
+                secrets=self._redaction_secrets(),
+                event="worker.autofix_reconcile",
+                status="failed",
+                correlation_id=f"review-run:{receipt.run_id}",
+                run_id=receipt.run_id,
+                diagnostic="Review Run no longer exists",
+            )
             return WorkerResult(receipt.run_id, "failed", detail="Review Run no longer exists")
         try:
             parent_merge_request = self.gitlab.get_merge_request(run.project_id, run.mr_iid)
@@ -448,6 +553,12 @@ class ReviewWorker:
                     "Auto-fix MR is still not observable",
                     claim_token=receipt.claim_token,
                 )
+                self._log_run(
+                    run,
+                    event="worker.autofix_reconcile",
+                    status="deferred",
+                    diagnostic="Auto-fix reconciliation pending",
+                )
                 return WorkerResult(
                     run.run_id, "deferred", detail="Auto-fix reconciliation pending"
                 )
@@ -457,12 +568,26 @@ class ReviewWorker:
                 receipt,
                 claim_token=receipt.claim_token,
             )
+            self._log_run(
+                run,
+                event="worker.autofix_reconcile",
+                status="succeeded",
+                diagnostic="Auto-fix reconciliation observed",
+            )
             return WorkerResult(run.run_id, "succeeded", detail="Auto-fix reconciliation observed")
         except Exception as exc:  # noqa: BLE001 - keep reconciliation independently retryable
             failure = classify_exception(exc, secrets=self._redaction_secrets())
             if failure.retryable:
                 self._schedule_reconciliation(
                     receipt, failure.detail, claim_token=receipt.claim_token
+                )
+                self._log_run(
+                    run,
+                    event="worker.autofix_reconcile",
+                    status="deferred",
+                    level=logging.WARNING,
+                    diagnostic=failure.detail,
+                    failure_class=failure.failure_class,
                 )
                 return WorkerResult(
                     run.run_id, "deferred", detail="Auto-fix reconciliation retry scheduled"
@@ -473,6 +598,14 @@ class ReviewWorker:
                 detail="Auto-fix reconciliation failed terminally",
                 error=failure.detail,
                 claim_token=receipt.claim_token,
+            )
+            self._log_run(
+                run,
+                event="worker.autofix_reconcile",
+                status="failed",
+                level=logging.ERROR,
+                diagnostic=failure.detail,
+                failure_class=failure.failure_class,
             )
             return WorkerResult(run.run_id, "failed", detail=failure.detail)
 
@@ -511,9 +644,13 @@ class ReviewWorker:
                         max_attempts=self.notification_max_attempts,
                     )
             except Exception as exc:  # noqa: BLE001 - isolate notification claim failures
-                LOGGER.error(
-                    "failed to claim notification outbox record: %s",
-                    self._redact(exc),
+                log_event(
+                    LOGGER,
+                    logging.ERROR,
+                    secrets=self._redaction_secrets(),
+                    event="notification.claim",
+                    status="failed",
+                    diagnostic=self._redact(exc),
                 )
                 break
             if delivery is None:
@@ -538,11 +675,28 @@ class ReviewWorker:
                     max_attempts=self.notification_max_attempts,
                     retry_delay_seconds=self.retry_delay_seconds,
                 )
+                log_event(
+                    LOGGER,
+                    logging.INFO if result.delivered else logging.WARNING,
+                    secrets=self._redaction_secrets(),
+                    event="notification.delivery",
+                    status="delivered" if result.delivered else "failed",
+                    correlation_id=delivery.correlation_id,
+                    delivery_id=delivery.delivery_id,
+                    channel=delivery.channel,
+                    attempt=delivery.attempts,
+                    diagnostic=result.detail or None,
+                )
             except Exception as exc:  # noqa: BLE001 - isolate notification update failures
-                LOGGER.error(
-                    "failed to update notification outbox record %s: %s",
-                    delivery.delivery_id,
-                    self._redact(exc),
+                log_event(
+                    LOGGER,
+                    logging.ERROR,
+                    secrets=self._redaction_secrets(),
+                    event="notification.update",
+                    status="failed",
+                    correlation_id=delivery.correlation_id,
+                    delivery_id=delivery.delivery_id,
+                    diagnostic=self._redact(exc),
                 )
             processed += 1
         return processed
@@ -614,12 +768,26 @@ class ReviewWorker:
                 recipients=event.recipients,
                 channels=channels,
             )
+            log_event(
+                LOGGER,
+                logging.INFO,
+                secrets=self._redaction_secrets(),
+                event="notification.queue",
+                status="queued",
+                correlation_id=correlation_id,
+                channel_count=len(deliveries),
+            )
             delivery_ids = tuple(
                 delivery.delivery_id for delivery in deliveries if delivery.status == "pending"
             )
             self.process_notifications(delivery_ids=delivery_ids)
         except Exception as exc:  # noqa: BLE001 - isolate notification enqueue failures
-            LOGGER.error(
-                "failed to enqueue notification outbox record: %s",
-                self._redact(exc),
+            log_event(
+                LOGGER,
+                logging.ERROR,
+                secrets=self._redaction_secrets(),
+                event="notification.queue",
+                status="failed",
+                correlation_id=correlation_id,
+                diagnostic=self._redact(exc),
             )

@@ -15,6 +15,9 @@ GitLab 人类评审与 AI Agent 协同的开源工作流编排器。
 - Git worktree lifecycle helper
 - GitLab event normalization and a `python-gitlab` adapter boundary
 - FastAPI health and GitLab Webhook endpoint with token validation
+- Separate `/healthz` liveness, `/readyz` SQLite/config readiness, and explicit live GitLab probe
+- Project-bound Review Run status through HTTP and `review-agent-flow status`
+- Bounded JSON operational logs with redacted diagnostics and no raw webhook payloads
 - Feishu and WeCom webhook notifier adapters
 - API + Worker orchestration, Pipeline Gate polling and auto-fix loop suppression
 - Default review-agent Skill and architecture ADRs
@@ -58,6 +61,17 @@ uvicorn review_agent_flow.web:create_app --factory --host 127.0.0.1 --port 8080
 
 `GITLAB_WEBHOOK_SECRET` 和 `REVIEW_AGENT_FLOW_PROJECT_ID` 都是 API 启动所需的部署配置。Secret 缺失或为空时服务直接启动失败；请求 token 错误返回 `401`，其他 Project 返回 `403`，不会进入队列。测试或显式嵌入式调用可以向 `create_app(..., webhook_secret=..., project_id=...)` 传值，但不存在匿名 Webhook 模式。
 
+健康检查和状态查询：
+
+```bash
+curl http://127.0.0.1:8080/healthz
+curl -i http://127.0.0.1:8080/readyz
+curl -i -H "X-ReviewFlow-Internal-Token: $GITLAB_WEBHOOK_SECRET" http://127.0.0.1:8080/probes/gitlab  # only an explicitly wired live probe
+review-agent-flow status --project-id 42 --db review-agent-flow.sqlite3 --run-id 1
+```
+
+`/readyz` 默认不访问 GitLab；未注入 live probe 时，带正确内部 token 的 `/probes/gitlab` 返回 `503 not_ready`，不会假装 provider 已就绪。新的 status/probe endpoint 要求 `X-ReviewFlow-Internal-Token`，其值复用已配置的 `GITLAB_WEBHOOK_SECRET`；缺失或错误 token 返回 `401`，不能触发 Store 查询或 live probe。`/health`、`/healthz`、`/readyz` 保持公开。
+
 Worker 使用同一个 SQLite 数据库：
 
 ```bash
@@ -77,6 +91,8 @@ review-agent-flow worker --once
 ```
 
 Docker 镜像默认启动 Webhook API；运行容器时必须注入 `GITLAB_WEBHOOK_SECRET` 和 `REVIEW_AGENT_FLOW_PROJECT_ID`。Worker 建议作为同镜像的独立进程或独立容器运行，并共享数据库、Project checkout 和 worktree 根目录。
+
+本地 contract test 入口为 `python -m pytest tests/test_p2_contract.py`；它不访问 GitLab，也不构造 live sandbox 结果。真实 GitLab sandbox 仍需按部署者的受控环境另行验证。
 
 ## License
 

@@ -29,6 +29,26 @@ events only when its runtime authentication secret is configured and matches.
 An unset secret makes the deployment unusable for webhook intake rather than
 turning webhook requests into an anonymous mode.
 
+**Readiness**: Process liveness is separate from operational readiness. A
+`/healthz` response means the API process is alive. A `/readyz` response checks
+required configuration, the bound Project identity, and SQLite read/write
+availability without making a live GitLab request by default. A live provider
+probe is explicit and separate from the default readiness gate.
+
+**Status Query**: Review Run status is read-only and Project-bound. It exposes
+status, attempts, redacted failures, effect-receipt summaries and safe
+diagnostics, but never lease claim tokens, GitLab tokens or notification
+credentials. Unknown or out-of-bound Runs return the same not-found response.
+The HTTP status routes and explicit live-probe route require
+`X-ReviewFlow-Internal-Token` equal to the configured `GITLAB_WEBHOOK_SECRET`;
+missing or incorrect tokens fail with `401` before Store or provider access.
+`/health`, `/healthz`, and `/readyz` remain public.
+
+**Operational Logs**: Webhook and Worker key paths emit bounded JSON events
+with correlation, Run, Project, MR, event and status fields. Raw webhook
+payloads and credentials are not default log inputs; diagnostics use the
+existing redaction helper.
+
 **AI Provider**: OpenAI-compatible API。核心只定义接口，部署文档推荐 LiteLLM，不内置模型厂商 SDK。
 
 **Agent Backend**: 本地 CLI 或本地 Agent 服务。它与 AI Provider 分离。
