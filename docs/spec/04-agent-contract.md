@@ -22,16 +22,21 @@ The Worker invokes the configured command with `shell=False`, the Review Run wor
 | `REVIEW_AGENT_FLOW_GITLAB_URL` | GitLab base URL |
 | `REVIEW_AGENT_FLOW_SKILL` | Project Skill path when it exists, otherwise the packaged default Skill |
 | `REVIEW_AGENT_FLOW_AUTO_FIX_ENABLED` | `true` only when Project policy enables auto-fix |
+| `REVIEW_AGENT_FLOW_NOTE_MARKER` | Canonical standalone token `<!-- review-run:<run-id>:note -->` that must appear exactly once in the Agent-owned Note body |
 | `GITLAB_TOKEN` | Review Bot token, when injected by runtime |
 
 The command receives no required JSON output contract. The Agent uses the worktree and GitLab context to submit Notes itself. The Worker only needs process status, stdout/stderr for diagnostics, timeout handling and lifecycle state.
 
 The Worker persists Effect Receipts for Agent execution, the expected
 Agent-owned Note, and (when enabled) the expected Auto-fix MR. These receipts
-are an audit and reconciliation surface, not an Agent response schema. A
-successful Agent process does not prove that a Note or Auto-fix MR was
-observed; the Worker records that distinction and later reconciles the
-deterministic Auto-fix branch.
+are an audit and reconciliation surface, not an Agent response schema. After
+the Agent exits successfully, the Worker asks the optional GitLab Note observer
+to find the Note containing the exact canonical marker. Only a scoped Note
+with exactly one marker line and a strict positive-integer native ID becomes
+`observed` and receives an external identity. A successful
+Agent process does not prove that a Note or Auto-fix MR was observed; a missing
+or unavailable Note remains `not_observed`, and the Review Run status is kept
+independent from that external side effect.
 
 Auto-fix reconciliation queries the deterministic branch across opened,
 closed, and merged Merge Requests. A delayed or temporarily invisible MR

@@ -30,7 +30,7 @@ GitLab 人类评审与 AI Agent 协同的开源工作流编排器。
 - Reviewer 通过 GitLab username 显式配置，首版不自动解析 CODEOWNERS。
 - AI Review 和 auto-fix 默认关闭，独立开关。
 - 每个 Review Run 使用精确 SHA 的独立 Git worktree。
-- Agent 不需要返回 JSON，可以直接写 GitLab Note。
+- Agent 不需要返回 JSON，可以直接写 GitLab Note；`status` 和 `worker --once` CLI 命令输出 JSON 运行状态，不构成 Agent JSON 报告，仓库也没有独立的 JSON render 命令。
 - Auto-fix 创建独立 MR，分支格式为 `autofix/MR-1/run-1`，标题以 `[ReviewFlow Auto-Fix]` 开头，只通知原 MR 创建者。
 - Auto-fix MR 不触发 AI Review，但正常运行 CI；合并回原 source branch 后只跳过对应 SHA 的自动 AI Review。
 - 通知按渠道写入 SQLite outbox；单渠道失败不影响 Review Run，最多重试 3 次并保留失败记录。

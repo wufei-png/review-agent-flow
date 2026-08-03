@@ -4,7 +4,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from .gitlab import CreatedMergeRequest, GitLabClient, MergeRequest, Pipeline
+from .gitlab import (
+    CreatedMergeRequest,
+    GitLabClient,
+    MergeRequest,
+    Note,
+    Pipeline,
+    has_exact_note_marker,
+)
 
 
 class PythonGitLabClient(GitLabClient):
@@ -52,8 +59,48 @@ class PythonGitLabClient(GitLabClient):
         pipeline = pipelines[0]
         return Pipeline(str(project_id), int(pipeline.id), sha, str(pipeline.status))
 
+    @staticmethod
+    def _note_from_resource(project_id: str, mr_iid: int, note: Any) -> Note | None:
+        if type(project_id) is not str or not project_id.strip():
+            return None
+        if type(mr_iid) is not int or mr_iid <= 0:
+            return None
+        native_id = getattr(note, "id", None)
+        if type(native_id) is not int or native_id <= 0:
+            return None
+        body = getattr(note, "body", None)
+        if not isinstance(body, str):
+            return None
+        return Note(
+            project_id=project_id,
+            mr_iid=mr_iid,
+            note_id=native_id,
+            body=body,
+        )
+
     def create_note(self, project_id: str, mr_iid: int, body: str) -> None:
         self._project(project_id).mergerequests.get(mr_iid).notes.create({"body": body})
+
+    def find_note_by_marker(
+        self, project_id: str, mr_iid: int, marker: str
+    ) -> Note | None:
+        if (
+            type(project_id) is not str
+            or not project_id.strip()
+            or type(mr_iid) is not int
+            or mr_iid <= 0
+            or not has_exact_note_marker(marker, marker)
+        ):
+            return None
+        merge_request = self._project(project_id).mergerequests.get(mr_iid)
+        matching = [
+            note
+            for note in merge_request.notes.list(get_all=True)
+            if has_exact_note_marker(getattr(note, "body", None), marker)
+        ]
+        if len(matching) != 1:
+            return None
+        return self._note_from_resource(project_id, mr_iid, matching[0])
 
     def create_branch(self, project_id: str, branch: str, ref: str) -> None:
         self._project(project_id).branches.create({"branch": branch, "ref": ref})

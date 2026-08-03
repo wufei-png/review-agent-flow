@@ -5,13 +5,23 @@ from pathlib import Path
 
 import pytest
 
-from review_agent_flow.gitlab import CreatedMergeRequest, MergeRequest, Pipeline
+from review_agent_flow.gitlab import (
+    CreatedMergeRequest,
+    MergeRequest,
+    Note,
+    Pipeline,
+    canonical_note_marker,
+)
 from review_agent_flow.notifications import FanoutNotifier, NotificationEvent, NotificationResult
 from review_agent_flow.policy import AIPolicy, HumanPolicy, ReviewPolicy
 from review_agent_flow.runner import AgentResult
 from review_agent_flow.store import SQLiteStore
 from review_agent_flow.worker import ReviewWorker
 from review_agent_flow.worktree import GitWorktreeManager
+
+
+class ProjectId(str):
+    pass
 
 
 class FakeGitLab:
@@ -54,6 +64,39 @@ class RetryableGitLab(FakeGitLab):
             error.status_code = self.status_code
             raise error
         return self.mr
+
+
+class ObservedNoteGitLab(FakeGitLab):
+    def __init__(
+        self,
+        mr: MergeRequest,
+        body_template: str = "{marker}\nActionable finding",
+        note_id: object = 314,
+        returned_project_id: object | None = None,
+        returned_mr_iid: object | None = None,
+    ) -> None:
+        super().__init__(mr)
+        self.body_template = body_template
+        self.note_id = note_id
+        self.returned_project_id = returned_project_id
+        self.returned_mr_iid = returned_mr_iid
+        self.note_markers: list[str] = []
+
+    def find_note_by_marker(
+        self, project_id: str, mr_iid: int, marker: str
+    ) -> Note:
+        self.note_markers.append(marker)
+        return Note(
+            project_id if self.returned_project_id is None else self.returned_project_id,
+            mr_iid if self.returned_mr_iid is None else self.returned_mr_iid,
+            self.note_id,
+            self.body_template.format(marker=marker),
+        )
+
+
+class FailingNoteObserverGitLab(FakeGitLab):
+    def find_note_by_marker(self, project_id: str, mr_iid: int, marker: str) -> Note:
+        raise RuntimeError("Note observer API unavailable")
 
 
 class EventualAutoFixGitLab(FakeGitLab):
@@ -127,9 +170,12 @@ def test_worker_runs_agent_in_exact_sha_worktree_and_cleans_it(tmp_path: Path) -
             command=(sys.executable, "-c", "import os; assert os.getcwd(); print('reviewed')"),
         ),
     )
+    gitlab = FakeGitLab(mr)
+    assert gitlab.create_note("42", 1, "legacy note") is None
+    assert not hasattr(gitlab, "find_note_by_marker")
     worker = ReviewWorker(
         store,
-        FakeGitLab(mr),
+        gitlab,
         GitWorktreeManager(repository, tmp_path / "worktrees"),
         policy,
         repository,
@@ -144,6 +190,210 @@ def test_worker_runs_agent_in_exact_sha_worktree_and_cleans_it(tmp_path: Path) -
     assert result.agent_result.stdout.strip() == "reviewed"
     assert not (tmp_path / "worktrees" / "run-1").exists()
     assert notifier.events[0].recipients == ("alice",)
+    note_receipt = store.list_effect_receipts(1, "note_expected")[0]
+    assert note_receipt.state == "not_observed"
+    assert note_receipt.external_identity is None
+
+
+def test_agent_note_receipt_observes_native_id_without_equating_agent_success_to_note_success(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    sha = _git_repository(repository)
+    mr = MergeRequest("42", 1, "Observe Note", "alice", "feature", "main", sha, "https://mr")
+    store = SQLiteStore(tmp_path / "review.db")
+    run = store.enqueue("42", 1, sha)
+    gitlab = ObservedNoteGitLab(mr)
+    worker = ReviewWorker(
+        store,
+        gitlab,
+        GitWorktreeManager(repository, tmp_path / "worktrees"),
+        ReviewPolicy(
+            ai=AIPolicy(
+                enabled=True,
+                command=(
+                    sys.executable,
+                    "-c",
+                    "import os; print(os.environ['REVIEW_AGENT_FLOW_NOTE_MARKER'])",
+                ),
+            )
+        ),
+        repository,
+        "https://gitlab",
+        project_id="42",
+    )
+
+    result = worker.process_one()
+
+    assert result is not None and result.status == "succeeded"
+    assert result.agent_result is not None
+    marker = canonical_note_marker(run.run_id)
+    assert result.agent_result.stdout.strip() == marker
+    assert gitlab.note_markers == [marker]
+    note_receipt = store.list_effect_receipts(run.run_id, "note_expected")[0]
+    assert note_receipt.state == "observed"
+    assert note_receipt.external_identity == "gitlab:42!1#note-314"
+    assert store.list_effect_receipts(run.run_id, "agent_execution")[0].state == "succeeded"
+
+
+def test_note_marker_observation_reuses_historical_receipt_key(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    sha = _git_repository(repository)
+    mr = MergeRequest("42", 1, "Stable Note receipt key", "alice", "feature", "main", sha, "https://mr")
+    store = SQLiteStore(tmp_path / "review.db")
+    run = store.enqueue("42", 1, sha)
+    historical_key = f"review-run:{run.run_id}:note"
+    existing = store.create_effect_receipt(
+        run.run_id,
+        "note_expected",
+        historical_key,
+        state="planned",
+    )
+    gitlab = ObservedNoteGitLab(mr)
+    worker = ReviewWorker(
+        store,
+        gitlab,
+        GitWorktreeManager(repository, tmp_path / "worktrees"),
+        ReviewPolicy(
+            ai=AIPolicy(
+                enabled=True,
+                command=(
+                    sys.executable,
+                    "-c",
+                    "import os; print(os.environ['REVIEW_AGENT_FLOW_NOTE_MARKER'])",
+                ),
+            )
+        ),
+        repository,
+        "https://gitlab",
+        project_id="42",
+    )
+
+    result = worker.process_one()
+
+    assert result is not None and result.status == "succeeded"
+    receipts = store.list_effect_receipts(run.run_id, "note_expected")
+    assert len(receipts) == 1
+    assert receipts[0].receipt_id == existing.receipt_id
+    assert receipts[0].dedupe_key == historical_key
+    assert receipts[0].state == "observed"
+    assert gitlab.note_markers == [canonical_note_marker(run.run_id)]
+
+
+@pytest.mark.parametrize(
+    ("body_template", "note_id"),
+    [
+        ("prefix {marker}", 314),
+        ("{marker} suffix", 314),
+        ("{marker}\n{marker}", 314),
+        ("{marker}", 0),
+        ("{marker}", -1),
+        ("{marker}", True),
+        ("{marker}", 1.0),
+        ("{marker}", "1"),
+    ],
+)
+def test_worker_keeps_noncanonical_or_invalid_observed_note_not_observed(
+    body_template: str, note_id: object, tmp_path: Path
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    sha = _git_repository(repository)
+    mr = MergeRequest("42", 1, "Reject malformed Note", "alice", "feature", "main", sha, "https://mr")
+    store = SQLiteStore(tmp_path / "review.db")
+    run = store.enqueue("42", 1, sha)
+    worker = ReviewWorker(
+        store,
+        ObservedNoteGitLab(mr, body_template=body_template, note_id=note_id),
+        GitWorktreeManager(repository, tmp_path / "worktrees"),
+        ReviewPolicy(ai=AIPolicy(enabled=True, command=(sys.executable, "-c", "print('reviewed')"))),
+        repository,
+        "https://gitlab",
+        project_id="42",
+    )
+
+    result = worker.process_one()
+
+    assert result is not None and result.status == "succeeded"
+    note_receipt = store.list_effect_receipts(run.run_id, "note_expected")[0]
+    assert note_receipt.state == "not_observed"
+    assert note_receipt.external_identity is None
+
+
+def test_worker_keeps_note_observer_exception_not_observed(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    sha = _git_repository(repository)
+    mr = MergeRequest("42", 1, "Observer outage", "alice", "feature", "main", sha, "https://mr")
+    store = SQLiteStore(tmp_path / "review.db")
+    run = store.enqueue("42", 1, sha)
+    worker = ReviewWorker(
+        store,
+        FailingNoteObserverGitLab(mr),
+        GitWorktreeManager(repository, tmp_path / "worktrees"),
+        ReviewPolicy(ai=AIPolicy(enabled=True, command=(sys.executable, "-c", "print('reviewed')"))),
+        repository,
+        "https://gitlab",
+        project_id="42",
+    )
+
+    result = worker.process_one()
+
+    assert result is not None and result.status == "succeeded"
+    note_receipt = store.list_effect_receipts(run.run_id, "note_expected")[0]
+    assert note_receipt.state == "not_observed"
+    assert note_receipt.external_identity is None
+    assert "observer API unavailable" in (note_receipt.error or "")
+
+
+@pytest.mark.parametrize(
+    ("returned_project_id", "returned_mr_iid"),
+    [
+        ("99", 1),
+        (True, 1),
+        (1.0, 1),
+        ("1", 1),
+        (ProjectId("42"), 1),
+        ("42", 2),
+        ("42", True),
+        ("42", 1.0),
+        ("42", "1"),
+        ("42", ProjectId("1")),
+        ("42", 0),
+        ("42", -1),
+    ],
+)
+def test_worker_rejects_note_from_wrong_project_or_mr(
+    returned_project_id: object, returned_mr_iid: object, tmp_path: Path
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    sha = _git_repository(repository)
+    mr = MergeRequest("42", 1, "Reject misbound Note", "alice", "feature", "main", sha, "https://mr")
+    store = SQLiteStore(tmp_path / "review.db")
+    run = store.enqueue("42", 1, sha)
+    worker = ReviewWorker(
+        store,
+        ObservedNoteGitLab(
+            mr,
+            returned_project_id=returned_project_id,
+            returned_mr_iid=returned_mr_iid,
+        ),
+        GitWorktreeManager(repository, tmp_path / "worktrees"),
+        ReviewPolicy(ai=AIPolicy(enabled=True, command=(sys.executable, "-c", "print('reviewed')"))),
+        repository,
+        "https://gitlab",
+        project_id="42",
+    )
+
+    result = worker.process_one()
+
+    assert result is not None and result.status == "succeeded"
+    note_receipt = store.list_effect_receipts(run.run_id, "note_expected")[0]
+    assert note_receipt.state == "not_observed"
+    assert note_receipt.external_identity is None
 
 
 def test_worker_uses_packaged_skill_when_project_skill_is_missing(tmp_path: Path) -> None:

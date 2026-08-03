@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from review_agent_flow.gitlab import canonical_note_marker
 from review_agent_flow.runner import AgentContext, LeaseLostError, LocalCliAgentRunner
 
 SHA = "a" * 40
@@ -36,6 +37,24 @@ def test_runner_exposes_run_id(tmp_path: Path) -> None:
         timeout_seconds=5,
     ).run(AgentContext("42", 7, 11, SHA, "https://gitlab.example", tmp_path))
     assert result.stdout.strip() == "11"
+
+
+def test_runner_exposes_note_marker(tmp_path: Path) -> None:
+    result = LocalCliAgentRunner(
+        [sys.executable, "-c", "import os; print(os.environ['REVIEW_AGENT_FLOW_NOTE_MARKER'])"],
+        timeout_seconds=5,
+    ).run(
+        AgentContext(
+            "42",
+            7,
+            11,
+            SHA,
+            "https://gitlab.example",
+            tmp_path,
+            note_marker=canonical_note_marker(11),
+        )
+    )
+    assert result.stdout.strip() == canonical_note_marker(11)
 
 
 def test_runner_heartbeats_during_long_agent_without_a_background_thread(tmp_path: Path) -> None:

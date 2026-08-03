@@ -10,12 +10,29 @@ The current endpoint is intentionally small. The remaining GitLab adapter must p
 
 - MR fetch and source/target branch details;
 - Pipeline status for Pipeline Gate;
-- Note creation;
+- Note creation, preserving the public `create_note(project_id, mr_iid, body) -> None` contract;
+- Optional Note observation through a separate `NoteObserver` capability:
+  `find_note_by_marker(project_id, mr_iid, marker) -> Note | None`;
 - reviewer lookup/mention data;
 - branch push and Auto-fix MR creation;
 - parent/Auto-fix MR merge relationship lookup.
 
 The adapter should use `python-gitlab` behind a narrow interface so the domain and Worker do not depend on GitLab SDK objects.
+
+The Worker detects the optional observer capability at runtime, so existing
+GitLab clients and fakes that only implement Note creation remain compatible.
+ReviewFlow passes the canonical token
+`<!-- review-run:<run-id>:note -->`. The observer must scope the lookup to the
+Project and MR and return a `Note` only when exactly one Note body contains one
+standalone line equal to that full token and the native Note ID is a strict
+positive integer. Zero matches, duplicate exact matches, prefix/suffix matches,
+and IDs represented by zero, negative numbers, booleans, floats, or strings are
+fail-closed as `None`. The Worker repeats the exact-token validation before
+updating `note_expected` to `observed`; missing observer capability or an
+unverified Note leaves the receipt `not_observed` without changing Agent Run
+success. The Note receipt keeps the historical dedupe key
+`review-run:<run-id>:note`; the canonical HTML token is an observation token,
+not a replacement dedupe key.
 
 ## Human notifications
 

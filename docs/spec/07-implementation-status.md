@@ -25,15 +25,21 @@
 | Structured failure ledger, bounded transient retry and lease heartbeat | store.py, worker.py, runner.py |
 | Effect Receipt persistence and Auto-fix reconciliation | store.py, worker.py, gitlab_client.py |
 
-## Remaining implementation
+## Verified live evidence
 
-1. Add real GitLab sandbox verification for Note, branch and Auto-fix MR APIs.
-2. Add Pipeline webhook fixtures for GitLab versions used by deployments.
-3. Add configurable retry/backoff policy beyond the Worker defaults.
-4. Add full recipient identity lookup/mapping for Feishu and WeCom.
-5. Add real Agent CLI contract tests and Auto-fix MR creation fixtures.
-6. Add Postgres/Redis implementations when multi-instance deployment is required.
-7. Add package build/publish automation after the public API stabilizes.
+1. On 2026-08-03, a real JiHuLab canary completed in Project `358268` with Review Run `2`, parent MR `!3`, Auto-fix MR `!4`, and Agent-owned Note native ID `8733889`.
+2. The persisted Note receipt was observed with external identity `gitlab:358268!3#note-8733889`; this verifies the Note observer path and the Agent/Auto-fix canary path against JiHuLab.
+3. Project `358268` was marked for deletion after the canary, so this is recorded historical evidence rather than a currently queryable live environment.
+
+## Remaining implementation and boundaries
+
+1. Add Pipeline webhook fixtures for GitLab versions used by deployments.
+2. Add configurable retry/backoff policy beyond the Worker defaults.
+3. Add full recipient identity lookup/mapping for Feishu and WeCom.
+4. Add real Agent CLI contract tests and Auto-fix MR creation fixtures beyond the recorded JiHuLab canary.
+5. Add Postgres/Redis implementations when multi-instance deployment is required.
+6. Add package build/publish automation after the public API stabilizes.
+7. Note observation is intentionally fail-closed: custom Agent Skills that omit the exact marker, transient observer failures, duplicate marker Notes, and malformed native IDs remain `not_observed`; no Note-specific later retry loop is claimed by this implementation.
 
 ## v0.1 acceptance criteria
 

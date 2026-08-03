@@ -12,7 +12,7 @@ from uuid import uuid4
 
 from .events import parse_auto_fix_branch
 from .failures import FailureInfo, classify_exception
-from .gitlab import GitLabClient, is_valid_sha
+from .gitlab import GitLabClient, canonical_note_marker, has_exact_note_marker, is_valid_sha
 from .notifications import FanoutNotifier, NotificationEvent, NotificationResult
 from .policy import ReviewPolicy
 from .runner import AgentContext, AgentResult, LeaseLostError, LocalCliAgentRunner
@@ -111,6 +111,10 @@ class ReviewWorker:
 
     def _redact(self, value: object) -> str:
         return redact(value, secrets=self._redaction_secrets())
+
+    @staticmethod
+    def _agent_note_marker(run: ReviewRun) -> str:
+        return canonical_note_marker(run.run_id)
 
     def _require_active_lease(self, run: ReviewRun, detail: str) -> None:
         if not self.store.has_active_lease(run.run_id, run.claim_token):
@@ -384,6 +388,7 @@ class ReviewWorker:
                     state="succeeded",
                     detail="Agent process exited successfully",
                 )
+                self._record_observed_note(run, receipts["note_expected"])
                 identity_error = self._record_auto_fix_if_created(run, merge_request, receipts)
                 if identity_error is not None:
                     if not self._finish_terminal(
@@ -546,7 +551,7 @@ class ReviewWorker:
                 f"review-run:{run.run_id}:note",
                 attempt=attempt,
                 state="planned",
-                detail="Agent-owned GitLab Note; the Worker does not require a JSON receipt",
+                detail="Agent-owned GitLab Note; observation uses the deterministic run marker",
             )
             if self.policy.ai.auto_fix:
                 branch = f"autofix/MR-{merge_request.iid}/run-{run.run_id}"
@@ -607,6 +612,62 @@ class ReviewWorker:
                 state="not_observed",
                 error=self._redact(error),
             )
+
+    def _record_observed_note(self, run: ReviewRun, receipt: EffectReceipt) -> None:
+        """Record a Note only after the adapter verifies its scoped marker and native ID."""
+
+        marker = self._agent_note_marker(run)
+        observer = getattr(self.gitlab, "find_note_by_marker", None)
+        if not callable(observer):
+            self._update_run_effect_receipt(
+                run,
+                receipt,
+                state="not_observed",
+                detail="GitLab adapter cannot verify the Agent-owned Note",
+            )
+            return
+        try:
+            note = observer(run.project_id, run.mr_iid, marker)
+        except Exception as exc:  # noqa: BLE001 - external observation is independent
+            self._update_run_effect_receipt(
+                run,
+                receipt,
+                state="not_observed",
+                detail="GitLab Note observation failed; Agent process status is independent",
+                error=self._redact(exc),
+            )
+            return
+
+        note_project_id = getattr(note, "project_id", None)
+        note_mr_iid = getattr(note, "mr_iid", None)
+        note_id = getattr(note, "note_id", None)
+        if (
+            note is None
+            or type(note_project_id) is not str
+            or note_project_id != run.project_id
+            or type(note_mr_iid) is not int
+            or note_mr_iid <= 0
+            or note_mr_iid != run.mr_iid
+            or type(note_id) is not int
+            or note_id <= 0
+            or not has_exact_note_marker(getattr(note, "body", None), marker)
+        ):
+            self._update_run_effect_receipt(
+                run,
+                receipt,
+                state="not_observed",
+                detail="No valid scoped GitLab Note was observed for the Agent run",
+            )
+            return
+
+        external_identity = f"gitlab:{run.project_id}!{run.mr_iid}#note-{note_id}"
+        self._update_run_effect_receipt(
+            run,
+            receipt,
+            state="observed",
+            external_identity=external_identity,
+            detail=f"Agent-owned GitLab Note observed with native id={note_id}",
+        )
 
     def _heartbeat(self, run: ReviewRun) -> bool:
         return self.store.extend_lease(
@@ -1188,6 +1249,7 @@ class ReviewWorker:
                 skill_path=skill_path,
                 gitlab_token=self.gitlab_token,
                 auto_fix_enabled=self.policy.ai.auto_fix,
+                note_marker=self._agent_note_marker(run),
             ),
             heartbeat=lambda: self._heartbeat(run),
             heartbeat_interval_seconds=max(

@@ -24,6 +24,7 @@ class AgentContext:
     skill_path: Path | None = None
     gitlab_token: str | None = None
     auto_fix_enabled: bool = False
+    note_marker: str | None = None
 
 
 @dataclass(frozen=True)
@@ -85,6 +86,8 @@ class LocalCliAgentRunner:
         )
         if context.skill_path is not None:
             env["REVIEW_AGENT_FLOW_SKILL"] = str(context.skill_path)
+        if context.note_marker is not None:
+            env["REVIEW_AGENT_FLOW_NOTE_MARKER"] = context.note_marker
         if context.gitlab_token is not None:
             env["GITLAB_TOKEN"] = context.gitlab_token
         if extra_env:

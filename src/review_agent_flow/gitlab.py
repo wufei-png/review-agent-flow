@@ -7,6 +7,27 @@ from dataclasses import dataclass
 from typing import Protocol
 
 _SHA_RE = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
+_NOTE_MARKER_RE = re.compile(r"^<!-- review-run:[1-9][0-9]*:note -->$")
+
+
+def canonical_note_marker(run_id: int) -> str:
+    """Return the exact standalone token agents must put in a review Note."""
+
+    if type(run_id) is not int or run_id <= 0:
+        raise ValueError("run_id must be a positive integer")
+    return f"<!-- review-run:{run_id}:note -->"
+
+
+def has_exact_note_marker(body: object, marker: object) -> bool:
+    """Require one complete canonical marker line and reject all near matches."""
+
+    if (
+        not isinstance(body, str)
+        or not isinstance(marker, str)
+        or _NOTE_MARKER_RE.fullmatch(marker) is None
+    ):
+        return False
+    return sum(line == marker for line in body.splitlines()) == 1
 
 
 def is_valid_sha(value: object) -> bool:
@@ -36,6 +57,22 @@ class Pipeline:
     pipeline_id: int
     sha: str
     status: str
+
+
+@dataclass(frozen=True)
+class Note:
+    project_id: str
+    mr_iid: int
+    note_id: int
+    body: str
+
+
+class NoteObserver(Protocol):
+    """Optional capability for observing Agent-owned GitLab Notes."""
+
+    def find_note_by_marker(
+        self, project_id: str, mr_iid: int, marker: str
+    ) -> Note | None: ...
 
 
 @dataclass(frozen=True)
