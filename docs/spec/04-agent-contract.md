@@ -26,10 +26,28 @@ The Worker invokes the configured command with `shell=False`, the Review Run wor
 | `REVIEW_AGENT_FLOW_AUTO_FIX_TARGET_BRANCH` | Original MR source branch; the Auto-fix MR must target this branch |
 | `REVIEW_AGENT_FLOW_AUTO_FIX_TITLE` | Service-registered Auto-fix title |
 | `REVIEW_AGENT_FLOW_AUTO_FIX_MARKER` | Stable intent marker that must be included verbatim in the Auto-fix MR description |
-| `REVIEW_AGENT_FLOW_NOTE_MARKER` | Stable `ReviewFlow-Run-ID:<run-id> SHA:<sha>` marker for Note deduplication |
+| `REVIEW_AGENT_FLOW_NOTE_MARKER` | Canonical standalone token `<!-- review-run:<run-id>:note -->` that must appear exactly once in the Agent-owned Note body |
 | `GITLAB_TOKEN` | Review Bot token, when injected by runtime |
 
 The command receives no required JSON output contract. The Agent uses the worktree and GitLab context to submit Notes itself. Before posting, it must search for the exact Note marker and must include it in a newly posted Note. When it creates an Auto-fix MR, it must include the exact Auto-fix marker in the MR description; this is the identity check that prevents a rebuilt SQLite database from adopting an old MR with a reused numeric Run ID. The Worker only needs process status, stdout/stderr for diagnostics, timeout handling and lifecycle state.
+
+The Worker persists Effect Receipts for Agent execution, the expected
+Agent-owned Note, and (when enabled) the expected Auto-fix MR. These receipts
+are an audit and reconciliation surface, not an Agent response schema. After
+the Agent exits successfully, the Worker asks the optional GitLab Note observer
+to find the Note containing the exact canonical marker. Only a scoped Note
+with exactly one marker line and a strict positive-integer native ID becomes
+`observed` and receives an external identity. A successful
+Agent process does not prove that a Note or Auto-fix MR was observed; a missing
+or unavailable Note remains `not_observed`, and the Review Run status is kept
+independent from that external side effect.
+
+Auto-fix reconciliation queries the deterministic branch across opened,
+closed, and merged Merge Requests. A delayed or temporarily invisible MR
+remains a pending receipt for a later Worker cycle. If the MR is merged, the
+relation stores its resulting merge SHA and suppresses only that exact parent
+SHA. This is at-least-once processing with reconciliation, not exactly-once
+external side effects.
 
 ## Worktree
 

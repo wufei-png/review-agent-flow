@@ -6,6 +6,8 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from .gitlab import is_valid_sha
+
 AUTO_FIX_TITLE_PREFIX = "[ReviewFlow Auto-Fix]"
 AUTO_FIX_BRANCH_RE = re.compile(r"^autofix/MR-(?P<mr_iid>\d+)/run-(?P<run_id>\d+)$")
 
@@ -29,7 +31,7 @@ class WebhookDecision:
 
 
 def parse_auto_fix_branch(branch: str) -> tuple[int, int] | None:
-    match = AUTO_FIX_BRANCH_RE.match(branch)
+    match = AUTO_FIX_BRANCH_RE.fullmatch(branch)
     if match is None:
         return None
     return int(match.group("mr_iid")), int(match.group("run_id"))
@@ -60,8 +62,6 @@ def _user_username(payload: dict[str, Any], attrs: dict[str, Any]) -> str | None
 
 
 def parse_webhook(event_name: str | None, payload: dict[str, Any]) -> WebhookDecision:
-    """Parse supported GitLab hooks without making network calls."""
-
     decisions = parse_webhooks(event_name, payload)
     for decision in decisions:
         if decision.accepted:
@@ -69,11 +69,7 @@ def parse_webhook(event_name: str | None, payload: dict[str, Any]) -> WebhookDec
     return decisions[0]
 
 
-def parse_webhooks(
-    event_name: str | None, payload: dict[str, Any]
-) -> tuple[WebhookDecision, ...]:
-    """Parse a GitLab hook into one decision per affected Merge Request."""
-
+def parse_webhooks(event_name: str | None, payload: dict[str, Any]) -> tuple[WebhookDecision, ...]:
     normalized = (event_name or "Merge Request Hook").strip()
     if normalized == "Merge Request Hook":
         return (_parse_merge_request(payload),)
@@ -86,10 +82,9 @@ def _parse_merge_request(payload: dict[str, Any]) -> WebhookDecision:
     attrs = payload.get("object_attributes") or {}
     project_id = _project_id(payload)
     mr_iid = _int_or_none(attrs.get("iid"))
-    last_commit = attrs.get("last_commit") or {}
-    sha = last_commit.get("id") or attrs.get("last_commit_id") or attrs.get("merge_commit_sha")
-    if not project_id or mr_iid is None or not sha:
+    if not project_id or mr_iid is None:
         return WebhookDecision(False, "missing project, MR IID, or SHA")
+
     if attrs.get("work_in_progress") is True or attrs.get("draft") is True:
         return WebhookDecision(False, "draft merge request", project_id=project_id, mr_iid=mr_iid)
 
@@ -98,22 +93,33 @@ def _parse_merge_request(payload: dict[str, Any]) -> WebhookDecision:
     target_branch = attrs.get("target_branch")
     description = attrs.get("description")
     action = attrs.get("action")
+    common = {
+        "project_id": project_id,
+        "mr_iid": mr_iid,
+        "title": title,
+        "source_branch": str(source_branch) if source_branch else None,
+        "target_branch": str(target_branch) if target_branch else None,
+        "description": str(description) if description is not None else None,
+        "action": str(action) if action is not None else None,
+    }
+
     if action == "merge":
-        merged_sha = attrs.get("merge_commit_sha") or attrs.get("last_commit_id") or sha
+        merged_sha = attrs.get("merge_commit_sha")
+        if not is_valid_sha(merged_sha):
+            return WebhookDecision(
+                False,
+                "merge event has an invalid merge_commit_sha",
+                **common,
+            )
         return WebhookDecision(
-            accepted=True,
-            reason="merge request merged",
+            True,
+            "merge request merged",
             kind="merge",
-            project_id=project_id,
-            mr_iid=mr_iid,
-            sha=str(merged_sha),
-            title=title,
-            source_branch=str(source_branch) if source_branch else None,
-            target_branch=str(target_branch) if target_branch else None,
-            description=str(description) if description is not None else None,
-            merged_sha=str(merged_sha),
-            action="merge",
+            sha=merged_sha,
+            merged_sha=merged_sha,
+            **common,
         )
+
     if action and action not in {"open", "reopen", "update"}:
         return WebhookDecision(
             False,
@@ -121,19 +127,27 @@ def _parse_merge_request(payload: dict[str, Any]) -> WebhookDecision:
             project_id=project_id,
             mr_iid=mr_iid,
         )
+
+    last_commit = attrs.get("last_commit") or {}
+    if not isinstance(last_commit, dict):
+        last_commit = {}
+    sha = last_commit.get("id") or attrs.get("last_commit_id")
+    if sha is None:
+        return WebhookDecision(False, "missing project, MR IID, or SHA")
+    if not is_valid_sha(sha):
+        return WebhookDecision(
+            False,
+            "invalid Merge Request head SHA; expected 40 or 64 hexadecimal characters",
+            project_id=project_id,
+            mr_iid=mr_iid,
+        )
     return WebhookDecision(
-        accepted=True,
-        reason="merge request",
+        True,
+        "merge request",
         kind="normal",
-        project_id=project_id,
-        mr_iid=mr_iid,
         sha=str(sha),
         author_username=_user_username(payload, attrs),
-        title=title,
-        source_branch=str(source_branch) if source_branch else None,
-        target_branch=str(target_branch) if target_branch else None,
-        description=str(description) if description is not None else None,
-        action=str(action) if action is not None else None,
+        **common,
     )
 
 
@@ -146,6 +160,14 @@ def _parse_pipeline(payload: dict[str, Any]) -> tuple[WebhookDecision, ...]:
         return (WebhookDecision(False, f"pipeline status is not success: {status}"),)
     if not project_id or not sha:
         return (WebhookDecision(False, "pipeline has no project or SHA"),)
+    if not is_valid_sha(sha):
+        return (
+            WebhookDecision(
+                False,
+                "invalid pipeline SHA; expected 40 or 64 hexadecimal characters",
+                project_id=project_id,
+            ),
+        )
 
     raw_merge_requests = payload.get("merge_request") or attrs.get("merge_request")
     if isinstance(raw_merge_requests, dict):
@@ -165,36 +187,27 @@ def _parse_pipeline(payload: dict[str, Any]) -> tuple[WebhookDecision, ...]:
             or payload.get("merge_request_iid")
         )
         if mr_iid is None:
-            decisions.append(
-                WebhookDecision(False, "pipeline has no MR IID", project_id=project_id)
-            )
+            decisions.append(WebhookDecision(False, "pipeline has no MR IID", project_id=project_id))
             continue
         if merge_request.get("work_in_progress") is True or merge_request.get("draft") is True:
             decisions.append(
-                WebhookDecision(
-                    False,
-                    "draft merge request",
-                    project_id=project_id,
-                    mr_iid=mr_iid,
-                )
+                WebhookDecision(False, "draft merge request", project_id=project_id, mr_iid=mr_iid)
             )
             continue
-
         title = str(merge_request.get("title") or attrs.get("title") or "")
         source_branch = merge_request.get("source_branch") or attrs.get("ref")
         description = merge_request.get("description") or attrs.get("description")
         decisions.append(
             WebhookDecision(
-                accepted=True,
-                reason="successful pipeline",
+                True,
+                "successful pipeline",
                 kind="pipeline",
                 project_id=project_id,
                 mr_iid=mr_iid,
                 sha=str(sha),
                 title=title,
                 source_branch=str(source_branch) if source_branch else None,
-                target_branch=str(merge_request.get("target_branch") or attrs.get("target_branch") or "")
-                or None,
+                target_branch=str(merge_request.get("target_branch") or attrs.get("target_branch") or "") or None,
                 description=str(description) if description is not None else None,
             )
         )

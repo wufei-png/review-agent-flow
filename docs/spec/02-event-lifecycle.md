@@ -3,7 +3,7 @@
 ## Normal Review Run
 
 1. GitLab 发送 Merge Request Hook。
-2. Webhook 验证必填 token，要求事件 Project ID 等于进程绑定的 Project，并读取 MR IID、action、draft 状态和 head SHA。
+2. Webhook 验证必填 token，要求事件 Project ID 等于进程绑定的 Project，并读取 MR IID、action、draft 状态和精确 head SHA；普通评审只接受 `last_commit.id` 或 `last_commit_id`，不把 `merge_commit_sha` 当作普通 head SHA。
 3. Draft MR 不创建运行；如果 Webhook 与 Worker 获取 MR 之间发生状态竞态，Worker 会重新排队而不发送通知或启动 Agent。
 4. 若 Project 启用 Pipeline Gate，Worker 将对应 Run 延后到下一次可检查时间；成功 Pipeline Hook 只唤醒已有 pending Run，不创建独立 Pipeline Run；等待中的 Run 不阻塞后续已就绪 Run。
 5. Store 以 `(project_id, mr_iid, sha, kind=normal)` 去重并创建 `pending` Review Run。

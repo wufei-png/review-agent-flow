@@ -29,11 +29,9 @@ def _init_policy(path: Path, force: bool) -> int:
 
 
 def _required(value: str | None, env_name: str) -> str:
-    if value:
-        return value
-    from_environment = os.getenv(env_name)
-    if from_environment:
-        return from_environment
+    configured = value if value is not None else os.getenv(env_name)
+    if configured is not None and configured.strip():
+        return configured.strip()
     raise SystemExit(f"missing required option or environment variable: {env_name}")
 
 
@@ -59,7 +57,9 @@ def _run_worker(args: argparse.Namespace) -> int:
         gitlab_url=gitlab_url,
         gitlab_token=gitlab_token,
         project_id=project_id,
-        sha_ensurer=GitShaEnsurer(repository, fetch_timeout_seconds=args.fetch_timeout),
+        sha_ensurer=GitShaEnsurer(
+            repository, fetch_timeout_seconds=getattr(args, "fetch_timeout", 30.0)
+        ),
         notifier=notifiers_from_policy(policy.notifications.channels),
         agent_timeout_seconds=args.agent_timeout,
         lease_seconds=args.agent_timeout + 60,
@@ -73,6 +73,24 @@ def _run_worker(args: argparse.Namespace) -> int:
         print(json.dumps(asdict(result), default=str))
         return 0 if result.status in {"succeeded", "deferred"} else 1
     worker.run_forever(args.poll_interval)
+    return 0
+
+
+def _run_status(args: argparse.Namespace) -> int:
+    """Print one project-bound Review Run snapshot without contacting GitLab."""
+
+    project_id = _required(args.project_id, "REVIEW_AGENT_FLOW_PROJECT_ID")
+    database = args.db or os.getenv("REVIEW_AGENT_FLOW_DB", "review-agent-flow.sqlite3")
+    try:
+        store = SQLiteStore(database, read_only=True)
+    except FileNotFoundError:
+        print(json.dumps({"status": "not_found"}, sort_keys=True))
+        return 1
+    snapshot = store.get_project_bound_review_run_status(project_id, args.run_id)
+    if snapshot is None:
+        print(json.dumps({"status": "not_found"}, sort_keys=True))
+        return 1
+    print(json.dumps(snapshot, sort_keys=True))
     return 0
 
 
@@ -94,9 +112,15 @@ def main(argv: list[str] | None = None) -> int:
     worker.add_argument("--fetch-timeout", type=int, default=60)
     worker.add_argument("--poll-interval", type=float, default=5.0)
     worker.add_argument("--once", action="store_true")
+    status = subparsers.add_parser("status", help="query one project-bound Review Run")
+    status.add_argument("--run-id", type=int, required=True)
+    status.add_argument("--project-id")
+    status.add_argument("--db")
     args = parser.parse_args(argv)
     if args.command == "init":
         return _init_policy(Path(args.path), args.force)
     if args.command == "worker":
         return _run_worker(args)
+    if args.command == "status":
+        return _run_status(args)
     return 0
