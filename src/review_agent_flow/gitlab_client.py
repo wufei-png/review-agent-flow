@@ -115,7 +115,7 @@ class PythonGitLabClient(GitLabClient):
         notes_manager = self._project(project_id).mergerequests.get(mr_iid).notes
         return any(
             self._note_author_username(note) == self._review_bot_username
-            and marker in str(getattr(note, "body", ""))
+            and has_exact_note_marker(getattr(note, "body", None), marker)
             for note in self._list_all_notes(notes_manager)
         )
 

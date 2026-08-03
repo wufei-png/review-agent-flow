@@ -73,7 +73,7 @@ def _client(value: FakeNotes | SimpleNamespace, username: str | None = "review-b
 
 
 def test_note_marker_paginates_and_requires_review_bot_author() -> None:
-    marker = "ReviewFlow-Run-ID:1 SHA:abc"
+    marker = canonical_note_marker(1)
     notes = FakeNotes(
         [
             [SimpleNamespace(body=marker, author={"username": "alice"}) for _ in range(100)],
@@ -87,12 +87,25 @@ def test_note_marker_paginates_and_requires_review_bot_author() -> None:
 
 
 def test_note_marker_is_not_trusted_without_review_bot_username() -> None:
-    marker = "ReviewFlow-Run-ID:1 SHA:abc"
+    marker = canonical_note_marker(1)
     notes = FakeNotes([[SimpleNamespace(body=marker, author={"username": "review-bot"})]])
     project = SimpleNamespace(mergerequests=FakeMergeRequests(notes))
 
     assert _client(project, username=None).has_note_marker("42", 1, marker) is False
     assert notes.requested_pages == []
+
+
+def test_note_marker_requires_one_standalone_canonical_line() -> None:
+    marker = canonical_note_marker(1)
+    notes = FakeNotes(
+        [[
+            SimpleNamespace(body=f"prefix {marker}"),
+            SimpleNamespace(body=f"{marker}\n{marker}"),
+        ]]
+    )
+    project = SimpleNamespace(mergerequests=FakeMergeRequests(notes))
+
+    assert _client(project).has_note_marker("42", 1, marker) is False
 
 
 def test_auto_fix_lookup_skips_old_same_branch_mr_without_current_marker() -> None:

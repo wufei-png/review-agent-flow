@@ -1038,8 +1038,11 @@ class SQLiteStore:
             receipt_id,
         )
         if claim_token is not None:
-            query += " AND state = 'running' AND claim_token = ?"
-            parameters += (claim_token,)
+            query += (
+                " AND state = 'running' AND claim_token = ?"
+                " AND lease_until IS NOT NULL AND lease_until > ?"
+            )
+            parameters += (claim_token, now_text)
         if run_id is not None and run_claim_token is not None:
             query += (
                 " AND run_id = ? AND EXISTS ("
@@ -1086,6 +1089,16 @@ class SQLiteStore:
                 "AND review_runs.project_id = ?)"
             )
             project_parameters = (project_id,)
+        run_status_scope = ""
+        joined_run_status_scope = ""
+        if effect_kind == "autofix_reconciliation":
+            run_status_scope = (
+                " AND EXISTS ("
+                "SELECT 1 FROM review_runs "
+                "WHERE review_runs.id = effect_receipts.run_id "
+                "AND review_runs.status IN ('succeeded', 'failed', 'cancelled'))"
+            )
+            joined_run_status_scope = " AND review_runs.status IN ('succeeded', 'failed', 'cancelled')"
         if max_attempts is None:
             reclaim_state = "'pending'"
             reclaim_next_attempt = "?"
@@ -1117,6 +1130,7 @@ class SQLiteStore:
                 WHERE effect_kind = ? AND state = 'running'
                   AND (lease_until IS NULL OR lease_until <= ?)
                   {project_scope}
+                  {run_status_scope}
                 """,
                 (
                     *reclaim_parameters,
@@ -1136,6 +1150,7 @@ class SQLiteStore:
                         )
                     WHERE effect_kind = ? AND state = 'pending' AND attempt >= ?
                       {project_scope}
+                      {run_status_scope}
                     """,
                     (
                         now_text,
@@ -1155,6 +1170,7 @@ class SQLiteStore:
                   AND (effect_receipts.next_attempt_at IS NULL
                        OR effect_receipts.next_attempt_at <= ?)
                   {"AND review_runs.project_id = ?" if project_id is not None else ""}
+                  {joined_run_status_scope}
                   {attempt_scope}
                 ORDER BY effect_receipts.id LIMIT ?
                 """,
@@ -1179,6 +1195,7 @@ class SQLiteStore:
                         lease_until = ?, claim_token = ?, updated_at = ?
                     WHERE id = ? AND state = 'pending'
                       {project_scope}
+                      {run_status_scope}
                       {claim_attempt_scope}
                     """,
                     (
@@ -1352,6 +1369,11 @@ class SQLiteStore:
                 SET status = 'abandoned', updated_at = ?
                 WHERE run_id = ? AND status IN ('planned', 'created')
                   AND auto_fix_mr_iid IS NULL
+                  AND EXISTS (
+                      SELECT 1 FROM review_runs
+                      WHERE review_runs.id = auto_fix_intents.run_id
+                        AND review_runs.status IN ('succeeded', 'failed', 'cancelled')
+                  )
                 """,
                 (self._now().isoformat(), run_id),
             )
@@ -1891,8 +1913,10 @@ class SQLiteStore:
             query = "SELECT attempts FROM notification_outbox WHERE id = ? AND status = 'running'"
             parameters: tuple[object, ...] = (delivery_id,)
             if claim_token is not None:
-                query += " AND claim_token = ?"
-                parameters += (claim_token,)
+                query += (
+                    " AND claim_token = ? AND lease_until IS NOT NULL AND lease_until > ?"
+                )
+                parameters += (claim_token, now_text)
             row = connection.execute(query, parameters).fetchone()
             if row is None:
                 return False
@@ -1906,13 +1930,15 @@ class SQLiteStore:
                 status = "failed"
                 next_attempt_at = None
                 delivered_at = None
-                last_error = detail or "notification delivery failed"
+                last_error = self._redact(detail) if detail else "notification delivery failed"
             else:
                 status = "pending"
                 delay = retry_delay_seconds * (2 ** max(attempts - 1, 0))
                 next_attempt_at = (now + timedelta(seconds=delay)).isoformat()
                 delivered_at = None
-                last_error = detail or "notification delivery failed; retrying"
+                last_error = (
+                    self._redact(detail) if detail else "notification delivery failed; retrying"
+                )
             query = (
                 "UPDATE notification_outbox SET status = ?, next_attempt_at = ?, "
                 "lease_until = NULL, claim_token = NULL, delivered_at = ?, last_error = ? "
@@ -1920,8 +1946,8 @@ class SQLiteStore:
             )
             parameters = (status, next_attempt_at, delivered_at, last_error, delivery_id)
             if claim_token is not None:
-                query += " AND claim_token = ?"
-                parameters += (claim_token,)
+                query += " AND claim_token = ? AND lease_until IS NOT NULL AND lease_until > ?"
+                parameters += (claim_token, now_text)
             cursor = connection.execute(query, parameters)
         return cursor.rowcount == 1
 
@@ -1959,9 +1985,9 @@ class SQLiteStore:
                 UPDATE worktree_cleanup
                 SET status = 'pending_cleanup', last_error = ?,
                     next_attempt_at = ?, lease_until = NULL, claim_token = NULL
-                WHERE id = ? AND status != 'cleaned'
+                WHERE id = ? AND status = 'active'
                 """,
-                (detail, self._now().isoformat(), cleanup_id),
+                (self._redact(detail), self._now().isoformat(), cleanup_id),
             )
         return cursor.rowcount == 1
 
@@ -1976,20 +2002,31 @@ class SQLiteStore:
                     next_attempt_at = NULL, lease_until = NULL, claim_token = NULL
                 WHERE id = ? AND status = 'active'
                 """,
-                (self._now().isoformat(), detail, cleanup_id),
+                (self._now().isoformat(), self._redact(detail), cleanup_id),
             )
         return cursor.rowcount == 1
 
     def mark_worktree_cleaned(self, cleanup_id: int, claim_token: str | None = None) -> bool:
+        now_text = self._now().isoformat()
         query = (
             "UPDATE worktree_cleanup SET status = 'cleaned', cleaned_at = ?, "
             "next_attempt_at = NULL, lease_until = NULL, claim_token = NULL "
-            "WHERE id = ? AND status IN ('active', 'pending_cleanup', 'running')"
+            "WHERE id = ? AND status = 'active'"
         )
-        parameters: tuple[object, ...] = (self._now().isoformat(), cleanup_id)
+        parameters: tuple[object, ...] = (now_text, cleanup_id)
         if claim_token is not None:
-            query += " AND claim_token = ?"
-            parameters += (claim_token,)
+            query = (
+                "UPDATE worktree_cleanup SET status = 'cleaned', cleaned_at = ?, "
+                "next_attempt_at = NULL, lease_until = NULL, claim_token = NULL "
+                "WHERE id = ? AND status = 'running' AND claim_token = ?"
+                " AND lease_until IS NOT NULL AND lease_until > ?"
+            )
+            parameters = (
+                now_text,
+                cleanup_id,
+                claim_token,
+                now_text,
+            )
         with self._connect() as connection:
             cursor = connection.execute(query, parameters)
         return cursor.rowcount == 1
@@ -2077,13 +2114,16 @@ class SQLiteStore:
             raise ValueError("worktree cleanup max_attempts must be positive")
         if retry_delay_seconds < 0:
             raise ValueError("worktree cleanup retry_delay_seconds cannot be negative")
+        now_text = self._now().isoformat()
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             query = "SELECT attempts FROM worktree_cleanup WHERE id = ? AND status = 'running'"
             parameters: tuple[object, ...] = (cleanup_id,)
             if claim_token is not None:
-                query += " AND claim_token = ?"
-                parameters += (claim_token,)
+                query += (
+                    " AND claim_token = ? AND lease_until IS NOT NULL AND lease_until > ?"
+                )
+                parameters += (claim_token, now_text)
             row = connection.execute(query, parameters).fetchone()
             if row is None:
                 return False
@@ -2097,14 +2137,16 @@ class SQLiteStore:
                 status = "failed"
                 next_attempt_at = None
                 cleaned_at = None
-                last_error = detail or "worktree cleanup failed"
+                last_error = self._redact(detail) if detail else "worktree cleanup failed"
             else:
                 status = "pending_cleanup"
                 next_attempt_at = (
                     self._now() + timedelta(seconds=retry_delay_seconds * (2 ** (attempts - 1)))
                 ).isoformat()
                 cleaned_at = None
-                last_error = detail or "worktree cleanup failed; retrying"
+                last_error = (
+                    self._redact(detail) if detail else "worktree cleanup failed; retrying"
+                )
             query = (
                 "UPDATE worktree_cleanup SET status = ?, next_attempt_at = ?, "
                 "lease_until = NULL, claim_token = NULL, cleaned_at = ?, last_error = ? "
@@ -2112,8 +2154,8 @@ class SQLiteStore:
             )
             parameters = (status, next_attempt_at, cleaned_at, last_error, cleanup_id)
             if claim_token is not None:
-                query += " AND claim_token = ?"
-                parameters += (claim_token,)
+                query += " AND claim_token = ? AND lease_until IS NOT NULL AND lease_until > ?"
+                parameters += (claim_token, now_text)
             cursor = connection.execute(query, parameters)
         return cursor.rowcount == 1
 

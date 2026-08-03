@@ -297,8 +297,9 @@ class ReviewWorker:
                     parent_merge_request,
                     merge_request,
                     parent_mr_iid=auto_fix_match.parent_mr_iid,
+                    expected_run_id=auto_fix_match.run_id,
                     expected_branch=(
-                        f"autofix/MR-{auto_fix_match.parent_mr_iid}/run-{run.run_id}"
+                        f"autofix/MR-{auto_fix_match.parent_mr_iid}/run-{auto_fix_match.run_id}"
                     ),
                 )
                 if identity_error is not None:
@@ -417,14 +418,11 @@ class ReviewWorker:
                         )
                         auto_fix_created = True
 
-                legacy_marker = f"ReviewFlow-Run-ID:{run.run_id} SHA:{run.sha}"
                 has_marker = False
                 has_note_marker = getattr(self.gitlab, "has_note_marker", None)
                 if callable(has_note_marker):
                     try:
-                        has_marker = bool(
-                            has_note_marker(run.project_id, run.mr_iid, legacy_marker)
-                        )
+                        has_marker = bool(has_note_marker(run.project_id, run.mr_iid, marker))
                     except Exception:  # noqa: BLE001 - duplicate detection is best effort
                         has_marker = False
                 if self.policy.ai.auto_fix and not auto_fix_created:
@@ -532,13 +530,20 @@ class ReviewWorker:
                         merge_request.target_branch,
                         merge_request.description,
                     ) is not None
+                reconciliation_pending = any(
+                    receipt.state in {"planned", "pending", "running"}
+                    for receipt in self.store.list_effect_receipts(
+                        run.run_id, "autofix_reconciliation"
+                    )
+                )
+                if not self.store.finish(run.run_id, "succeeded", claim_token=run.claim_token):
+                    raise LeaseLostError("Review Run lease lost before Agent result completion")
                 if (
                     auto_fix_intent is not None
                     and not auto_fix_created
+                    and not reconciliation_pending
                 ):
                     self.store.abandon_auto_fix_intent(run.run_id)
-                if not self.store.finish(run.run_id, "succeeded", claim_token=run.claim_token):
-                    raise LeaseLostError("Review Run lease lost before Agent result completion")
                 self._log_run(run, status="succeeded", diagnostic="Agent process exited successfully")
                 completed_result = WorkerResult(run.run_id, "succeeded", result)
             finally:
@@ -624,14 +629,13 @@ class ReviewWorker:
         except Exception as exc:  # noqa: BLE001 - a failed Run must be persisted
             if receipts and not agent_finished:
                 self._cleanup_agent_effects(run, receipts, exc)
-            if auto_fix_intent is not None and not agent_started:
-                try:
-                    self.store.abandon_auto_fix_intent(run.run_id)
-                except Exception:
-                    LOGGER.exception("failed to abandon unused Auto-fix intent for Run %s", run.run_id)
             failure = classify_exception(exc, secrets=self._redaction_secrets())
             if failure.retryable:
                 requeued = self._retry_or_fail(run, failure)
+                if not requeued and auto_fix_intent is not None and not agent_started:
+                    current = self.store.get_review_run(run.run_id)
+                    if current is not None and current.status in {"failed", "cancelled"}:
+                        self.store.abandon_auto_fix_intent(run.run_id)
                 return WorkerResult(
                     run.run_id,
                     "deferred" if requeued else "failed",
@@ -639,6 +643,8 @@ class ReviewWorker:
                 )
             if not self._finish_terminal(run, "failed", failure.detail, failure.failure_class):
                 return self._lease_recovery_result(run, failure.detail)
+            if auto_fix_intent is not None and not agent_started:
+                self.store.abandon_auto_fix_intent(run.run_id)
             return WorkerResult(run.run_id, "failed", detail=failure.detail)
 
     def _finish_terminal(
@@ -848,9 +854,11 @@ class ReviewWorker:
         *,
         parent_mr_iid: int,
         expected_branch: str,
+        expected_run_id: int | None = None,
     ) -> str | None:
         parsed = parse_auto_fix_branch(expected_branch)
-        if parsed != (parent_mr_iid, run.run_id):
+        branch_run_id = run.run_id if expected_run_id is None else expected_run_id
+        if parsed != (parent_mr_iid, branch_run_id):
             return "Auto-fix expected branch does not match its parent MR and Review Run"
         if (
             getattr(parent_merge_request, "project_id", None) != run.project_id
@@ -904,6 +912,7 @@ class ReviewWorker:
                 "deferred",
                 detail="Auto-fix reconciliation lease lost; reclaim will recover",
             )
+        self.store.abandon_auto_fix_intent(run.run_id)
         self._log_run(
             run,
             event="worker.autofix_reconcile",
@@ -1209,6 +1218,10 @@ class ReviewWorker:
                     "Auto-fix MR is still not observable",
                     claim_token=receipt.claim_token,
                 )
+                if not scheduled:
+                    current_receipt = self.store.get_effect_receipt(receipt.receipt_id)
+                    if current_receipt is not None and current_receipt.state == "not_observed":
+                        self.store.abandon_auto_fix_intent(run.run_id)
                 self._log_run(
                     run,
                     event="worker.autofix_reconcile",
@@ -1262,6 +1275,10 @@ class ReviewWorker:
                 scheduled = self._schedule_reconciliation(
                     receipt, failure.detail, claim_token=receipt.claim_token
                 )
+                if not scheduled:
+                    current_receipt = self.store.get_effect_receipt(receipt.receipt_id)
+                    if current_receipt is not None and current_receipt.state == "not_observed":
+                        self.store.abandon_auto_fix_intent(run.run_id)
                 self._log_run(
                     run,
                     event="worker.autofix_reconcile",
@@ -1283,13 +1300,15 @@ class ReviewWorker:
                         else "Auto-fix reconciliation exhausted; not observed"
                     ),
                 )
-            self.store.update_effect_receipt(
+            updated = self.store.update_effect_receipt(
                 receipt.receipt_id,
                 state="failed",
                 detail="Auto-fix reconciliation failed terminally",
                 error=failure.detail,
                 claim_token=receipt.claim_token,
             )
+            if updated:
+                self.store.abandon_auto_fix_intent(run.run_id)
             self._log_run(
                 run,
                 event="worker.autofix_reconcile",

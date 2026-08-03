@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from urllib.error import URLError
 
 from .policy import PolicyError
+from .repository import ShaFetchError, ShaUnavailableError
 from .security import redact
 from .worktree import WorktreeError
 
@@ -63,6 +64,10 @@ def classify_exception(
         if "path already exists" in detail.lower():
             return FailureInfo("worktree_conflict", False, detail)
         return FailureInfo("worktree_transport", True, detail)
+    if isinstance(error, ShaFetchError):
+        return FailureInfo("repository_fetch", True, detail)
+    if isinstance(error, ShaUnavailableError):
+        return FailureInfo("repository_sha_unavailable", False, detail)
     if isinstance(error, (FileNotFoundError, PermissionError)):
         return FailureInfo("agent_configuration", False, detail)
     if isinstance(error, PolicyError):

@@ -130,6 +130,9 @@ def test_effect_receipt_claim_reclaim_is_project_scoped(tmp_path) -> None:
     store = SQLiteStore(database)
     project_a_run = store.enqueue("A", 1, SHA)
     project_b_run = store.enqueue("B", 1, OLD_SHA)
+    claimed_a = store.claim_next(project_id="A")
+    assert claimed_a is not None
+    assert store.finish(project_a_run.run_id, "succeeded", claim_token=claimed_a.claim_token)
     project_a_receipt = store.create_effect_receipt(
         project_a_run.run_id,
         "autofix_reconciliation",
@@ -167,10 +170,33 @@ def test_effect_receipt_claim_reclaim_is_project_scoped(tmp_path) -> None:
     assert row == ("running", "project-b-token")
 
 
+def test_autofix_reconciliation_waits_for_terminal_parent_run(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "review.db")
+    run = store.enqueue("42", 1, SHA)
+    receipt = store.create_effect_receipt(
+        run.run_id,
+        "autofix_reconciliation",
+        "autofix/MR-1/run-1",
+        state="pending",
+    )
+
+    assert store.claim_pending_effect_receipts("autofix_reconciliation", project_id="42") == ()
+    claimed_run = store.claim_next(project_id="42")
+    assert claimed_run is not None
+    assert store.finish(run.run_id, "succeeded", claim_token=claimed_run.claim_token)
+    claimed_receipts = store.claim_pending_effect_receipts(
+        "autofix_reconciliation", project_id="42"
+    )
+    assert [item.receipt_id for item in claimed_receipts] == [receipt.receipt_id]
+
+
 def test_effect_receipt_crash_reclaim_stops_at_max_attempts(tmp_path) -> None:
     database = tmp_path / "review.db"
     store = SQLiteStore(database)
     run = store.enqueue("42", 1, SHA)
+    claimed_run = store.claim_next(project_id="42")
+    assert claimed_run is not None
+    assert store.finish(run.run_id, "succeeded", claim_token=claimed_run.claim_token)
     receipt = store.create_effect_receipt(
         run.run_id,
         "autofix_reconciliation",
@@ -221,6 +247,9 @@ def test_pending_effect_receipt_at_max_attempts_is_not_claimed(tmp_path) -> None
     database = tmp_path / "review.db"
     store = SQLiteStore(database)
     run = store.enqueue("42", 1, SHA)
+    claimed_run = store.claim_next(project_id="42")
+    assert claimed_run is not None
+    assert store.finish(run.run_id, "succeeded", claim_token=claimed_run.claim_token)
     receipt = store.create_effect_receipt(
         run.run_id,
         "autofix_reconciliation",
@@ -362,6 +391,9 @@ def test_auto_fix_intent_rejects_reused_run_id_without_current_marker(tmp_path) 
         )
         is None
     )
+    claimed = store.claim_next(project_id="42")
+    assert claimed is not None
+    assert store.finish(run.run_id, "succeeded", claim_token=claimed.claim_token)
     assert store.abandon_auto_fix_intent(run.run_id) is True
     assert store.get_auto_fix_intent(run.run_id).status == "abandoned"
 
@@ -378,6 +410,10 @@ def test_abandoned_auto_fix_intent_is_not_reclaimed(tmp_path) -> None:
         "feature/validation",
         "[ReviewFlow Auto-Fix] Improve validation",
     )
+    assert store.abandon_auto_fix_intent(run.run_id) is False
+    claimed = store.claim_next(project_id="42")
+    assert claimed is not None
+    assert store.finish(run.run_id, "succeeded", claim_token=claimed.claim_token)
     assert store.abandon_auto_fix_intent(run.run_id) is True
     assert (
         store.resolve_auto_fix_match(
@@ -570,6 +606,106 @@ def test_expired_run_token_cannot_update_receipt_or_finish(tmp_path) -> None:
     assert saved_run.status == "running"
 
 
+def test_expired_claims_cannot_finish_before_reclaim(tmp_path) -> None:
+    database = tmp_path / "review.db"
+    store = SQLiteStore(database)
+    expired = "2000-01-01T00:00:00+00:00"
+
+    effect_run = store.enqueue("42", 2, OLD_SHA)
+    claimed_effect_run = store.claim_next(project_id="42")
+    assert claimed_effect_run is not None and claimed_effect_run.run_id == effect_run.run_id
+    assert store.finish(
+        effect_run.run_id, "succeeded", claim_token=claimed_effect_run.claim_token
+    )
+    receipt = store.create_effect_receipt(
+        effect_run.run_id,
+        "autofix_reconciliation",
+        "autofix/MR-2/run-2",
+        state="pending",
+    )
+    claimed_receipt = store.claim_pending_effect_receipts(
+        "autofix_reconciliation", project_id="42"
+    )[0]
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE effect_receipts SET lease_until = ? WHERE id = ?",
+            (expired, receipt.receipt_id),
+        )
+    assert (
+        store.update_effect_receipt(
+            receipt.receipt_id,
+            state="observed",
+            claim_token=claimed_receipt.claim_token,
+        )
+        is False
+    )
+
+    delivery = store.enqueue_notifications(
+        "review-run:2:human",
+        "Review",
+        "Please review",
+        None,
+        (),
+        (("recording", "recording"),),
+    )[0]
+    claimed_delivery = store.claim_notification(delivery.delivery_id)
+    assert claimed_delivery is not None and claimed_delivery.claim_token
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE notification_outbox SET lease_until = ? WHERE id = ?",
+            (expired, delivery.delivery_id),
+        )
+    assert (
+        store.finish_notification(
+            delivery.delivery_id,
+            True,
+            claim_token=claimed_delivery.claim_token,
+        )
+        is False
+    )
+
+    cleanup = store.register_worktree(effect_run.run_id, tmp_path / "worktree", OLD_SHA)
+    assert store.mark_worktree_cleanup_pending(cleanup.cleanup_id, "retry cleanup")
+    claimed_cleanup = store.claim_next_worktree_cleanup()
+    assert claimed_cleanup is not None and claimed_cleanup.claim_token
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE worktree_cleanup SET lease_until = ? WHERE id = ?",
+            (expired, cleanup.cleanup_id),
+        )
+    assert (
+        store.finish_worktree_cleanup(
+            cleanup.cleanup_id,
+            True,
+            claim_token=claimed_cleanup.claim_token,
+        )
+        is False
+    )
+
+
+def test_main_worktree_cleanup_cannot_overwrite_claimed_cleanup(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "review.db")
+    run = store.enqueue("42", 1, SHA)
+    claimed_run = store.claim_next(project_id="42")
+    assert claimed_run is not None
+    assert store.finish(run.run_id, "succeeded", claim_token=claimed_run.claim_token)
+    cleanup = store.register_worktree(run.run_id, tmp_path / "worktree", SHA)
+    claimed_cleanup = store.claim_next_worktree_cleanup()
+    assert claimed_cleanup is not None and claimed_cleanup.claim_token
+
+    assert store.mark_worktree_cleaned(cleanup.cleanup_id) is False
+    assert store.mark_worktree_cleanup_pending(cleanup.cleanup_id, "late cleanup failure") is False
+    current = store.get_worktree_record(cleanup.cleanup_id)
+    assert current is not None
+    assert current.status == "running"
+    assert current.claim_token == claimed_cleanup.claim_token
+    assert store.finish_worktree_cleanup(
+        cleanup.cleanup_id,
+        True,
+        claim_token=claimed_cleanup.claim_token,
+    )
+
+
 def test_effect_receipt_is_idempotent_queryable_and_redacted(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("GITLAB_TOKEN", "super-secret-token")
     store = SQLiteStore(tmp_path / "review.db")
@@ -634,3 +770,52 @@ def test_runtime_redaction_secret_covers_plain_audit_text(tmp_path) -> None:
     saved_receipt = store.get_effect_receipt(receipt.receipt_id)
     assert saved_receipt is not None
     assert token not in (saved_receipt.error or "")
+
+
+def test_notification_and_worktree_errors_are_redacted(tmp_path) -> None:
+    token = "runtime-store-token-456"
+    store = SQLiteStore(tmp_path / "review.db", redaction_secrets=(token,))
+
+    delivery = store.enqueue_notifications(
+        "review-run:1:human",
+        "Review",
+        "Please review",
+        None,
+        ("alice",),
+        (("recording", "recording"),),
+    )[0]
+    claimed_delivery = store.claim_notification(delivery.delivery_id)
+    assert claimed_delivery is not None
+    assert store.finish_notification(
+        delivery.delivery_id,
+        False,
+        f"provider response access_token={token}",
+        claim_token=claimed_delivery.claim_token,
+        max_attempts=1,
+    )
+    saved_delivery = store.get_notification_delivery(delivery.delivery_id)
+    assert saved_delivery is not None
+    assert token not in (saved_delivery.last_error or "")
+
+    run = store.enqueue("42", 1, SHA)
+    claimed_run = store.claim_next(project_id="42")
+    assert claimed_run is not None
+    assert store.finish(run.run_id, "succeeded", claim_token=claimed_run.claim_token)
+    cleanup = store.register_worktree(run.run_id, tmp_path / "worktree", SHA)
+    assert store.mark_worktree_cleanup_pending(cleanup.cleanup_id, f"cleanup {token}")
+    pending = store.get_worktree_record(cleanup.cleanup_id)
+    assert pending is not None
+    assert token not in (pending.last_error or "")
+
+    claimed_cleanup = store.claim_next_worktree_cleanup(max_attempts=1)
+    assert claimed_cleanup is not None
+    assert store.finish_worktree_cleanup(
+        cleanup.cleanup_id,
+        False,
+        f"git stderr token={token}",
+        claim_token=claimed_cleanup.claim_token,
+        max_attempts=1,
+    )
+    saved_cleanup = store.get_worktree_record(cleanup.cleanup_id)
+    assert saved_cleanup is not None
+    assert token not in (saved_cleanup.last_error or "")

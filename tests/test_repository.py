@@ -1,7 +1,9 @@
 import subprocess
 from pathlib import Path
 
-from review_agent_flow.repository import GitShaEnsurer
+import pytest
+
+from review_agent_flow.repository import GitShaEnsurer, ShaFetchError
 
 
 def _git_repository(path: Path) -> str:
@@ -37,3 +39,17 @@ def test_ensure_sha_fetches_missing_commit_under_repository_lock(tmp_path: Path)
         ["git", "-C", str(checkout), "cat-file", "-e", f"{new_sha}^{{commit}}"],
         check=False,
     ).returncode == 0
+
+
+def test_temporary_commit_probe_failure_is_retryable(monkeypatch, tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    ensurer = GitShaEnsurer(repository)
+
+    def timeout(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired("git cat-file", 1)
+
+    monkeypatch.setattr("review_agent_flow.repository.subprocess.run", timeout)
+
+    with pytest.raises(ShaFetchError, match="checking commit .* timed out"):
+        ensurer.ensure_sha("a" * 40)
