@@ -33,6 +33,17 @@
 
 ## Remaining implementation and boundaries
 
+The following accepted target contracts are not implemented yet:
+
+- Policy schema v3 with Operator-owned `ai.backend` / `ai.profile` and no
+  Project-provided `ai.command`;
+- stable Review Key markers for Notes and Auto-fix artifacts, including the
+  Review-Key/Intent-derived Auto-fix branch and documented legacy boundaries;
+- the Review Outcome projection over user-visible Effect Receipts and
+  notification deliveries, backed by immutable Requested Outputs, an Effective
+  Run Decision and Output Expectations; and
+- explicit, audited Operator recovery of Auto-fix relations after Store loss.
+
 1. Add Pipeline webhook fixtures for GitLab versions used by deployments.
 2. Add configurable retry/backoff policy beyond the Worker defaults.
 3. Add full recipient identity lookup/mapping for Feishu and WeCom.
@@ -50,7 +61,10 @@
 - Two Worker claims cannot execute one pending Run twice.
 - A normal Run uses an exact-SHA worktree and always cleans it up.
 - Cleanup is recorded and retried independently when removal fails; a stale, closed or merged MR cannot trigger notification or Agent execution.
-- Agent command receives the documented environment and direct GitLab token context.
+- An AI-enabled Policy selects an Operator-authorized Agent Backend/Profile;
+  Project-provided executable commands and Policy schema v2 are rejected.
+- The selected Agent Backend receives the documented Review Run context and
+  only the runtime environment allowed by its Operator-owned profile.
 - Auto-fix creates a separate MR and never writes directly to the parent source branch.
 - Auto-fix MR notification targets only the parent MR creator.
 - Auto-fix merge suppresses exactly one parent SHA; a later user SHA triggers normally.
@@ -65,5 +79,6 @@
 - A Pipeline Hook never creates a standalone Run; when Gate is enabled it wakes an existing deferred normal Run for the same SHA.
 - A title/branch-only Auto-fix lookalike follows the normal path; only a server-owned intent/relation enters the Auto-fix path.
 - Auto-fix reconciliation verifies the Run/SHA marker, abandons a terminal intent with no child MR, paginates trusted Review Bot Note markers, and prunes missing worktree metadata.
-- Policy schema v2 makes stable notification channel IDs explicit; v1 policies require an intentional config update before loading.
+- Policy schema v3 makes stable notification channel IDs and Operator-owned
+  Agent Backend/Profile selection explicit; v1 and v2 policies are rejected.
 - A missing local SHA is fetched only through the explicit locked and bounded `ensure_sha` step before worktree creation.

@@ -11,4 +11,8 @@ ReviewFlow adds durable effect receipts and reconciliation keyed by the
 Review Run, a canonical deterministic Note marker, and platform identities. This preserves
 existing Agent compatibility while making replay and duplicate side effects
 auditable; it deliberately provides at-least-once behavior with reconciliation,
-not an exactly-once guarantee.
+not an exactly-once guarantee. This decision targets a trusted internal Project
+deployment: the Operator accepts that Project Policy and admitted MR content can
+influence a credentialed Agent. Environment minimization, Operator-owned backend
+selection and process isolation harden that deployment, but do not turn it into
+an unattended execution boundary for arbitrary untrusted contributions.
