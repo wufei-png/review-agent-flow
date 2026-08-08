@@ -1795,31 +1795,58 @@ class SQLiteStore:
         now_text: str,
         lease_until: str,
         claim_token: str,
+        excluded_delivery_ids: tuple[int, ...] = (),
+        excluded_channel_ids: tuple[str, ...] = (),
+        allowed_channel_ids: tuple[str, ...] | None = None,
     ) -> sqlite3.Row | None:
+        if allowed_channel_ids == ():
+            return None
         if delivery_id is None:
+            exclusion = ""
+            parameters: tuple[object, ...] = (now_text,)
+            if allowed_channel_ids is not None:
+                placeholders = ", ".join("?" for _ in allowed_channel_ids)
+                exclusion = f" AND channel_id IN ({placeholders})"
+                parameters += allowed_channel_ids
+            if excluded_delivery_ids:
+                placeholders = ", ".join("?" for _ in excluded_delivery_ids)
+                exclusion += f" AND id NOT IN ({placeholders})"
+                parameters += excluded_delivery_ids
+            if excluded_channel_ids:
+                placeholders = ", ".join("?" for _ in excluded_channel_ids)
+                exclusion += f" AND channel_id NOT IN ({placeholders})"
+                parameters += excluded_channel_ids
             row = connection.execute(
-                """
+                f"""
                 SELECT id AS delivery_id, correlation_id, channel_id, channel,
                        title, body, url, recipients_json, status, attempts,
                        next_attempt_at, lease_until, claim_token, created_at,
                        delivered_at, last_error
                 FROM notification_outbox
                 WHERE status = 'pending' AND next_attempt_at <= ?
+                  {exclusion}
                 ORDER BY id LIMIT 1
                 """,
-                (now_text,),
+                parameters,
             ).fetchone()
         else:
+            channel_scope = ""
+            parameters = (delivery_id, now_text)
+            if allowed_channel_ids is not None:
+                placeholders = ", ".join("?" for _ in allowed_channel_ids)
+                channel_scope = f" AND channel_id IN ({placeholders})"
+                parameters += allowed_channel_ids
             row = connection.execute(
-                """
+                f"""
                 SELECT id AS delivery_id, correlation_id, channel_id, channel,
                        title, body, url, recipients_json, status, attempts,
                        next_attempt_at, lease_until, claim_token, created_at,
                        delivered_at, last_error
                 FROM notification_outbox
                 WHERE id = ? AND status = 'pending' AND next_attempt_at <= ?
+                  {channel_scope}
                 """,
-                (delivery_id, now_text),
+                parameters,
             ).fetchone()
         if row is None:
             return None
@@ -1848,6 +1875,9 @@ class SQLiteStore:
         delivery_id: int | None,
         lease_seconds: int,
         max_attempts: int,
+        excluded_delivery_ids: tuple[int, ...] = (),
+        excluded_channel_ids: tuple[str, ...] = (),
+        allowed_channel_ids: tuple[str, ...] | None = None,
     ) -> NotificationDelivery | None:
         if lease_seconds <= 0:
             raise ValueError("notification lease_seconds must be positive")
@@ -1874,7 +1904,14 @@ class SQLiteStore:
                 (max_attempts, max_attempts, now_text, max_attempts, now_text),
             )
             claimed = self._claim_notification_row(
-                connection, delivery_id, now_text, lease_until, claim_token
+                connection,
+                delivery_id,
+                now_text,
+                lease_until,
+                claim_token,
+                excluded_delivery_ids,
+                excluded_channel_ids,
+                allowed_channel_ids,
             )
         return self._notification_from_row(claimed) if claimed is not None else None
 
@@ -1882,16 +1919,32 @@ class SQLiteStore:
         self,
         lease_seconds: int = DEFAULT_NOTIFICATION_LEASE_SECONDS,
         max_attempts: int = DEFAULT_NOTIFICATION_MAX_ATTEMPTS,
+        excluded_delivery_ids: tuple[int, ...] = (),
+        excluded_channel_ids: tuple[str, ...] = (),
+        allowed_channel_ids: tuple[str, ...] | None = None,
     ) -> NotificationDelivery | None:
-        return self._claim_notification(None, lease_seconds, max_attempts)
+        return self._claim_notification(
+            None,
+            lease_seconds,
+            max_attempts,
+            excluded_delivery_ids,
+            excluded_channel_ids,
+            allowed_channel_ids,
+        )
 
     def claim_notification(
         self,
         delivery_id: int,
         lease_seconds: int = DEFAULT_NOTIFICATION_LEASE_SECONDS,
         max_attempts: int = DEFAULT_NOTIFICATION_MAX_ATTEMPTS,
+        allowed_channel_ids: tuple[str, ...] | None = None,
     ) -> NotificationDelivery | None:
-        return self._claim_notification(delivery_id, lease_seconds, max_attempts)
+        return self._claim_notification(
+            delivery_id,
+            lease_seconds,
+            max_attempts,
+            allowed_channel_ids=allowed_channel_ids,
+        )
 
     def finish_notification(
         self,

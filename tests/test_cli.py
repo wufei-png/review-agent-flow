@@ -9,6 +9,15 @@ from review_agent_flow.policy import ReviewPolicy
 from review_agent_flow.worker import WorkerResult
 
 
+class FakeNotificationDispatcher:
+    def __init__(self) -> None:
+        self.batch_calls = 0
+
+    def process_channel_batch(self) -> int:
+        self.batch_calls += 1
+        return 0
+
+
 def test_worker_resolves_relative_policy_from_repository(monkeypatch, tmp_path: Path) -> None:
     repository = tmp_path / "project"
     repository.mkdir()
@@ -21,6 +30,8 @@ def test_worker_resolves_relative_policy_from_repository(monkeypatch, tmp_path: 
     class FakeWorker:
         def __init__(self, **kwargs):
             captured["worker"] = kwargs
+            self.notification_dispatcher = FakeNotificationDispatcher()
+            captured["notification_dispatcher"] = self.notification_dispatcher
 
         def process_one(self):
             return None
@@ -51,15 +62,18 @@ def test_worker_resolves_relative_policy_from_repository(monkeypatch, tmp_path: 
     assert cli._run_worker(args) == 0
     assert captured["policy_path"] == repository / ".gitlab/reviewflow.yml"
     assert captured["worker"]["project_id"] == "42"
+    assert captured["notification_dispatcher"].batch_calls == 1
 
 
 def test_worker_once_emits_json_run_status(monkeypatch, tmp_path: Path, capsys) -> None:
     repository = tmp_path / "project"
     repository.mkdir()
+    captured = {}
 
     class FakeWorker:
         def __init__(self, **kwargs):
-            pass
+            self.notification_dispatcher = FakeNotificationDispatcher()
+            captured["notification_dispatcher"] = self.notification_dispatcher
 
         def process_one(self):
             return WorkerResult(7, "succeeded", detail="done")
@@ -94,6 +108,7 @@ def test_worker_once_emits_json_run_status(monkeypatch, tmp_path: Path, capsys) 
         "run_id": 7,
         "status": "succeeded",
     }
+    assert captured["notification_dispatcher"].batch_calls == 1
 
 
 def test_worker_entry_requires_a_bound_project(monkeypatch, tmp_path: Path) -> None:

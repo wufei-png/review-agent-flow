@@ -67,6 +67,7 @@ def _run_worker(args: argparse.Namespace) -> int:
     )
     if args.once:
         result = worker.process_one()
+        worker.notification_dispatcher.process_channel_batch()
         if result is None:
             print(json.dumps({"status": "idle"}))
             return 0

@@ -8,12 +8,13 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from uuid import uuid4
+from threading import Event, Thread
 
 from .events import parse_auto_fix_branch
 from .failures import FailureInfo, classify_exception
 from .gitlab import GitLabClient, canonical_note_marker, has_exact_note_marker, is_valid_sha
-from .notifications import FanoutNotifier, NotificationEvent, NotificationResult
+from .notification_dispatcher import NotificationDispatcher
+from .notifications import FanoutNotifier, NotificationEvent
 from .policy import ReviewPolicy
 from .repository import GitShaEnsurer
 from .runner import AgentContext, AgentResult, LeaseLostError, LocalCliAgentRunner
@@ -96,8 +97,14 @@ class ReviewWorker:
         self.lease_seconds = lease_seconds
         self.max_attempts = max_attempts
         self.retry_delay_seconds = retry_delay_seconds
-        self.notification_lease_seconds = notification_lease_seconds
-        self.notification_max_attempts = notification_max_attempts
+        self.notification_dispatcher = NotificationDispatcher(
+            store,
+            self.notifier,
+            lease_seconds=notification_lease_seconds,
+            max_attempts=notification_max_attempts,
+            retry_delay_seconds=retry_delay_seconds,
+            secret_provider=self._redaction_secrets,
+        )
         if max_retry_delay_seconds < 0:
             raise ValueError("max_retry_delay_seconds cannot be negative")
         if reconciliation_max_attempts <= 0:
@@ -1320,18 +1327,31 @@ class ReviewWorker:
             return WorkerResult(run.run_id, "failed", detail=failure.detail)
 
     def run_forever(self, poll_interval_seconds: float = 5.0) -> None:
-        while True:
-            result = self.process_one()
-            cleanup_count = self.process_worktree_cleanup(limit=1)
-            reconciliation = self.reconcile_auto_fixes(limit=1)
-            self.process_notifications(limit=1)
-            if (
-                result is None
-                or result.status == "deferred"
-                or cleanup_count > 0
-                or (reconciliation is not None and reconciliation.status == "deferred")
-            ):
-                time.sleep(poll_interval_seconds)
+        notification_stop = Event()
+        notification_thread = Thread(
+            target=self.notification_dispatcher.run_forever,
+            kwargs={
+                "poll_interval_seconds": min(max(poll_interval_seconds, 0.1), 1.0),
+                "stop_event": notification_stop,
+            },
+            name="reviewflow-notification-dispatcher",
+        )
+        notification_thread.start()
+        try:
+            while True:
+                result = self.process_one()
+                cleanup_count = self.process_worktree_cleanup(limit=1)
+                reconciliation = self.reconcile_auto_fixes(limit=1)
+                if (
+                    result is None
+                    or result.status == "deferred"
+                    or cleanup_count > 0
+                    or (reconciliation is not None and reconciliation.status == "deferred")
+                ):
+                    time.sleep(poll_interval_seconds)
+        finally:
+            notification_stop.set()
+            notification_thread.join()
 
     def process_worktree_cleanup(self, limit: int = 1) -> int:
         if limit <= 0:
@@ -1360,86 +1380,6 @@ class ReviewWorker:
                 max_attempts=self.worktree_cleanup_max_attempts,
                 retry_delay_seconds=self.retry_delay_seconds,
             )
-            processed += 1
-        return processed
-
-    def process_notifications(
-        self, limit: int = 1, delivery_ids: tuple[int, ...] | None = None
-    ) -> int:
-        """Deliver due outbox records without changing Review Run status."""
-
-        if limit <= 0:
-            raise ValueError("notification limit must be positive")
-        processed = 0
-        claim_ids = delivery_ids if delivery_ids is not None else (None,) * limit
-        for delivery_id in claim_ids:
-            try:
-                if delivery_id is None:
-                    delivery = self.store.claim_next_notification(
-                        lease_seconds=self.notification_lease_seconds,
-                        max_attempts=self.notification_max_attempts,
-                    )
-                else:
-                    delivery = self.store.claim_notification(
-                        delivery_id,
-                        lease_seconds=self.notification_lease_seconds,
-                        max_attempts=self.notification_max_attempts,
-                    )
-            except Exception as exc:  # noqa: BLE001 - isolate notification claim failures
-                log_event(
-                    LOGGER,
-                    logging.ERROR,
-                    secrets=self._redaction_secrets(),
-                    event="notification.claim",
-                    status="failed",
-                    diagnostic=self._redact(exc),
-                )
-                break
-            if delivery is None:
-                break
-            event = NotificationEvent(
-                title=delivery.title,
-                body=delivery.body,
-                url=delivery.url,
-                recipients=delivery.recipients,
-                correlation_id=delivery.correlation_id,
-            )
-            try:
-                result = self.notifier.notify_channel(event, delivery.channel_id)
-            except Exception as exc:  # noqa: BLE001 - isolate one channel failure
-                result = NotificationResult(delivery.channel_id, False, str(exc))
-            try:
-                self.store.finish_notification(
-                    delivery.delivery_id,
-                    result.delivered,
-                    result.detail,
-                    claim_token=delivery.claim_token,
-                    max_attempts=self.notification_max_attempts,
-                    retry_delay_seconds=self.retry_delay_seconds,
-                )
-                log_event(
-                    LOGGER,
-                    logging.INFO if result.delivered else logging.WARNING,
-                    secrets=self._redaction_secrets(),
-                    event="notification.delivery",
-                    status="delivered" if result.delivered else "failed",
-                    correlation_id=delivery.correlation_id,
-                    delivery_id=delivery.delivery_id,
-                    channel=delivery.channel,
-                    attempt=delivery.attempts,
-                    diagnostic=result.detail or None,
-                )
-            except Exception as exc:  # noqa: BLE001 - isolate notification update failures
-                log_event(
-                    LOGGER,
-                    logging.ERROR,
-                    secrets=self._redaction_secrets(),
-                    event="notification.update",
-                    status="failed",
-                    correlation_id=delivery.correlation_id,
-                    delivery_id=delivery.delivery_id,
-                    diagnostic=self._redact(exc),
-                )
             processed += 1
         return processed
 
@@ -1489,7 +1429,7 @@ class ReviewWorker:
     def _notify_humans(self, run: ReviewRun, merge_request) -> None:
         if not self.policy.human.enabled:
             return
-        self._queue_notification(
+        self.notification_dispatcher.enqueue(
             NotificationEvent(
                 title=f"Review requested: !{merge_request.iid} {merge_request.title}",
                 body="A human review is requested.",
@@ -1500,7 +1440,7 @@ class ReviewWorker:
         )
 
     def _notify_autofix(self, run: ReviewRun, parent_merge_request, auto_fix_merge_request) -> None:
-        self._queue_notification(
+        self.notification_dispatcher.enqueue(
             NotificationEvent(
                 title=f"Auto-fix review: !{auto_fix_merge_request.iid} {auto_fix_merge_request.title}",
                 body="An Auto-fix Merge Request is ready for the original MR creator to review.",
@@ -1509,41 +1449,3 @@ class ReviewWorker:
                 correlation_id=f"review-run:{run.run_id}:autofix",
             )
         )
-
-    def _queue_notification(self, event: NotificationEvent) -> None:
-        channels = self.notifier.channel_specs()
-        if not channels:
-            return
-        correlation_id = event.correlation_id or f"notification:{uuid4().hex}"
-        try:
-            deliveries = self.store.enqueue_notifications(
-                correlation_id=correlation_id,
-                title=event.title,
-                body=event.body,
-                url=event.url,
-                recipients=event.recipients,
-                channels=channels,
-            )
-            log_event(
-                LOGGER,
-                logging.INFO,
-                secrets=self._redaction_secrets(),
-                event="notification.queue",
-                status="queued",
-                correlation_id=correlation_id,
-                channel_count=len(deliveries),
-            )
-            delivery_ids = tuple(
-                delivery.delivery_id for delivery in deliveries if delivery.status == "pending"
-            )
-            self.process_notifications(delivery_ids=delivery_ids)
-        except Exception as exc:  # noqa: BLE001 - isolate notification enqueue failures
-            log_event(
-                LOGGER,
-                logging.ERROR,
-                secrets=self._redaction_secrets(),
-                event="notification.queue",
-                status="failed",
-                correlation_id=correlation_id,
-                diagnostic=self._redact(exc),
-            )

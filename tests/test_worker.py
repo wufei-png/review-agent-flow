@@ -206,6 +206,11 @@ def test_worker_runs_agent_in_exact_sha_worktree_and_cleans_it(tmp_path: Path) -
     assert result.agent_result is not None
     assert result.agent_result.stdout.strip() == "reviewed"
     assert not (tmp_path / "worktrees" / "run-1").exists()
+    assert notifier.events == []
+    queued_notification = store.get_notification_delivery(1)
+    assert queued_notification is not None
+    assert queued_notification.recipients == ("alice",)
+    assert worker.notification_dispatcher.process() == 1
     assert notifier.events[0].recipients == ("alice",)
     note_receipt = store.list_effect_receipts(1, "note_expected")[0]
     assert note_receipt.state == "not_observed"
@@ -807,8 +812,12 @@ def test_notification_failure_does_not_fail_review_run_and_is_retried(tmp_path: 
     result = worker.process_one()
     assert result is not None
     assert result.status == "succeeded"
+    assert notifier.attempts == 0
+    assert store.get_notification_delivery(1).status == "pending"
+    assert worker.notification_dispatcher.process() == 1
     assert notifier.attempts == 1
-    assert worker.process_notifications() == 1
+    assert store.get_notification_delivery(1).status == "pending"
+    assert worker.notification_dispatcher.process() == 1
     assert notifier.attempts == 2
     assert store.get_notification_delivery(1).status == "delivered"
     assert store.get_notification_delivery(1).correlation_id == f"review-run:{run.run_id}:human"
@@ -850,8 +859,15 @@ def test_notification_channels_are_isolated_and_terminal_failure_is_audited(tmp_
     )
     result = worker.process_one()
     assert result is not None and result.status == "succeeded"
+    assert notifier.calls == []
+    assert worker.notification_dispatcher.process(limit=4) == 2
     assert notifier.calls == ["failing", "working"]
-    assert worker.process_notifications(limit=2) == 2
+    assert store.get_notification_delivery(1).status == "pending"
+    assert store.get_notification_delivery(2).status == "delivered"
+    assert worker.notification_dispatcher.process() == 1
+    assert worker.notification_dispatcher.process() == 1
+    assert notifier.calls.count("failing") == 3
+    assert notifier.calls.count("working") == 1
     assert store.get_notification_delivery(1).status == "failed"
     assert store.get_notification_delivery(2).status == "delivered"
 

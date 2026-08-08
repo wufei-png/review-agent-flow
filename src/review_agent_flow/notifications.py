@@ -103,6 +103,17 @@ class FanoutNotifier:
             raise ValueError("notification channel IDs must be unique")
         self.notifiers = notifiers
 
+    def redaction_secrets(self) -> tuple[str, ...]:
+        """Return runtime webhook credentials that must not cross audit boundaries."""
+
+        return tuple(
+            webhook_url
+            for notifier in self.notifiers
+            if (webhook_url := getattr(notifier, "webhook_url", None))
+            and isinstance(webhook_url, str)
+            and not webhook_url.isspace()
+        )
+
     def channel_specs(self) -> tuple[tuple[str, str], ...]:
         return tuple(
             (
