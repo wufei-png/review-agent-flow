@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
+import socket
 import sys
 from dataclasses import asdict
 from pathlib import Path
+from uuid import uuid4
 
+from . import __version__
+from .autofix_recovery import AutoFixRecoveryService, OperatorContext
 from .gitlab_client import PythonGitLabClient
 from .notifications import notifiers_from_policy
 from .operator_config import OperatorConfigError, load_operator_config, resolve_backend
@@ -125,6 +130,94 @@ def _run_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _operator_context(args: argparse.Namespace) -> OperatorContext:
+    return OperatorContext(
+        recovery_id=args.recovery_id or uuid4().hex,
+        reason=args.reason.strip(),
+        principal=getpass.getuser(),
+        hostname=socket.gethostname(),
+        tool_version=__version__,
+    )
+
+
+def _recovery_service(args: argparse.Namespace) -> AutoFixRecoveryService:
+    gitlab_url = _required(args.gitlab_url, "GITLAB_URL")
+    gitlab_token = _required(args.gitlab_token, "GITLAB_TOKEN")
+    review_bot_username = _required(None, "GITLAB_REVIEW_BOT_USERNAME")
+    store = SQLiteStore(args.db or os.getenv("REVIEW_AGENT_FLOW_DB", "review-agent-flow.sqlite3"))
+    store.add_redaction_secret(gitlab_token)
+    return AutoFixRecoveryService(
+        store,
+        PythonGitLabClient(gitlab_url, gitlab_token, review_bot_username),
+        review_bot_username,
+    )
+
+
+def _run_recover_auto_fix_relation(args: argparse.Namespace) -> int:
+    service = _recovery_service(args)
+    project_id = _required(args.project_id, "REVIEW_AGENT_FLOW_PROJECT_ID")
+    plan_json = Path(args.plan_file).expanduser().resolve().read_text(encoding="utf-8").strip()
+    context = _operator_context(args)
+    try:
+        relation = service.recover_relation(
+            context=context,
+            project_id=project_id,
+            parent_mr_iid=args.parent_mr_iid,
+            parent_sha=args.parent_sha,
+            intent_nonce=args.intent_nonce,
+            plan_json=plan_json,
+            plan_sha256=args.plan_sha256,
+            child_mr_iid=args.child_mr_iid,
+        )
+    except Exception:  # noqa: BLE001 - detailed rejection is redacted in the durable audit
+        print(json.dumps({"status": "rejected", "recovery_id": context.recovery_id}))
+        return 1
+    print(
+        json.dumps(
+            {
+                "status": "recovered",
+                "recovery_id": context.recovery_id,
+                "relation_id": relation.relation_id,
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def _run_resend_auto_fix_notification(args: argparse.Namespace) -> int:
+    service = _recovery_service(args)
+    project_id = _required(args.project_id, "REVIEW_AGENT_FLOW_PROJECT_ID")
+    policy = load_policy(Path(args.policy).expanduser().resolve())
+    channels = tuple(
+        (str(channel["id"]), str(channel["type"]))
+        for channel in policy.notifications.channels
+    )
+    context = _operator_context(args)
+    try:
+        request = service.resend_notification(
+            context=context,
+            project_id=project_id,
+            child_mr_iid=args.child_mr_iid,
+            channels=channels,
+        )
+    except Exception:  # noqa: BLE001 - detailed rejection is redacted in the durable audit
+        print(json.dumps({"status": "rejected", "recovery_id": context.recovery_id}))
+        return 1
+    print(
+        json.dumps(
+            {
+                "status": "queued",
+                "recovery_id": context.recovery_id,
+                "request_id": request.request_id,
+                "generation": request.generation,
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="review-agent-flow")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -147,6 +240,34 @@ def main(argv: list[str] | None = None) -> int:
     status.add_argument("--run-id", type=int, required=True)
     status.add_argument("--project-id")
     status.add_argument("--db")
+    recover = subparsers.add_parser(
+        "recover-autofix-relation",
+        help="explicitly validate and recover one lost Auto-fix Relation",
+    )
+    recover.add_argument("--gitlab-url")
+    recover.add_argument("--gitlab-token")
+    recover.add_argument("--project-id")
+    recover.add_argument("--parent-mr-iid", type=int, required=True)
+    recover.add_argument("--parent-sha", required=True)
+    recover.add_argument("--intent-nonce", required=True)
+    recover.add_argument("--plan-sha256", required=True)
+    recover.add_argument("--plan-file", required=True)
+    recover.add_argument("--child-mr-iid", type=int, required=True)
+    recover.add_argument("--reason", required=True)
+    recover.add_argument("--recovery-id")
+    recover.add_argument("--db")
+    resend = subparsers.add_parser(
+        "resend-autofix-notification",
+        help="create a new audited notification request for an existing Relation",
+    )
+    resend.add_argument("--gitlab-url")
+    resend.add_argument("--gitlab-token")
+    resend.add_argument("--project-id")
+    resend.add_argument("--child-mr-iid", type=int, required=True)
+    resend.add_argument("--policy", required=True)
+    resend.add_argument("--reason", required=True)
+    resend.add_argument("--recovery-id")
+    resend.add_argument("--db")
     args = parser.parse_args(argv)
     if args.command == "init":
         return _init_policy(Path(args.path), args.force)
@@ -154,4 +275,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_worker(args)
     if args.command == "status":
         return _run_status(args)
+    if args.command == "recover-autofix-relation":
+        return _run_recover_auto_fix_relation(args)
+    if args.command == "resend-autofix-notification":
+        return _run_resend_auto_fix_notification(args)
     return 0

@@ -43,9 +43,30 @@ pytest
 ruff check .
 ```
 
-当前正在从 checkpoint 中的 Agent-owned 预发布实现迁移到上述目标。
-迁移期间不提供旧 Policy/SQLite/marker 兼容契约；项目尚在开发阶段，
-请以当前测试和 implementation-status 为准。
+当前代码已完成从 checkpoint 中 Agent-owned 预发布实现到上述本地目标的
+硬切换。不提供旧 Policy/SQLite/marker 兼容契约；项目尚在开发阶段，请以
+当前测试和 implementation-status 为准。
+
+Store 丢失后的 Auto-fix Relation 只能通过显式 Operator 命令恢复。命令还需
+提供发布前保存的规范 Publication Plan JSON，以便重新核对远端 commit 的父
+SHA、文件内容、路径和执行位；恢复不会自动补发通知：
+
+```bash
+review-agent-flow recover-autofix-relation \
+  --project-id 42 --parent-mr-iid 1 --parent-sha "$PARENT_SHA" \
+  --intent-nonce "$INTENT_NONCE" --plan-sha256 "$PLAN_SHA256" \
+  --plan-file /trusted/path/plan.json --child-mr-iid 9 \
+  --reason "restore lost local Store" --db /trusted/path/reviewflow.db
+
+review-agent-flow resend-autofix-notification \
+  --project-id 42 --child-mr-iid 9 --policy /trusted/path/reviewflow.yml \
+  --reason "Operator approved notification resend" \
+  --db /trusted/path/reviewflow.db
+```
+
+GitLab URL/token 和 Review Bot 用户名分别来自命令参数或 `GITLAB_URL`、
+`GITLAB_TOKEN`、`GITLAB_REVIEW_BOT_USERNAME`。每次命令记录 OS principal、
+hostname、tool version、reason、result 和独立 recovery ID。
 
 本地测试不访问真实 GitLab、飞书、企微或 Agent Provider。真实 E2E
 需要 Operator 提供受控凭据和运行环境。

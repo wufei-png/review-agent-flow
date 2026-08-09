@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import PurePosixPath
 from typing import Any
 
 from .gitlab import (
@@ -14,6 +15,8 @@ from .gitlab import (
     Note,
     NoteMarkerLookup,
     Pipeline,
+    RepositoryAction,
+    RepositoryCommitObservation,
     has_exact_note_marker,
     is_valid_sha,
 )
@@ -285,9 +288,23 @@ class PythonGitLabClient(GitLabClient):
         target_branch: str,
         marker: str | None = None,
     ) -> CreatedMergeRequest | None:
-        mrs = self._project(project_id).mergerequests.list(
-            state="all", source_branch=source_branch, target_branch=target_branch, per_page=100
-        )
+        manager = self._project(project_id).mergerequests
+        filters = {
+            "state": "all",
+            "source_branch": source_branch,
+            "target_branch": target_branch,
+        }
+        try:
+            mrs = list(manager.list(get_all=True, per_page=100, **filters))
+        except TypeError:  # pragma: no cover - compatibility with pagination-only adapters
+            mrs = []
+            page = 1
+            while True:
+                page_values = list(manager.list(per_page=100, page=page, **filters))
+                mrs.extend(page_values)
+                if len(page_values) < 100:
+                    break
+                page += 1
         matches: list[CreatedMergeRequest] = []
         for mr in mrs:
             description = str(getattr(mr, "description", "") or "")
@@ -330,3 +347,110 @@ class PythonGitLabClient(GitLabClient):
                 "multiple Auto-fix Merge Requests match one frozen Publication Plan"
             )
         return matches[0] if matches else None
+
+    @staticmethod
+    def _resource_value(resource: Any, name: str, default: Any = None) -> Any:
+        if isinstance(resource, dict):
+            return resource.get(name, default)
+        return getattr(resource, name, default)
+
+    @staticmethod
+    def _canonical_repository_path(value: object) -> str:
+        if not isinstance(value, str):
+            raise GitLabIdentityConflict("GitLab returned a non-text repository path")
+        path = PurePosixPath(value)
+        if (
+            not value
+            or str(path) != value
+            or path.is_absolute()
+            or "\\" in value
+            or any(part in {"", ".", ".."} for part in path.parts)
+        ):
+            raise GitLabIdentityConflict("GitLab returned a non-canonical repository path")
+        return value
+
+    def observe_repository_commit(
+        self, project_id: str, commit_sha: str
+    ) -> RepositoryCommitObservation:
+        """Reconstruct a bounded semantic action list for explicit recovery."""
+
+        if not is_valid_sha(commit_sha):
+            raise ValueError("invalid repository commit SHA")
+        project = self._project(project_id)
+        commit = project.commits.get(commit_sha)
+        observed_sha = str(getattr(commit, "id", "") or "")
+        if observed_sha.lower() != commit_sha.lower():
+            raise GitLabIdentityConflict("GitLab returned a conflicting repository commit")
+        raw_parents = getattr(commit, "parent_ids", None)
+        if not isinstance(raw_parents, (list, tuple)) or not all(
+            is_valid_sha(parent) for parent in raw_parents
+        ):
+            raise GitLabIdentityConflict("GitLab returned invalid commit parents")
+        diffs = list(commit.diff(get_all=True))
+        if len(diffs) > 100:
+            raise GitLabIdentityConflict("repository commit exceeds the recovery action bound")
+
+        actions: list[RepositoryAction] = []
+        total_content_bytes = 0
+        for diff in diffs:
+            if bool(self._resource_value(diff, "collapsed", False)) or bool(
+                self._resource_value(diff, "too_large", False)
+            ):
+                raise GitLabIdentityConflict("GitLab omitted part of the repository commit diff")
+            old_path = self._canonical_repository_path(
+                self._resource_value(diff, "old_path")
+            )
+            new_path = self._canonical_repository_path(
+                self._resource_value(diff, "new_path")
+            )
+            if old_path != new_path or bool(self._resource_value(diff, "renamed_file", False)):
+                raise GitLabIdentityConflict("recovery rejects renamed repository paths")
+            old_mode = str(self._resource_value(diff, "a_mode", "") or "")
+            new_mode = str(self._resource_value(diff, "b_mode", "") or "")
+            if old_mode not in {"0", "000000", "100644", "100755"} or new_mode not in {
+                "0",
+                "000000",
+                "100644",
+                "100755",
+            }:
+                raise GitLabIdentityConflict("recovery rejects non-regular repository entries")
+            created = bool(self._resource_value(diff, "new_file", False))
+            deleted = bool(self._resource_value(diff, "deleted_file", False))
+            if created and deleted:
+                raise GitLabIdentityConflict("GitLab returned contradictory repository diff flags")
+            if deleted:
+                actions.append(RepositoryAction("delete", old_path))
+                continue
+
+            file_resource = project.files.get(file_path=new_path, ref=commit_sha)
+            try:
+                raw_content = file_resource.decode()
+            except Exception as exc:
+                raise GitLabIdentityConflict("GitLab returned unreadable repository content") from exc
+            if not isinstance(raw_content, bytes) or b"\0" in raw_content:
+                raise GitLabIdentityConflict("recovery rejects binary repository content")
+            if len(raw_content) > 1024 * 1024:
+                raise GitLabIdentityConflict("repository file exceeds the recovery size bound")
+            try:
+                content = raw_content.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise GitLabIdentityConflict("recovery rejects non-UTF-8 repository content") from exc
+            executable = new_mode == "100755"
+            if created:
+                total_content_bytes += len(raw_content)
+                actions.append(RepositoryAction("create", new_path, content, executable))
+            elif old_mode != new_mode and not str(
+                self._resource_value(diff, "diff", "") or ""
+            ):
+                actions.append(
+                    RepositoryAction("chmod", new_path, execute_filemode=executable)
+                )
+            else:
+                total_content_bytes += len(raw_content)
+                actions.append(RepositoryAction("update", new_path, content, executable))
+            if total_content_bytes > 5 * 1024 * 1024:
+                raise GitLabIdentityConflict("repository commit exceeds the recovery size bound")
+        actions.sort(key=lambda action: action.file_path)
+        return RepositoryCommitObservation(
+            str(project_id), observed_sha.lower(), tuple(str(parent).lower() for parent in raw_parents), tuple(actions)
+        )

@@ -194,3 +194,63 @@ def test_status_does_not_create_missing_database(tmp_path: Path, capsys) -> None
     assert cli._run_status(args) == 1
     assert json.loads(capsys.readouterr().out) == {"status": "not_found"}
     assert not database.exists()
+
+
+def test_cli_routes_explicit_relation_recovery(monkeypatch) -> None:
+    captured = {}
+
+    def run(args):
+        captured["args"] = args
+        return 7
+
+    monkeypatch.setattr(cli, "_run_recover_auto_fix_relation", run)
+
+    result = cli.main(
+        [
+            "recover-autofix-relation",
+            "--parent-mr-iid",
+            "1",
+            "--parent-sha",
+            "a" * 40,
+            "--intent-nonce",
+            "b" * 32,
+            "--plan-sha256",
+            "c" * 64,
+            "--plan-file",
+            "/trusted/plan.json",
+            "--child-mr-iid",
+            "9",
+            "--reason",
+            "restore Store",
+        ]
+    )
+
+    assert result == 7
+    assert captured["args"].child_mr_iid == 9
+    assert captured["args"].reason == "restore Store"
+
+
+def test_cli_routes_separate_notification_resend(monkeypatch) -> None:
+    captured = {}
+
+    def run(args):
+        captured["args"] = args
+        return 8
+
+    monkeypatch.setattr(cli, "_run_resend_auto_fix_notification", run)
+
+    result = cli.main(
+        [
+            "resend-autofix-notification",
+            "--child-mr-iid",
+            "9",
+            "--policy",
+            "/trusted/policy.yml",
+            "--reason",
+            "resend approved",
+        ]
+    )
+
+    assert result == 8
+    assert captured["args"].policy == "/trusted/policy.yml"
+    assert captured["args"].reason == "resend approved"

@@ -208,6 +208,8 @@ def test_publisher_uses_exact_commit_contract_and_atomically_requests_notificati
     assert relation is not None and relation.source_branch == branch
     request = store.get_auto_fix_notification_request(relation.relation_id)
     assert request is not None
+    assert request.generation == 1
+    assert request.request_kind == "publication"
     assert request.recipients == ("alice",)
     with sqlite3.connect(tmp_path / "review.db") as connection:
         assert connection.execute("SELECT COUNT(*) FROM notification_requests").fetchone()[0] == 1

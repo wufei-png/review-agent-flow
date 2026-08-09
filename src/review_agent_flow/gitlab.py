@@ -136,6 +136,34 @@ class CreatedCommit:
     branch: str
 
 
+@dataclass(frozen=True)
+class RepositoryAction:
+    """One semantic repository change observed at a GitLab commit."""
+
+    action: str
+    file_path: str
+    content: str | None = None
+    execute_filemode: bool | None = None
+
+    def as_dict(self) -> dict[str, object]:
+        value: dict[str, object] = {"action": self.action, "file_path": self.file_path}
+        if self.content is not None:
+            value["content"] = self.content
+        if self.execute_filemode is not None:
+            value["execute_filemode"] = self.execute_filemode
+        return value
+
+
+@dataclass(frozen=True)
+class RepositoryCommitObservation:
+    """Bounded remote evidence used only by explicit Operator recovery."""
+
+    project_id: str
+    sha: str
+    parent_ids: tuple[str, ...]
+    actions: tuple[RepositoryAction, ...]
+
+
 class GitLabClient(Protocol):
     def get_merge_request(self, project_id: str, mr_iid: int) -> MergeRequest: ...
 
@@ -188,3 +216,7 @@ class GitLabClient(Protocol):
         target_branch: str,
         marker: str | None = None,
     ) -> CreatedMergeRequest | None: ...
+
+    def observe_repository_commit(
+        self, project_id: str, commit_sha: str
+    ) -> RepositoryCommitObservation: ...

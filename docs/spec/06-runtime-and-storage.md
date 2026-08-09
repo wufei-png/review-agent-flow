@@ -43,10 +43,10 @@ The pre-release implementation performs a hard cutover to a fresh schema; it doe
 - `auto_fix_publication_intents`: immutable generation and nonce, with at most one active generation per ReviewKey;
 - `auto_fix_publication_plans`: full canonical Plan, digest, verification evidence and publication state;
 - `auto_fix_relations`: parent identity, child identity, observed state, divergence and merge SHA;
-- `notification_requests` and delivery outbox: immutable event identity, rendered fields, channel, attempts, lease and status;
+- `notification_requests` and delivery outbox: immutable event identity and generation, rendered fields, channel, attempts, lease and status;
 - `review_run_failures`: failure class, retryability, claim attempt and redacted diagnostic;
 - `worktree_cleanup`: workspace path, Run/SHA, attempts, lease and cleanup status;
-- `operator_recoveries`: recovery ID, exact supplied identities, reason, principal, host, tool version and result.
+- `operator_recoveries`: recovery ID, action, exact supplied identities, reason, principal, host, tool version, result and redacted diagnostic.
 
 Auto-fix retries reuse the active Intent generation and nonce. An explicit re-arm closes the prior generation, creates a new immutable generation/nonce and retains history. A child MR webhook can reference only an existing local Intent or Relation.
 
@@ -55,6 +55,8 @@ Auto-fix retries reuse the active Intent generation and nonce. An explicit re-ar
 Before any Auto-fix GitLab write, the Store persists the complete immutable Publication Plan, including base SHA, ordered content/actions and modes, branch, marker template, commit message, title, target, readiness and CI behavior. `plan_sha256` is the digest of canonical UTF-8 JSON for those independent inputs, excluding the derived digest value and final rendered marker. The Store freezes that payload, digest and digest-bearing marker together. A pending or uncertain plan remains recoverable without recapturing an Agent workspace.
 
 The Operator may configure retention for sensitive review, diff and notification payloads. After successful publication or explicit abandonment, ReviewFlow may purge content while retaining the digest, stable identities, decision, timestamps and audit record. Purge never changes the meaning of a completed receipt.
+
+A deployment that requires complete Store-loss recovery must retain the canonical Publication Plan as trusted backup evidence before payload purge; the digest or GitLab marker alone is deliberately insufficient authority. The recovery CLI consumes that retained canonical JSON but never writes it back into the active Store after successful reconstruction.
 
 ## Deployment defaults
 

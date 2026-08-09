@@ -2,7 +2,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from review_agent_flow.gitlab import Note, NoteMarkerLookup, canonical_note_marker
+from review_agent_flow.gitlab import (
+    Note,
+    NoteMarkerLookup,
+    RepositoryAction,
+    RepositoryCommitObservation,
+    canonical_note_marker,
+)
 from review_agent_flow.gitlab_client import PythonGitLabClient
 
 SHA = "a" * 40
@@ -146,6 +152,141 @@ def test_autofix_commit_uses_start_sha_and_never_forces() -> None:
     ]
 
 
+def test_explicit_recovery_observes_exact_remote_actions_and_parent() -> None:
+    commit_sha = "f" * 40
+    diffs = [
+        {
+            "old_path": "created.txt",
+            "new_path": "created.txt",
+            "a_mode": "000000",
+            "b_mode": "100644",
+            "new_file": True,
+            "deleted_file": False,
+            "renamed_file": False,
+            "diff": "created",
+        },
+        {
+            "old_path": "deleted.txt",
+            "new_path": "deleted.txt",
+            "a_mode": "100644",
+            "b_mode": "000000",
+            "new_file": False,
+            "deleted_file": True,
+            "renamed_file": False,
+            "diff": "deleted",
+        },
+        {
+            "old_path": "mode.sh",
+            "new_path": "mode.sh",
+            "a_mode": "100644",
+            "b_mode": "100755",
+            "new_file": False,
+            "deleted_file": False,
+            "renamed_file": False,
+            "diff": "",
+        },
+        {
+            "old_path": "updated.txt",
+            "new_path": "updated.txt",
+            "a_mode": "100644",
+            "b_mode": "100644",
+            "new_file": False,
+            "deleted_file": False,
+            "renamed_file": False,
+            "diff": "updated",
+        },
+    ]
+    commit = SimpleNamespace(
+        id=commit_sha,
+        parent_ids=[SHA],
+        diff=lambda **kwargs: diffs,
+    )
+    contents = {
+        "created.txt": b"created\n",
+        "mode.sh": b"#!/bin/sh\n",
+        "updated.txt": b"updated\n",
+    }
+    files = SimpleNamespace(
+        get=lambda *, file_path, ref: SimpleNamespace(decode=lambda: contents[file_path])
+    )
+    project = SimpleNamespace(
+        commits=SimpleNamespace(get=lambda sha: commit),
+        files=files,
+    )
+
+    observed = _client(project).observe_repository_commit("42", commit_sha)
+
+    assert observed == RepositoryCommitObservation(
+        "42",
+        commit_sha,
+        (SHA,),
+        (
+            RepositoryAction("create", "created.txt", "created\n", False),
+            RepositoryAction("delete", "deleted.txt"),
+            RepositoryAction("chmod", "mode.sh", execute_filemode=True),
+            RepositoryAction("update", "updated.txt", "updated\n", False),
+        ),
+    )
+
+
+def test_explicit_recovery_rejects_incomplete_remote_diff() -> None:
+    commit_sha = "f" * 40
+    commit = SimpleNamespace(
+        id=commit_sha,
+        parent_ids=[SHA],
+        diff=lambda **kwargs: [
+            {
+                "old_path": "large.txt",
+                "new_path": "large.txt",
+                "a_mode": "100644",
+                "b_mode": "100644",
+                "collapsed": True,
+            }
+        ],
+    )
+    project = SimpleNamespace(commits=SimpleNamespace(get=lambda sha: commit))
+
+    with pytest.raises(ValueError, match="omitted"):
+        _client(project).observe_repository_commit("42", commit_sha)
+
+
+def test_explicit_recovery_does_not_charge_chmod_files_as_content_actions() -> None:
+    commit_sha = "f" * 40
+    paths = [f"script-{index}.sh" for index in range(6)]
+    diffs = [
+        {
+            "old_path": path,
+            "new_path": path,
+            "a_mode": "100644",
+            "b_mode": "100755",
+            "new_file": False,
+            "deleted_file": False,
+            "renamed_file": False,
+            "diff": "",
+        }
+        for path in paths
+    ]
+    commit = SimpleNamespace(
+        id=commit_sha,
+        parent_ids=[SHA],
+        diff=lambda **kwargs: diffs,
+    )
+    unchanged_content = b"x" * (900 * 1024)
+    files = SimpleNamespace(
+        get=lambda *, file_path, ref: SimpleNamespace(decode=lambda: unchanged_content)
+    )
+    project = SimpleNamespace(
+        commits=SimpleNamespace(get=lambda sha: commit),
+        files=files,
+    )
+
+    observed = _client(project).observe_repository_commit("42", commit_sha)
+
+    assert observed.actions == tuple(
+        RepositoryAction("chmod", path, execute_filemode=True) for path in paths
+    )
+
+
 def test_autofix_merge_request_freezes_creation_readiness_and_bot_author() -> None:
     payloads: list[dict[str, object]] = []
 
@@ -275,6 +416,44 @@ def test_auto_fix_lookup_skips_old_same_branch_mr_without_current_marker() -> No
         "42", AUTO_FIX_BRANCH, "feature", marker
     )
     assert found is not None and found.iid == 9
+
+
+def test_auto_fix_lookup_paginates_before_proving_unique_identity() -> None:
+    marker = (
+        f"<!-- reviewflow:v1;project=42;mr=1;sha={SHA};effect=autofix;"
+        f"intent={NONCE};plan_sha256={'e' * 64} -->"
+    )
+
+    def resource(iid: int, description: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            iid=iid,
+            title="Auto-fix",
+            author={"username": "review-bot"},
+            source_branch=AUTO_FIX_BRANCH,
+            target_branch="feature",
+            web_url=f"https://mr/{iid}",
+            description=description,
+        )
+
+    class PaginatedMergeRequests:
+        def list(self, **kwargs: object) -> list[SimpleNamespace]:
+            if kwargs.get("get_all"):
+                raise TypeError("pagination-only fake")
+            page = int(kwargs["page"])
+            if page == 1:
+                return [resource(1, marker)] + [
+                    resource(index, "old marker") for index in range(2, 101)
+                ]
+            if page == 2:
+                return [resource(101, marker)]
+            return []
+
+    project = SimpleNamespace(mergerequests=PaginatedMergeRequests())
+
+    with pytest.raises(ValueError, match="multiple"):
+        _client(project).find_merge_request_by_source_branch(
+            "42", AUTO_FIX_BRANCH, "feature", marker
+        )
 
 
 def test_python_gitlab_note_adapter_returns_and_observes_native_id() -> None:

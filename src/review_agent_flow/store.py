@@ -21,7 +21,7 @@ DEFAULT_NOTIFICATION_LEASE_SECONDS = 30
 DEFAULT_NOTIFICATION_MAX_ATTEMPTS = 3
 DEFAULT_WORKTREE_CLEANUP_LEASE_SECONDS = 60
 DEFAULT_WORKTREE_CLEANUP_MAX_ATTEMPTS = 5
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 DEFAULT_EFFECT_LEASE_SECONDS = 60
 DEFAULT_NOTE_PUBLICATION_LEASE_SECONDS = 60
 DEFAULT_NOTE_PUBLICATION_MAX_ATTEMPTS = 5
@@ -175,11 +175,35 @@ class ProgramAutoFixRelation:
 class NotificationRequest:
     request_id: int
     relation_id: int
+    generation: int
+    request_kind: str
     correlation_id: str
     title: str
     body: str
     url: str | None
     recipients: tuple[str, ...]
+    created_at: str
+
+
+@dataclass(frozen=True)
+class OperatorRecovery:
+    audit_id: int
+    recovery_id: str
+    action: str
+    relation_id: int | None
+    project_id: str
+    parent_mr_iid: int
+    parent_sha: str
+    intent_nonce: str
+    plan_sha256: str
+    child_project_id: str
+    child_mr_iid: int
+    reason: str
+    principal: str
+    hostname: str
+    tool_version: str
+    result: str
+    diagnostic: str | None
     created_at: str
 
 
@@ -222,7 +246,7 @@ class WorktreeRecord:
 class SQLiteStore:
     """Small SQLite store.
 
-    Version 8 is intentionally a fresh schema.  There is no production database
+    Version 9 is intentionally a fresh schema.  There is no production database
     migration contract for this pre-release implementation; an older database
     must be recreated rather than guessed into a new notification or Auto-fix
     routing model.
@@ -414,12 +438,35 @@ class SQLiteStore:
                 );
                 CREATE TABLE IF NOT EXISTS notification_requests (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    relation_id INTEGER NOT NULL UNIQUE REFERENCES auto_fix_relations(id),
+                    relation_id INTEGER NOT NULL REFERENCES auto_fix_relations(id),
+                    generation INTEGER NOT NULL,
+                    request_kind TEXT NOT NULL,
                     correlation_id TEXT NOT NULL UNIQUE,
                     title TEXT NOT NULL,
                     body TEXT NOT NULL,
                     url TEXT,
                     recipients_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(relation_id, generation)
+                );
+                CREATE TABLE IF NOT EXISTS operator_recoveries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    recovery_id TEXT NOT NULL UNIQUE,
+                    action TEXT NOT NULL,
+                    relation_id INTEGER REFERENCES auto_fix_relations(id),
+                    project_id TEXT NOT NULL,
+                    parent_mr_iid INTEGER NOT NULL,
+                    parent_sha TEXT NOT NULL,
+                    intent_nonce TEXT NOT NULL,
+                    plan_sha256 TEXT NOT NULL,
+                    child_project_id TEXT NOT NULL,
+                    child_mr_iid INTEGER NOT NULL,
+                    reason TEXT NOT NULL,
+                    principal TEXT NOT NULL,
+                    hostname TEXT NOT NULL,
+                    tool_version TEXT NOT NULL,
+                    result TEXT NOT NULL,
+                    diagnostic TEXT,
                     created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS review_run_failures (
@@ -507,7 +554,7 @@ class SQLiteStore:
                     last_error TEXT,
                     UNIQUE(run_id, path)
                 );
-                PRAGMA user_version = 8;
+                PRAGMA user_version = 9;
                 """
             )
 
@@ -2839,10 +2886,10 @@ class SQLiteStore:
             connection.execute(
                 """
                 INSERT INTO notification_requests(
-                    relation_id, correlation_id, title, body, url,
+                    relation_id, generation, request_kind, correlation_id, title, body, url,
                     recipients_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(relation_id) DO NOTHING
+                ) VALUES (?, 1, 'publication', ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(relation_id, generation) DO NOTHING
                 """,
                 (
                     relation.relation_id,
@@ -2856,9 +2903,10 @@ class SQLiteStore:
             )
             request_row = connection.execute(
                 """
-                SELECT id AS request_id, relation_id, correlation_id, title,
+                SELECT id AS request_id, relation_id, generation, request_kind,
+                       correlation_id, title,
                        body, url, recipients_json, created_at
-                FROM notification_requests WHERE relation_id = ?
+                FROM notification_requests WHERE relation_id = ? AND generation = 1
                 """,
                 (relation.relation_id,),
             ).fetchone()
@@ -2869,7 +2917,9 @@ class SQLiteStore:
                 **request_values, recipients=request_recipients
             )
             if (
-                request.correlation_id != correlation_id
+                request.generation != 1
+                or request.request_kind != "publication"
+                or request.correlation_id != correlation_id
                 or request.title != title
                 or request.body != body
                 or request.url != url
@@ -3222,22 +3272,666 @@ class SQLiteStore:
         return cursor.rowcount == 1
 
     def get_auto_fix_notification_request(
-        self, relation_id: int
+        self, relation_id: int, generation: int | None = None
     ) -> NotificationRequest | None:
+        generation_filter = "" if generation is None else " AND generation = ?"
+        parameters: tuple[object, ...] = (relation_id,)
+        if generation is not None:
+            parameters += (generation,)
         with self._connect() as connection:
             row = connection.execute(
-                """
-                SELECT id AS request_id, relation_id, correlation_id, title,
+                f"""
+                SELECT id AS request_id, relation_id, generation, request_kind,
+                       correlation_id, title,
                        body, url, recipients_json, created_at
                 FROM notification_requests WHERE relation_id = ?
+                {generation_filter}
+                ORDER BY generation DESC LIMIT 1
                 """,
-                (relation_id,),
+                parameters,
             ).fetchone()
         if row is None:
             return None
         values = dict(row)
         recipients = tuple(json.loads(values.pop("recipients_json")))
         return NotificationRequest(**values, recipients=recipients)
+
+    @staticmethod
+    def _validate_operator_audit_values(
+        *,
+        recovery_id: str,
+        action: str,
+        project_id: str,
+        parent_mr_iid: int,
+        parent_sha: str,
+        intent_nonce: str,
+        plan_sha256: str,
+        child_project_id: str,
+        child_mr_iid: int,
+        reason: str,
+        principal: str,
+        hostname: str,
+        tool_version: str,
+        strict_identity: bool = True,
+    ) -> None:
+        if action not in {"relation_recovery", "notification_resend"}:
+            raise ValueError("invalid Operator recovery action")
+        text_values = (
+            recovery_id,
+            project_id,
+            parent_sha,
+            intent_nonce,
+            plan_sha256,
+            child_project_id,
+            reason,
+            principal,
+            hostname,
+            tool_version,
+        )
+        if any(not isinstance(value, str) or not value.strip() for value in text_values):
+            raise ValueError("Operator recovery audit fields cannot be empty")
+        if strict_identity and (parent_mr_iid <= 0 or child_mr_iid <= 0):
+            raise ValueError("Operator recovery Merge Request IIDs must be positive")
+        if strict_identity and not is_valid_sha(parent_sha):
+            raise ValueError("Operator recovery parent SHA is invalid")
+        if strict_identity and (
+            len(plan_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in plan_sha256)
+        ):
+            raise ValueError("Operator recovery Plan digest is invalid")
+
+    @staticmethod
+    def _operator_recovery_from_row(row: sqlite3.Row) -> OperatorRecovery:
+        return OperatorRecovery(**dict(row))
+
+    @staticmethod
+    def _operator_recovery_columns() -> str:
+        return (
+            "id AS audit_id, recovery_id, action, relation_id, project_id, "
+            "parent_mr_iid, parent_sha, intent_nonce, plan_sha256, "
+            "child_project_id, child_mr_iid, reason, principal, hostname, "
+            "tool_version, result, diagnostic, created_at"
+        )
+
+    def record_operator_recovery_failure(
+        self,
+        *,
+        recovery_id: str,
+        action: str,
+        project_id: str,
+        parent_mr_iid: int,
+        parent_sha: str,
+        intent_nonce: str,
+        plan_sha256: str,
+        child_project_id: str,
+        child_mr_iid: int,
+        reason: str,
+        principal: str,
+        hostname: str,
+        tool_version: str,
+        diagnostic: str,
+    ) -> OperatorRecovery:
+        """Persist a failed explicit action without creating local authority."""
+
+        self._validate_operator_audit_values(
+            recovery_id=recovery_id,
+            action=action,
+            project_id=project_id,
+            parent_mr_iid=parent_mr_iid,
+            parent_sha=parent_sha,
+            intent_nonce=intent_nonce,
+            plan_sha256=plan_sha256,
+            child_project_id=child_project_id,
+            child_mr_iid=child_mr_iid,
+            reason=reason,
+            principal=principal,
+            hostname=hostname,
+            tool_version=tool_version,
+            strict_identity=False,
+        )
+        now = self._now().isoformat()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO operator_recoveries(
+                    recovery_id, action, project_id, parent_mr_iid, parent_sha,
+                    intent_nonce, plan_sha256, child_project_id, child_mr_iid,
+                    reason, principal, hostname, tool_version, result,
+                    diagnostic, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'failed', ?, ?)
+                ON CONFLICT(recovery_id) DO NOTHING
+                """,
+                (
+                    recovery_id,
+                    action,
+                    project_id,
+                    parent_mr_iid,
+                    parent_sha,
+                    intent_nonce,
+                    plan_sha256,
+                    child_project_id,
+                    child_mr_iid,
+                    reason,
+                    principal,
+                    hostname,
+                    tool_version,
+                    self._redact(diagnostic),
+                    now,
+                ),
+            )
+            row = connection.execute(
+                f"SELECT {self._operator_recovery_columns()} "
+                "FROM operator_recoveries WHERE recovery_id = ?",
+                (recovery_id,),
+            ).fetchone()
+        assert row is not None
+        audit = self._operator_recovery_from_row(row)
+        if (
+            audit.action != action
+            or audit.result != "failed"
+            or audit.project_id != project_id
+            or audit.parent_mr_iid != parent_mr_iid
+            or audit.parent_sha != parent_sha
+            or audit.intent_nonce != intent_nonce
+            or audit.plan_sha256 != plan_sha256
+            or audit.child_project_id != child_project_id
+            or audit.child_mr_iid != child_mr_iid
+            or audit.reason != reason
+            or audit.principal != principal
+            or audit.hostname != hostname
+            or audit.tool_version != tool_version
+        ):
+            raise ValueError("Operator recovery ID is already bound to another action")
+        return audit
+
+    def recover_program_auto_fix_relation(
+        self,
+        *,
+        recovery_id: str,
+        project_id: str,
+        parent_mr_iid: int,
+        parent_sha: str,
+        intent_nonce: str,
+        plan_json: str,
+        plan_sha256: str,
+        marker: str,
+        source_branch: str,
+        target_branch: str,
+        child_project_id: str,
+        child_mr_iid: int,
+        published_commit_sha: str,
+        status: str,
+        merged_sha: str | None,
+        reason: str,
+        principal: str,
+        hostname: str,
+        tool_version: str,
+    ) -> ProgramAutoFixRelation:
+        """Atomically reconstruct one exact relation after explicit validation."""
+
+        self._validate_operator_audit_values(
+            recovery_id=recovery_id,
+            action="relation_recovery",
+            project_id=project_id,
+            parent_mr_iid=parent_mr_iid,
+            parent_sha=parent_sha,
+            intent_nonce=intent_nonce,
+            plan_sha256=plan_sha256,
+            child_project_id=child_project_id,
+            child_mr_iid=child_mr_iid,
+            reason=reason,
+            principal=principal,
+            hostname=hostname,
+            tool_version=tool_version,
+        )
+        if child_project_id != project_id:
+            raise ValueError("cross-Project Auto-fix recovery is unsupported")
+        if not is_valid_sha(published_commit_sha):
+            raise ValueError("Operator recovery child commit SHA is invalid")
+        if status not in {"opened", "closed", "merged"}:
+            raise ValueError("Operator recovery child state is invalid")
+        if status == "merged" and not is_valid_sha(merged_sha):
+            raise ValueError("merged recovery requires a valid merge SHA")
+        if status != "merged" and merged_sha is not None:
+            raise ValueError("only a merged recovery may include a merge SHA")
+        try:
+            payload = json.loads(plan_json)
+        except json.JSONDecodeError as exc:
+            raise ValueError("Operator recovery Plan is not valid JSON") from exc
+        canonical_plan = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        if canonical_plan != plan_json:
+            raise ValueError("Operator recovery Plan must be canonical JSON")
+        if hashlib.sha256(plan_json.encode("utf-8")).hexdigest() != plan_sha256:
+            raise ValueError("Operator recovery Plan digest does not match its payload")
+        if not isinstance(payload, dict):
+            raise TypeError("Operator recovery Plan must be an object")
+        candidate_sha256 = payload.get("candidate_sha256")
+        verification = payload.get("verification")
+        if not isinstance(candidate_sha256, str) or not isinstance(verification, dict):
+            raise TypeError("Operator recovery Plan evidence is invalid")
+        intent_value = payload.get("intent")
+        if not isinstance(intent_value, dict):
+            raise TypeError("Operator recovery Plan Intent is invalid")
+        generation = intent_value.get("generation")
+        marker_template = payload.get("marker_template")
+        if (
+            payload.get("review_key")
+            != {"project_id": project_id, "mr_iid": parent_mr_iid, "sha": parent_sha}
+            or type(generation) is not int
+            or generation <= 0
+            or intent_value.get("nonce") != intent_nonce
+            or payload.get("branch") != source_branch
+            or payload.get("target_branch") != target_branch
+            or not isinstance(marker_template, str)
+            or marker_template.count("{plan_sha256}") != 1
+            or marker_template.replace("{plan_sha256}", plan_sha256) != marker
+            or verification.get("candidate_sha256") != candidate_sha256
+        ):
+            raise ValueError("Operator recovery Plan identity is inconsistent")
+        verification_json = json.dumps(
+            verification, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        now = self._now().isoformat()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing_audit = connection.execute(
+                f"SELECT {self._operator_recovery_columns()} FROM operator_recoveries "
+                "WHERE recovery_id = ?",
+                (recovery_id,),
+            ).fetchone()
+            if existing_audit is not None:
+                if (
+                    existing_audit["action"] != "relation_recovery"
+                    or existing_audit["result"] != "succeeded"
+                    or existing_audit["relation_id"] is None
+                    or existing_audit["project_id"] != project_id
+                    or existing_audit["parent_mr_iid"] != parent_mr_iid
+                    or existing_audit["parent_sha"] != parent_sha
+                    or existing_audit["intent_nonce"] != intent_nonce
+                    or existing_audit["plan_sha256"] != plan_sha256
+                    or existing_audit["child_project_id"] != child_project_id
+                    or existing_audit["child_mr_iid"] != child_mr_iid
+                    or existing_audit["reason"] != reason
+                    or existing_audit["principal"] != principal
+                    or existing_audit["hostname"] != hostname
+                    or existing_audit["tool_version"] != tool_version
+                ):
+                    raise ValueError("Operator recovery ID is already bound to another result")
+                row = connection.execute(
+                    f"SELECT {self._program_auto_fix_relation_columns()} "
+                    "FROM auto_fix_relations WHERE id = ?",
+                    (existing_audit["relation_id"],),
+                ).fetchone()
+                assert row is not None
+                return self._program_auto_fix_relation_from_row(row)
+
+            connection.execute(
+                """
+                INSERT INTO review_runs(
+                    project_id, mr_iid, sha, status, created_at, finished_at
+                ) VALUES (?, ?, ?, 'succeeded', ?, ?)
+                ON CONFLICT(project_id, mr_iid, sha) DO NOTHING
+                """,
+                (project_id, parent_mr_iid, parent_sha, now, now),
+            )
+            run = connection.execute(
+                "SELECT id, status FROM review_runs "
+                "WHERE project_id = ? AND mr_iid = ? AND sha = ?",
+                (project_id, parent_mr_iid, parent_sha),
+            ).fetchone()
+            assert run is not None
+            if run["status"] != "succeeded":
+                raise ValueError("existing Review Run is not compatible with recovery")
+            connection.execute(
+                """
+                INSERT INTO auto_fix_publication_intents(
+                    run_id, project_id, mr_iid, sha, generation, nonce, state,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'published', ?, ?)
+                ON CONFLICT(run_id) DO NOTHING
+                """,
+                (
+                    run["id"],
+                    project_id,
+                    parent_mr_iid,
+                    parent_sha,
+                    generation,
+                    intent_nonce,
+                    now,
+                    now,
+                ),
+            )
+            intent = connection.execute(
+                "SELECT id, generation, nonce FROM auto_fix_publication_intents WHERE run_id = ?",
+                (run["id"],),
+            ).fetchone()
+            assert intent is not None
+            if intent["generation"] != generation or intent["nonce"] != intent_nonce:
+                raise ValueError("existing Auto-fix Intent conflicts with recovery")
+            connection.execute(
+                """
+                INSERT INTO auto_fix_publication_plans(
+                    intent_id, run_id, plan_json, plan_sha256, marker,
+                    candidate_sha256, verification_json, state, created_at,
+                    updated_at, branch_commit_sha, external_mr_iid
+                ) VALUES (?, ?, NULL, ?, ?, ?, ?, 'published', ?, ?, ?, ?)
+                ON CONFLICT(run_id) DO NOTHING
+                """,
+                (
+                    intent["id"],
+                    run["id"],
+                    plan_sha256,
+                    marker,
+                    candidate_sha256,
+                    verification_json,
+                    now,
+                    now,
+                    published_commit_sha,
+                    child_mr_iid,
+                ),
+            )
+            plan = connection.execute(
+                "SELECT id, plan_sha256, marker, branch_commit_sha, external_mr_iid "
+                "FROM auto_fix_publication_plans WHERE run_id = ?",
+                (run["id"],),
+            ).fetchone()
+            assert plan is not None
+            if (
+                plan["plan_sha256"] != plan_sha256
+                or plan["marker"] != marker
+                or plan["branch_commit_sha"] != published_commit_sha
+                or plan["external_mr_iid"] != child_mr_iid
+            ):
+                raise ValueError("existing Publication Plan conflicts with recovery")
+            connection.execute(
+                """
+                INSERT INTO auto_fix_relations(
+                    intent_id, plan_id, run_id, parent_project_id, parent_mr_iid,
+                    parent_sha, auto_fix_project_id, auto_fix_mr_iid,
+                    source_branch, target_branch, marker, plan_sha256,
+                    published_commit_sha, status, merged_sha, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(plan_id) DO NOTHING
+                """,
+                (
+                    intent["id"],
+                    plan["id"],
+                    run["id"],
+                    project_id,
+                    parent_mr_iid,
+                    parent_sha,
+                    child_project_id,
+                    child_mr_iid,
+                    source_branch,
+                    target_branch,
+                    marker,
+                    plan_sha256,
+                    published_commit_sha,
+                    status,
+                    merged_sha,
+                    now,
+                    now,
+                ),
+            )
+            relation_row = connection.execute(
+                f"SELECT {self._program_auto_fix_relation_columns()} "
+                "FROM auto_fix_relations WHERE plan_id = ?",
+                (plan["id"],),
+            ).fetchone()
+            assert relation_row is not None
+            relation = self._program_auto_fix_relation_from_row(relation_row)
+            if (
+                relation.auto_fix_project_id != child_project_id
+                or relation.auto_fix_mr_iid != child_mr_iid
+                or relation.source_branch != source_branch
+                or relation.target_branch != target_branch
+                or relation.status != status
+            ):
+                raise ValueError("existing Auto-fix Relation conflicts with recovery")
+            connection.execute(
+                """
+                INSERT INTO effect_receipts(
+                    run_id, effect_kind, dedupe_key, attempt, state,
+                    external_identity, detail, created_at, updated_at
+                ) VALUES (?, 'autofix_plan', ?, 1, 'published', ?, ?, ?, ?)
+                ON CONFLICT(run_id, effect_kind, dedupe_key, attempt) DO NOTHING
+                """,
+                (
+                    run["id"],
+                    f"autofix-intent:{intent_nonce}",
+                    f"gitlab:{child_project_id}!{child_mr_iid}",
+                    "Relation reconstructed by explicit Operator recovery",
+                    now,
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO operator_recoveries(
+                    recovery_id, action, relation_id, project_id, parent_mr_iid,
+                    parent_sha, intent_nonce, plan_sha256, child_project_id,
+                    child_mr_iid, reason, principal, hostname, tool_version,
+                    result, created_at
+                ) VALUES (?, 'relation_recovery', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                          'succeeded', ?)
+                """,
+                (
+                    recovery_id,
+                    relation.relation_id,
+                    project_id,
+                    parent_mr_iid,
+                    parent_sha,
+                    intent_nonce,
+                    plan_sha256,
+                    child_project_id,
+                    child_mr_iid,
+                    reason,
+                    principal,
+                    hostname,
+                    tool_version,
+                    now,
+                ),
+            )
+        return relation
+
+    def create_auto_fix_notification_resend(
+        self,
+        relation_id: int,
+        *,
+        recovery_id: str,
+        title: str,
+        body: str,
+        url: str,
+        recipients: tuple[str, ...],
+        channels: tuple[tuple[str, str], ...],
+        reason: str,
+        principal: str,
+        hostname: str,
+        tool_version: str,
+    ) -> NotificationRequest:
+        """Create a new immutable request; never mutate historical delivery state."""
+
+        if len({channel_id for channel_id, _channel in channels}) != len(channels):
+            raise ValueError("notification channel IDs must be unique")
+        if not channels:
+            raise ValueError("notification resend requires at least one channel")
+        now = self._now().isoformat()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            relation = connection.execute(
+                "SELECT * FROM auto_fix_relations WHERE id = ?", (relation_id,)
+            ).fetchone()
+            if relation is None:
+                raise ValueError("Auto-fix Relation does not exist")
+            self._validate_operator_audit_values(
+                recovery_id=recovery_id,
+                action="notification_resend",
+                project_id=str(relation["parent_project_id"]),
+                parent_mr_iid=int(relation["parent_mr_iid"]),
+                parent_sha=str(relation["parent_sha"]),
+                intent_nonce=str(
+                    connection.execute(
+                        "SELECT nonce FROM auto_fix_publication_intents WHERE id = ?",
+                        (relation["intent_id"],),
+                    ).fetchone()[0]
+                ),
+                plan_sha256=str(relation["plan_sha256"]),
+                child_project_id=str(relation["auto_fix_project_id"]),
+                child_mr_iid=int(relation["auto_fix_mr_iid"]),
+                reason=reason,
+                principal=principal,
+                hostname=hostname,
+                tool_version=tool_version,
+            )
+            existing_audit = connection.execute(
+                f"SELECT {self._operator_recovery_columns()} FROM operator_recoveries "
+                "WHERE recovery_id = ?",
+                (recovery_id,),
+            ).fetchone()
+            correlation_id = f"autofix-plan:{relation['plan_sha256']}:resend:{recovery_id}"
+            if existing_audit is not None:
+                if (
+                    existing_audit["action"] != "notification_resend"
+                    or existing_audit["result"] != "succeeded"
+                    or existing_audit["relation_id"] != relation_id
+                    or existing_audit["project_id"] != relation["parent_project_id"]
+                    or existing_audit["parent_mr_iid"] != relation["parent_mr_iid"]
+                    or existing_audit["parent_sha"] != relation["parent_sha"]
+                    or existing_audit["plan_sha256"] != relation["plan_sha256"]
+                    or existing_audit["child_project_id"]
+                    != relation["auto_fix_project_id"]
+                    or existing_audit["child_mr_iid"] != relation["auto_fix_mr_iid"]
+                    or existing_audit["reason"] != reason
+                    or existing_audit["principal"] != principal
+                    or existing_audit["hostname"] != hostname
+                    or existing_audit["tool_version"] != tool_version
+                ):
+                    raise ValueError("Operator recovery ID is already bound to another result")
+                request_row = connection.execute(
+                    "SELECT id AS request_id, relation_id, generation, request_kind, "
+                    "correlation_id, title, body, url, recipients_json, created_at "
+                    "FROM notification_requests WHERE correlation_id = ?",
+                    (correlation_id,),
+                ).fetchone()
+                assert request_row is not None
+                values = dict(request_row)
+                saved_recipients = tuple(json.loads(values.pop("recipients_json")))
+                request = NotificationRequest(**values, recipients=saved_recipients)
+                channel_rows = connection.execute(
+                    "SELECT channel_id, channel FROM notification_outbox "
+                    "WHERE correlation_id = ? ORDER BY channel_id",
+                    (correlation_id,),
+                ).fetchall()
+                saved_channels = tuple(
+                    (str(row["channel_id"]), str(row["channel"])) for row in channel_rows
+                )
+                if (
+                    request.title != title
+                    or request.body != body
+                    or request.url != url
+                    or request.recipients != recipients
+                    or saved_channels != tuple(sorted(channels))
+                ):
+                    raise ValueError("Operator notification resend is immutable")
+                return request
+            generation = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(generation), 0) FROM notification_requests "
+                    "WHERE relation_id = ?",
+                    (relation_id,),
+                ).fetchone()[0]
+            ) + 1
+            recipients_json = json.dumps(recipients, separators=(",", ":"))
+            connection.execute(
+                """
+                INSERT INTO notification_requests(
+                    relation_id, generation, request_kind, correlation_id,
+                    title, body, url, recipients_json, created_at
+                ) VALUES (?, ?, 'operator_resend', ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    relation_id,
+                    generation,
+                    correlation_id,
+                    title,
+                    body,
+                    url,
+                    recipients_json,
+                    now,
+                ),
+            )
+            for channel_id, channel in channels:
+                connection.execute(
+                    """
+                    INSERT INTO notification_outbox(
+                        correlation_id, channel_id, channel, title, body, url,
+                        recipients_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        correlation_id,
+                        channel_id,
+                        channel,
+                        title,
+                        body,
+                        url,
+                        recipients_json,
+                        now,
+                    ),
+                )
+            intent_nonce = str(
+                connection.execute(
+                    "SELECT nonce FROM auto_fix_publication_intents WHERE id = ?",
+                    (relation["intent_id"],),
+                ).fetchone()[0]
+            )
+            connection.execute(
+                """
+                INSERT INTO operator_recoveries(
+                    recovery_id, action, relation_id, project_id, parent_mr_iid,
+                    parent_sha, intent_nonce, plan_sha256, child_project_id,
+                    child_mr_iid, reason, principal, hostname, tool_version,
+                    result, created_at
+                ) VALUES (?, 'notification_resend', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                          'succeeded', ?)
+                """,
+                (
+                    recovery_id,
+                    relation_id,
+                    relation["parent_project_id"],
+                    relation["parent_mr_iid"],
+                    relation["parent_sha"],
+                    intent_nonce,
+                    relation["plan_sha256"],
+                    relation["auto_fix_project_id"],
+                    relation["auto_fix_mr_iid"],
+                    reason,
+                    principal,
+                    hostname,
+                    tool_version,
+                    now,
+                ),
+            )
+            request_row = connection.execute(
+                "SELECT id AS request_id, relation_id, generation, request_kind, "
+                "correlation_id, title, body, url, recipients_json, created_at "
+                "FROM notification_requests WHERE correlation_id = ?",
+                (correlation_id,),
+            ).fetchone()
+        assert request_row is not None
+        values = dict(request_row)
+        saved_recipients = tuple(json.loads(values.pop("recipients_json")))
+        return NotificationRequest(**values, recipients=saved_recipients)
+
+    def list_operator_recoveries(self) -> tuple[OperatorRecovery, ...]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT {self._operator_recovery_columns()} "
+                "FROM operator_recoveries ORDER BY id"
+            ).fetchall()
+        return tuple(self._operator_recovery_from_row(row) for row in rows)
 
     def is_suppressed_parent_sha(self, project_id: str, mr_iid: int, sha: str) -> bool:
         with self._connect() as connection:

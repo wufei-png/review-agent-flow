@@ -74,8 +74,9 @@ An Auto-fix-shaped Webhook may update or wake an existing Intent/Relation but
 cannot create a Review Run or establish identity without local authority.
 
 After Store loss, only a local trusted-host Operator CLI may recover one exact,
-unique Review Bot MR after validating ReviewKey, nonce, plan digest, branch,
-target, author, marker, and remote actions. Recovery requires a reason and
+unique Review Bot MR after validating ReviewKey, nonce, plan digest, the
+Operator-retained canonical Plan payload, branch, target, author, marker, and
+remote actions. Recovery requires a reason and
 audits the OS principal, hostname, time, command version, and recovery ID. It
 does not automatically resend an indeterminate notification; a separate
 audited command creates a new Notification Request when requested.

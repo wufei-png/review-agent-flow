@@ -58,9 +58,9 @@ The webhook adapter succeeds only for HTTP 2xx plus provider business success (`
 
 ## Explicit recovery
 
-Store-loss recovery is never inferred from an Auto-fix-looking branch, title or marker alone. A trusted-host Operator CLI requires an exact Project, parent MR, parent SHA, Intent nonce, Plan digest and child MR identity. It revalidates all available GitLab facts and records reason, principal, hostname, time, tool version and recovery ID.
+Store-loss recovery is never inferred from an Auto-fix-looking branch, title or marker alone. A trusted-host Operator CLI requires an exact Project, parent MR, parent SHA, Intent nonce, Plan digest, the canonical full Plan payload and child MR identity. It requires one unique configured Review Bot MR, revalidates the parent and child identities, and reconstructs the child commit's single exact parent plus its bounded paths, contents and executable modes before comparing those remote actions with the Plan. It records reason, principal, hostname, time, tool version, recovery ID and success or failure.
 
-Recovery does not automatically resend historical notifications because delivery state is indeterminate. A separate audited resend request is required.
+Recovery does not automatically resend historical notifications because delivery state is indeterminate. A separate audited resend command creates a new immutable Notification Request generation and fresh outbox deliveries; it does not reset or overwrite historical delivery state.
 
 ## Agent and model integrations
 
