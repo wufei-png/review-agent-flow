@@ -14,11 +14,11 @@
 
 **Reviewer**: 显式配置的 GitLab username，仅作为 Notify-only 人审通知对象；Approval Requirement 不属于 v0.1。
 
-**AI Review**: Agent 针对一个 MR 的一个 SHA 执行评审并直接向 GitLab 提交 Note。首版默认关闭，不批准也不阻塞合并。
+**AI Review**: Agent 针对一个 MR 的一个精确 SHA 产生评审结果，ReviewFlow 将有效结果发布为 GitLab Note。首版默认关闭，不批准也不阻塞合并。
 
 **Review Run**: 对一个 MR 的一个 SHA 执行的一次评审尝试。它拥有独立的 Run Lifecycle；用户是否已收到评审由 Review Outcome 表达。
 
-**Review Key**: 一个 Project/MR/精确 SHA/评审类型组合的稳定逻辑身份。它在本地 Store 重建后仍可用于识别已有的 Review Artifact。
+**Review Key**: 一个 Project、父 MR IID 和精确 SHA 组成的稳定逻辑身份。它在本地 Store 重建后仍可用于识别已有的 Review Artifact。
 _Avoid_: Run ID, Attempt ID
 
 **Run Identifier**: 本地持久化 Review Run 的追踪身份。它不作为外部 Review Artifact 的幂等身份。
@@ -41,13 +41,25 @@ _Avoid_: Raw Policy, Webhook Payload
 
 **Effect Receipt**: 连接 Review Run、预期外部副作用和平台已观察身份/状态的持久记录。它用于重放与对账，不代表外部平台操作具备 exactly-once 语义。
 
+**Publication Request**: ReviewFlow 在调用外部平台前持久化的用户可见效果请求。它使 Note、Auto-fix 和通知能独立重试与对账。
+_Avoid_: Agent Side Effect, Synchronous Publish
+
 **Notification Delivery**: 一个通知渠道面向一组接收者的持久化投递结果。它独立于 Run Lifecycle，但参与 Review Outcome。
 _Avoid_: Review Run Status, Synchronous Notification
 
-**Auto-fix Merge Request**: Agent 创建的独立 MR，目标为原 MR 的 source branch。它必须由 Auto-fix Intent 授权并携带可验证的 Auto-fix 身份；标题或分支本身不能建立可信关系。
+**Auto-fix Merge Request**: AutoFixPublisher 根据不可变 Publication Plan 以 Review Bot 身份创建的独立 MR，目标为父 MR 的 source branch。它必须由 Auto-fix Intent 授权并建立 Auto-fix Relation。
 
-**Auto-fix Intent**: ReviewFlow 在允许 Agent 创建 Auto-fix Merge Request 前持久化的服务端授权。正常执行中只有 Intent 或由它建立的关系能够赋予 Auto-fix 身份。
+**Auto-fix Intent**: ReviewFlow 为一个 Review Key 持久化的一代 Auto-fix 发布授权，携带不可变的随机 nonce。同一时间只有一代可 active，重试复用当前 nonce；Operator 显式 re-arm 会创建新一代并保留旧代审计历史。
 _Avoid_: Branch Convention, Title Marker
+
+**Publication Plan**: 由有效 Auto-fix 提议、受限 Diff Envelope 和 Operator verification 冻结而成的不可变发布意图。它定义精确内容和平台动作，而不代表外部平台已接受这些动作。
+_Avoid_: Mutable Draft, Agent Commit
+
+**Auto-fix Relation**: 将 Auto-fix Intent 与 GitLab 返回的子 MR 原生身份连接的持久关系。关系建立后，标题、描述或 Draft/Ready 变化不会改变它的身份。
+_Avoid_: Branch-shaped Event, Marker-only Adoption
+
+**Auto-fix Reconciliation**: 对不确定外部调用、进程崩溃和已知 Relation 状态变化的对账。它不在正常路径中搜索或接管 Agent 创建的 MR。
+_Avoid_: Normal Publisher, Automatic Adoption
 
 **Auto-fix Recovery**: Store 丢失后，由 Operator 显式发起并审计的 Auto-fix 关系重建。它不是 Webhook 或后台 reconciliation 的自动分类路径。
 _Avoid_: Automatic Adoption, Marker-only Recovery
@@ -87,15 +99,21 @@ _Avoid_: Project Command, AI Provider
 **Backend Profile**: Agent Backend 中由 Operator 命名和授权的一组运行约束，供 Project Policy 选择。
 _Avoid_: Command Template, Project Script
 
-**Review Agent Skill**: 指导 Agent 读取上下文、提交 Note、创建 Auto-fix MR 的默认能力说明。Project 可用 `.gitlab/review-agent/SKILL.md` 覆盖。
+**Agent Result**: Agent 在受控 Result Path 写入的有界、版本化评审结果。它可包含原始 review Markdown 和可选 Auto-fix 提议，但不携带平台发布身份。
+_Avoid_: Stdout Protocol, GitLab Receipt
+
+**Review Agent Skill**: 指导 Agent 读取上下文、产生 Agent Result 并在授权时编辑 Trusted Workspace 的默认能力说明。Project 可用 `.gitlab/review-agent/SKILL.md` 覆盖。
 
 **Trusted Project Deployment**: Operator 接受 Project Policy、被接纳的 MR 内容和配置的 Agent 会共同影响一个具备 Review Bot 能力的内部部署。它不承诺安全地无人值守处理任意外部或不可信贡献。
 _Avoid_: Untrusted-MR Sandbox, Multi-tenant Service
 
-**Trusted Execution Environment**: Operator 接受 Agent 在读取仓库和 MR 内容后以 Review Bot 能力行动的执行边界。它不是针对任意不可信贡献的隔离或沙箱边界。
+**Trusted Workspace**: ReviewFlow 为精确 SHA 创建的 linked worktree，Agent 可在其中分析和编辑。它不是文件系统沙箱；宿主隔离属于 Backend Profile 和 Operator 边界。
 _Avoid_: Secure Sandbox, Untrusted Execution
 
-**Deployment boundary**: v0.1 一个 API/Worker 进程只服务一个 GitLab Project；Webhook secret 和 Project ID 必须配置。Repository 对象缺失由显式 `ensure_sha` 在仓库锁内限时 fetch 后再校验，Worktree manager 不隐藏 fetch。
+**Worker Process**: v0.1 中受外部 supervisor 管理的单一 OS 进程，内部运行独立 Review/Publication、Notification 和 Reconciliation/Cleanup 循环。任一循环意外退出都使进程失败，而不静默降级。
+_Avoid_: Monolithic Loop, Silent Partial Worker
+
+**Deployment Boundary**: v0.1 一个 API/Worker 部署只服务一个 GitLab Project；Webhook secret 和 Project ID 必须配置。多进程 Dispatcher/Reconciler 在需要独立扩缩容或替换 SQLite 时再引入。
 
 **Runtime Boundary**: ReviewFlow 中 Project/MR/SHA 评审编排以及 Effect Receipt、Worker Lease 语义所拥有的独立版本与依赖边界。相似的工程辅助能力不因此自动成为本项目的运行时依赖。
 _Avoid_: Shared Runtime, Common Runtime
