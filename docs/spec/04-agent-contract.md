@@ -13,7 +13,7 @@ The core does not ship vendor-specific model SDKs. LiteLLM may be used as an ext
 
 ## Invocation
 
-The Worker invokes the selected Operator command with `shell=False` and the exact-SHA Trusted Workspace as `cwd`. It creates `REVIEW_AGENT_FLOW_RESULT_PATH` outside that workspace with restrictive permissions and supplies only these ReviewFlow variables plus the profile's explicit environment allowlist:
+The Worker invokes the selected Operator command with `shell=False` and the exact-SHA Trusted Workspace as `cwd`. It creates `REVIEW_AGENT_FLOW_RESULT_PATH` outside that workspace with restrictive permissions and supplies only these ReviewFlow variables, the profile's explicit environment allowlist, and the Operator-owned execution `PATH`:
 
 | Variable | Meaning |
 | --- | --- |

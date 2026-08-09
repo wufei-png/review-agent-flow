@@ -19,7 +19,7 @@ This is evidence for the old Agent-owned path only. It does not verify strict RE
 - Duplicate intake for one Project/parent MR/exact SHA creates one kind-free Review Run.
 - Policy v3 rejects executable commands and selects only an Operator-authorized backend/profile; v1/v2 are rejected.
 - Startup strictly validates the external Operator configuration and bound Project allowlists.
-- The Agent receives a detached exact-SHA Trusted Workspace, an environment allowlist and a controlled RESULT_PATH, but no GitLab publication token.
+- The Agent receives a detached exact-SHA Trusted Workspace, a profile environment allowlist plus Operator-owned execution PATH, and a controlled RESULT_PATH, but no GitLab publication token.
 - Missing, malformed, unsupported or oversized Agent results fail closed; valid raw review Markdown is Program-published with the canonical ReviewKey Note marker.
 - A stale parent head supersedes unpublished effects; a confirmed user-deleted Note is not recreated.
 - Note and Auto-fix are independent effects: an invalid proposal or diff does not suppress a valid Note.

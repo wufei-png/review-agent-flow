@@ -2106,6 +2106,64 @@ class SQLiteStore:
             else None
         )
 
+    def block_incomplete_auto_fix_after_frozen_note(
+        self,
+        run_id: int,
+        run_claim_token: str | None,
+        error: str,
+    ) -> bool:
+        """Fail closed when a crash left only the independent Note durable."""
+
+        if not run_claim_token:
+            return False
+        now = self._now().isoformat()
+        safe_error = self._redact(error)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            run = connection.execute(
+                """
+                SELECT 1 FROM review_runs
+                WHERE id = ? AND status = 'running' AND claim_token = ?
+                  AND lease_until IS NOT NULL AND lease_until > ?
+                """,
+                (run_id, run_claim_token, now),
+            ).fetchone()
+            if run is None:
+                return False
+            intent = connection.execute(
+                "SELECT id, nonce, state FROM auto_fix_publication_intents WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if intent is None or intent["state"] != "pending":
+                return True
+            plan = connection.execute(
+                "SELECT 1 FROM auto_fix_publication_plans WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if plan is not None:
+                return True
+            connection.execute(
+                """
+                UPDATE auto_fix_publication_intents
+                SET state = 'blocked', updated_at = ?, last_error = ?
+                WHERE id = ? AND state = 'pending'
+                """,
+                (now, safe_error, intent["id"]),
+            )
+            connection.execute(
+                """
+                UPDATE effect_receipts
+                SET state = 'blocked',
+                    detail = 'Auto-fix candidate was not durable before Worker recovery',
+                    error = ?, next_attempt_at = NULL, lease_until = NULL,
+                    claim_token = NULL, updated_at = ?
+                WHERE run_id = ? AND effect_kind = 'autofix_plan'
+                  AND dedupe_key = ? AND state IN ('planned', 'running')
+                """,
+                (safe_error, now, run_id, f"autofix-intent:{intent['nonce']}"),
+            )
+        return True
+
     def resolve_auto_fix_publication_intent(
         self,
         run_id: int,

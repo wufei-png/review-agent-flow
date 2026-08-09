@@ -267,9 +267,11 @@ def resolve_backend(
             + ", ".join(exposed)
         )
     source = os.environ if environ is None else environ
-    allowed_environment = MappingProxyType(
-        {name: source[name] for name in profile.environment if name in source}
-    )
+    allowed_values = {name: source[name] for name in profile.environment if name in source}
+    # PATH is trusted deployment input needed by bare Operator commands and their
+    # shebang interpreters. It is not Project-controlled or treated as a secret.
+    allowed_values.setdefault("PATH", source.get("PATH", os.defpath))
+    allowed_environment = MappingProxyType(allowed_values)
     return ResolvedBackend(
         policy.backend,
         policy.profile,

@@ -42,15 +42,35 @@ def test_operator_config_resolves_only_allowed_backend_profile_and_environment(t
         config,
         AIPolicy(enabled=True, backend="local-agent", profile="default"),
         "42",
-        {"MODEL_TOKEN": "allowed", "GITLAB_TOKEN": "forbidden"},
+        {
+            "MODEL_TOKEN": "allowed",
+            "GITLAB_TOKEN": "forbidden",
+            "PATH": "/operator/bin",
+        },
     )
 
     assert resolved is not None
     assert resolved.command == ("opencode", "run")
     assert resolved.timeout_seconds == 120
-    assert resolved.environment == {"MODEL_TOKEN": "allowed"}
+    assert resolved.environment == {"MODEL_TOKEN": "allowed", "PATH": "/operator/bin"}
     assert resolved.verification is not None
     assert resolved.verification.command == ("pytest", "-q")
+
+
+def test_operator_execution_path_is_supplied_without_inheriting_other_environment(
+    tmp_path,
+) -> None:
+    config = load_operator_config(_write_config(tmp_path / "operator.yml"))
+
+    resolved = resolve_backend(
+        config,
+        AIPolicy(enabled=True, backend="local-agent", profile="default"),
+        "42",
+        {"PATH": "/trusted/bin", "UNLISTED": "hidden"},
+    )
+
+    assert resolved is not None
+    assert resolved.environment == {"PATH": "/trusted/bin"}
 
 
 def test_operator_config_denies_unknown_project_backend_and_profile(tmp_path) -> None:

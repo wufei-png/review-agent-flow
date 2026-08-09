@@ -196,6 +196,61 @@ class ReviewWorker:
     def _agent_note_marker(run: ReviewRun) -> str:
         return canonical_note_marker(run.project_id, run.mr_iid, run.sha)
 
+    def _resume_from_frozen_note(
+        self,
+        run: ReviewRun,
+        intent: AutoFixPublicationIntent | None,
+        note_request_id: int,
+    ) -> WorkerResult:
+        """Complete a crashed Run from its durable independent Note output."""
+
+        plan = self.store.get_auto_fix_publication_plan(run.run_id)
+        if (
+            intent is not None
+            and plan is None
+            and not self.store.block_incomplete_auto_fix_after_frozen_note(
+                run.run_id,
+                run.claim_token,
+                "Worker crashed after freezing the Note but before the Auto-fix candidate was durable",
+            )
+        ):
+            return self._lease_recovery_result(
+                run, "Review Run lease lost while recovering its frozen Note"
+            )
+        if not self.store.finish(run.run_id, "succeeded", claim_token=run.claim_token):
+            return self._lease_recovery_result(
+                run, "Review Run lease lost before frozen Note recovery completion"
+            )
+        self._log_run(
+            run,
+            status="succeeded",
+            diagnostic="Recovered durable Note output after an expired Worker lease",
+        )
+        try:
+            self.note_publisher.process(request_id=note_request_id)
+        except Exception as exc:  # noqa: BLE001 - Note state is independently durable
+            self._log_run(
+                run,
+                status="note_publication_deferred",
+                level=logging.WARNING,
+                diagnostic=exc,
+            )
+        if plan is not None and plan.state == "frozen":
+            try:
+                self.auto_fix_publisher.process(plan_id=plan.plan_id)
+            except Exception as exc:  # noqa: BLE001 - Plan state is independently durable
+                self._log_run(
+                    run,
+                    status="autofix_publication_deferred",
+                    level=logging.WARNING,
+                    diagnostic=exc,
+                )
+        return WorkerResult(
+            run.run_id,
+            "succeeded",
+            detail="recovered durable Agent effects after Worker lease expiry",
+        )
+
     def _require_active_lease(self, run: ReviewRun, detail: str) -> None:
         if not self.store.has_active_lease(run.run_id, run.claim_token):
             raise LeaseLostError(detail)
@@ -405,6 +460,14 @@ class ReviewWorker:
                     )
                 self._log_run(run, status="succeeded", diagnostic="human path only")
                 return WorkerResult(run.run_id, "succeeded", detail="human path only")
+
+            frozen_note = self.store.get_note_publication_for_run(run.run_id)
+            if frozen_note is not None:
+                return self._resume_from_frozen_note(
+                    run,
+                    self.store.get_auto_fix_publication_intent(run.run_id),
+                    frozen_note.request_id,
+                )
 
             self.sha_ensurer.ensure_sha(run.sha)
             if self.auto_fix_enabled:

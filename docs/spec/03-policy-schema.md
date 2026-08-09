@@ -82,7 +82,7 @@ autofix_publication:
   ci_trigger: manual
 ```
 
-The Operator file is trusted deployment input. The selected backend/profile must exist and allow the bound Project. Environment entries are an allowlist copied from the Worker environment; ReviewFlow does not inject GitLab publication credentials into the Agent. Auto-fix is allowed only when both Project Policy and Operator configuration enable it for that Project.
+The Operator file is trusted deployment input. The selected backend/profile must exist and allow the bound Project. Environment entries are an allowlist copied from the Worker environment; ReviewFlow additionally supplies the Worker-owned `PATH` (or the platform default) so bare Operator commands and their shebang interpreters resolve without inheriting the rest of the Worker environment. `PATH` is not treated as a secret. ReviewFlow does not inject GitLab publication credentials into the Agent. Auto-fix is allowed only when both Project Policy and Operator configuration enable it for that Project.
 
 `initial_readiness` is `draft` or `ready`. `ci_trigger` is `manual` or `automatic`. The supported combinations are `draft/manual`, `draft/automatic` and `ready/automatic`; `ready/manual` is rejected because a ready MR must not silently skip CI. Manual CI adds `[skip ci]` to the Program-owned commit. These values describe creation only and are frozen into the immutable Publication Plan; later user Draft/Ready changes do not invalidate a Relation.
 

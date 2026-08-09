@@ -82,6 +82,29 @@ def test_runner_environment_is_allowlist_plus_controlled_context(tmp_path: Path)
     ]
 
 
+def test_runner_resolves_bare_operator_command_from_trusted_path(tmp_path: Path) -> None:
+    executable_root = tmp_path / "operator-bin"
+    executable_root.mkdir()
+    executable = executable_root / "review-agent-test"
+    executable.write_text(
+        "#!/bin/sh\n"
+        "printf '%s' '{\"version\":1,\"review_markdown\":\"reviewed\"}' "
+        '> "$REVIEW_AGENT_FLOW_RESULT_PATH"\n'
+        'printf "%s" "$PATH"\n',
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+
+    result = LocalCliAgentRunner([executable.name], timeout_seconds=5).run(
+        _context(tmp_path), extra_env={"PATH": str(executable_root)}
+    )
+
+    assert result.returncode == 0
+    assert result.output is not None
+    assert result.output.review_markdown == "reviewed"
+    assert result.stdout == str(executable_root)
+
+
 @pytest.mark.parametrize(
     "payload",
     [

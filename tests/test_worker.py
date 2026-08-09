@@ -312,6 +312,7 @@ def test_worker_runs_agent_in_exact_sha_worktree_and_cleans_it(tmp_path: Path) -
         ),
     )
     gitlab = FakeGitLab(mr)
+
     worker = ReviewWorker(
         store,
         gitlab,
@@ -339,6 +340,100 @@ def test_worker_runs_agent_in_exact_sha_worktree_and_cleans_it(tmp_path: Path) -
     assert note_receipt.external_identity == "gitlab:42!1#note-1"
     assert gitlab.created_note_bodies == [
         f"{canonical_note_marker('42', 1, sha)}\nreviewed"
+    ]
+
+
+def test_expired_run_resumes_frozen_note_without_rerunning_agent_or_stranding_intent(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    sha = _git_repository(repository)
+    mr = MergeRequest("42", 1, "Crash recovery", "alice", "feature", "main", sha, "https://mr")
+    database = tmp_path / "review.db"
+    store = SQLiteStore(database)
+    run = store.enqueue("42", 1, sha)
+    claimed = store.claim_next(project_id="42")
+    assert claimed is not None
+    intent = store.create_auto_fix_publication_intent(
+        claimed.run_id, claimed.claim_token
+    )
+    assert intent is not None
+    store.create_effect_receipt(
+        run.run_id,
+        "agent_execution",
+        f"review-run:{run.run_id}:agent",
+        state="succeeded",
+    )
+    note_receipt = store.create_effect_receipt(
+        run.run_id,
+        "note_expected",
+        canonical_note_marker("42", 1, sha),
+        state="planned",
+    )
+    store.create_effect_receipt(
+        run.run_id,
+        "autofix_plan",
+        f"autofix-intent:{intent.nonce}",
+        state="planned",
+    )
+    note = store.create_note_publication_request(
+        run.run_id,
+        note_receipt.receipt_id,
+        "durable review",
+        claimed.claim_token,
+    )
+    assert note is not None
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE review_runs SET lease_until = ? WHERE id = ?",
+            ("2000-01-01T00:00:00+00:00", run.run_id),
+        )
+
+    rerun_marker = tmp_path / "agent-reran"
+    policy = ReviewPolicy(
+        ai=AIPolicy(
+            enabled=True,
+            auto_fix=True,
+            command=(
+                sys.executable,
+                "-c",
+                f"from pathlib import Path; Path({str(rerun_marker)!r}).write_text('ran')",
+            ),
+        )
+    )
+    gitlab = FakeGitLab(mr)
+
+    class NoRepositoryRecovery:
+        def ensure_sha(self, _sha: str) -> None:
+            raise AssertionError("durable Note recovery must not require repository access")
+
+    worker = ReviewWorker(
+        store,
+        gitlab,
+        GitWorktreeManager(repository, tmp_path / "worktrees"),
+        policy,
+        repository,
+        "https://gitlab",
+        project_id="42",
+        retry_delay_seconds=0,
+        sha_ensurer=NoRepositoryRecovery(),
+    )
+
+    result = worker.process_one()
+
+    assert result is not None and result.status == "succeeded"
+    assert result.agent_result is None
+    assert "recovered durable Agent effects" in result.detail
+    assert not rerun_marker.exists()
+    assert store.get_review_run(run.run_id).status == "succeeded"  # type: ignore[union-attr]
+    recovered_intent = store.get_auto_fix_publication_intent(run.run_id)
+    assert recovered_intent is not None and recovered_intent.state == "blocked"
+    auto_fix_receipt = store.list_effect_receipts(run.run_id, "autofix_plan")[0]
+    assert auto_fix_receipt.state == "blocked"
+    assert store.get_auto_fix_publication_plan(run.run_id) is None
+    assert gitlab.created_note_bodies == [
+        f"{canonical_note_marker('42', 1, sha)}\ndurable review"
     ]
 
 

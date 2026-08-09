@@ -17,6 +17,9 @@
 9. 首次发布前如 head 已变更，旧 SHA 的未发布效果终止为
    `superseded`，新 SHA 使用新 ReviewKey。
 10. Worktree cleanup 是独立资源任务，失败不会重跑 Agent。
+11. Worker lease 在 Note Request 已冻结后过期时，重试直接完成并发布该持久化
+    Note，不再次调用非确定性 Agent；若 Auto-fix Plan 尚未持久化，则对应 Intent
+    和 receipt fail closed 为 `blocked`，不从遗留 worktree 推断候选。
 
 ## Program-owned Note
 

@@ -227,7 +227,9 @@ class LocalCliAgentRunner:
         )
         if context.skill_path is not None:
             env["REVIEW_AGENT_FLOW_SKILL"] = str(context.skill_path)
-        redaction_secrets = tuple(extra_env.values()) if extra_env else ()
+        redaction_secrets = tuple(
+            value for name, value in (extra_env or {}).items() if name != "PATH"
+        )
 
         process = subprocess.Popen(
             list(self.command),
