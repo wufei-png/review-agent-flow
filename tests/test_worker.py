@@ -9,8 +9,10 @@ from review_agent_flow.gitlab import (
     CreatedMergeRequest,
     MergeRequest,
     Note,
+    NoteMarkerLookup,
     Pipeline,
     canonical_note_marker,
+    has_exact_note_marker,
 )
 from review_agent_flow.notifications import FanoutNotifier, NotificationEvent, NotificationResult
 from review_agent_flow.operator_config import ResolvedBackend
@@ -65,6 +67,9 @@ class ProjectId(str):
 class FakeGitLab:
     def __init__(self, mr: MergeRequest):
         self.mr = mr
+        self.notes: list[Note] = []
+        self.created_note_bodies: list[str] = []
+        self.note_lookups: list[str] = []
 
     def get_merge_request(self, project_id: str, mr_iid: int) -> MergeRequest:
         return self.mr
@@ -72,8 +77,30 @@ class FakeGitLab:
     def get_latest_pipeline(self, project_id: str, sha: str) -> Pipeline:
         return Pipeline(project_id, 1, sha, "success")
 
-    def create_note(self, project_id: str, mr_iid: int, body: str) -> None:
-        pass
+    def create_note(self, project_id: str, mr_iid: int, body: str) -> Note:
+        self.created_note_bodies.append(body)
+        note = Note(project_id, mr_iid, len(self.notes) + 1, body)
+        self.notes.append(note)
+        return note
+
+    def lookup_note_marker(
+        self, project_id: str, mr_iid: int, marker: str
+    ) -> NoteMarkerLookup:
+        self.note_lookups.append(marker)
+        candidates = tuple(
+            note
+            for note in self.notes
+            if note.project_id == project_id and note.mr_iid == mr_iid and marker in note.body
+        )
+        return NoteMarkerLookup(
+            tuple(note for note in candidates if has_exact_note_marker(note.body, marker)),
+            tuple(note for note in candidates if not has_exact_note_marker(note.body, marker)),
+        )
+
+    def get_trusted_note(
+        self, project_id: str, mr_iid: int, note_id: int
+    ) -> Note | None:
+        return next((note for note in self.notes if note.note_id == note_id), None)
 
     def create_branch(self, project_id: str, branch: str, ref: str) -> None:
         pass
@@ -112,7 +139,7 @@ class ObservedNoteGitLab(FakeGitLab):
     def __init__(
         self,
         mr: MergeRequest,
-        body_template: str = "{marker}\nActionable finding",
+        body_template: str = "{marker}\nreviewed",
         note_id: object = 314,
         returned_project_id: object | None = None,
         returned_mr_iid: object | None = None,
@@ -124,20 +151,25 @@ class ObservedNoteGitLab(FakeGitLab):
         self.returned_mr_iid = returned_mr_iid
         self.note_markers: list[str] = []
 
-    def find_note_by_marker(
+    def lookup_note_marker(
         self, project_id: str, mr_iid: int, marker: str
-    ) -> Note:
+    ) -> NoteMarkerLookup:
         self.note_markers.append(marker)
-        return Note(
+        note = Note(
             project_id if self.returned_project_id is None else self.returned_project_id,
             mr_iid if self.returned_mr_iid is None else self.returned_mr_iid,
             self.note_id,
             self.body_template.format(marker=marker),
         )
+        if has_exact_note_marker(note.body, marker):
+            return NoteMarkerLookup((note,), ())
+        return NoteMarkerLookup((), (note,))
 
 
 class FailingNoteObserverGitLab(FakeGitLab):
-    def find_note_by_marker(self, project_id: str, mr_iid: int, marker: str) -> Note:
+    def lookup_note_marker(
+        self, project_id: str, mr_iid: int, marker: str
+    ) -> NoteMarkerLookup:
         raise RuntimeError("Note observer API unavailable")
 
 
@@ -217,8 +249,6 @@ def test_worker_runs_agent_in_exact_sha_worktree_and_cleans_it(tmp_path: Path) -
         ),
     )
     gitlab = FakeGitLab(mr)
-    assert gitlab.create_note("42", 1, "legacy note") is None
-    assert not hasattr(gitlab, "find_note_by_marker")
     worker = ReviewWorker(
         store,
         gitlab,
@@ -242,8 +272,11 @@ def test_worker_runs_agent_in_exact_sha_worktree_and_cleans_it(tmp_path: Path) -
     assert worker.notification_dispatcher.process() == 1
     assert notifier.events[0].recipients == ("alice",)
     note_receipt = store.list_effect_receipts(1, "note_expected")[0]
-    assert note_receipt.state == "not_observed"
-    assert note_receipt.external_identity is None
+    assert note_receipt.state == "published"
+    assert note_receipt.external_identity == "gitlab:42!1#note-1"
+    assert gitlab.created_note_bodies == [
+        f"{canonical_note_marker('42', 1, sha)}\nreviewed"
+    ]
 
 
 def test_agent_note_receipt_observes_native_id_without_equating_agent_success_to_note_success(
@@ -283,9 +316,78 @@ def test_agent_note_receipt_observes_native_id_without_equating_agent_success_to
     assert result.agent_result.stdout.strip() == "reviewed"
     assert gitlab.note_markers == [marker]
     note_receipt = store.list_effect_receipts(run.run_id, "note_expected")[0]
-    assert note_receipt.state == "observed"
+    assert note_receipt.state == "published"
     assert note_receipt.external_identity == "gitlab:42!1#note-314"
     assert store.list_effect_receipts(run.run_id, "agent_execution")[0].state == "succeeded"
+
+
+def test_worker_idle_poll_reconciles_a_due_published_note(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    sha = _git_repository(repository)
+    mr = MergeRequest("42", 1, "Reconcile Note", "alice", "feature", "main", sha, "https://mr")
+    database = tmp_path / "review.db"
+    store = SQLiteStore(database)
+    run = store.enqueue("42", 1, sha)
+    gitlab = FakeGitLab(mr)
+    worker = ReviewWorker(
+        store,
+        gitlab,
+        GitWorktreeManager(repository, tmp_path / "worktrees"),
+        ReviewPolicy(
+            ai=AIPolicy(enabled=True, command=(sys.executable, "-c", "print('reviewed')"))
+        ),
+        repository,
+        "https://gitlab",
+        project_id="42",
+    )
+    assert worker.process_one().status == "succeeded"  # type: ignore[union-attr]
+    request = store.get_note_publication_for_run(run.run_id)
+    assert request is not None and request.state == "published"
+    gitlab.notes.clear()
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE note_publication_requests SET reconcile_next_at = ? WHERE id = ?",
+            ("2000-01-01T00:00:00+00:00", request.request_id),
+        )
+
+    reconciled = worker.process_one()
+
+    assert reconciled is not None and reconciled.status == "removed"
+    assert store.get_note_publication_request(request.request_id).state == "removed"  # type: ignore[union-attr]
+
+
+def test_note_marker_conflict_blocks_only_note_effect_not_review_run(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    sha = _git_repository(repository)
+    marker = canonical_note_marker("42", 1, sha)
+    mr = MergeRequest("42", 1, "Marker conflict", "alice", "feature", "main", sha, "https://mr")
+    store = SQLiteStore(tmp_path / "review.db")
+    run = store.enqueue("42", 1, sha)
+    command = (
+        "import json, os, pathlib; pathlib.Path("
+        "os.environ['REVIEW_AGENT_FLOW_RESULT_PATH']).write_text(json.dumps("
+        f"{{'version': 1, 'review_markdown': {marker!r}}}))"
+    )
+    gitlab = FakeGitLab(mr)
+    worker = ReviewWorker(
+        store,
+        gitlab,
+        GitWorktreeManager(repository, tmp_path / "worktrees"),
+        ReviewPolicy(ai=AIPolicy(enabled=True, command=(sys.executable, "-c", command))),
+        repository,
+        "https://gitlab",
+        project_id="42",
+    )
+
+    result = worker.process_one()
+
+    assert result is not None and result.status == "succeeded"
+    assert store.get_review_run(run.run_id).status == "succeeded"  # type: ignore[union-attr]
+    request = store.get_note_publication_for_run(run.run_id)
+    assert request is not None and request.state == "blocked"
+    assert gitlab.created_note_bodies == []
 
 
 def test_note_marker_observation_uses_review_key_receipt_key(tmp_path: Path) -> None:
@@ -329,7 +431,7 @@ def test_note_marker_observation_uses_review_key_receipt_key(tmp_path: Path) -> 
     assert len(receipts) == 1
     assert receipts[0].receipt_id == existing.receipt_id
     assert receipts[0].dedupe_key == marker
-    assert receipts[0].state == "observed"
+    assert receipts[0].state == "published"
     assert gitlab.note_markers == [marker]
 
 
@@ -346,7 +448,7 @@ def test_note_marker_observation_uses_review_key_receipt_key(tmp_path: Path) -> 
         ("{marker}", "1"),
     ],
 )
-def test_worker_keeps_noncanonical_or_invalid_observed_note_not_observed(
+def test_worker_blocks_noncanonical_or_invalid_observed_note(
     body_template: str, note_id: object, tmp_path: Path
 ) -> None:
     repository = tmp_path / "repo"
@@ -369,11 +471,11 @@ def test_worker_keeps_noncanonical_or_invalid_observed_note_not_observed(
 
     assert result is not None and result.status == "succeeded"
     note_receipt = store.list_effect_receipts(run.run_id, "note_expected")[0]
-    assert note_receipt.state == "not_observed"
+    assert note_receipt.state == "blocked"
     assert note_receipt.external_identity is None
 
 
-def test_worker_keeps_note_observer_exception_not_observed(tmp_path: Path) -> None:
+def test_worker_keeps_note_observer_exception_pending(tmp_path: Path) -> None:
     repository = tmp_path / "repo"
     repository.mkdir()
     sha = _git_repository(repository)
@@ -394,7 +496,7 @@ def test_worker_keeps_note_observer_exception_not_observed(tmp_path: Path) -> No
 
     assert result is not None and result.status == "succeeded"
     note_receipt = store.list_effect_receipts(run.run_id, "note_expected")[0]
-    assert note_receipt.state == "not_observed"
+    assert note_receipt.state == "pending"
     assert note_receipt.external_identity is None
     assert "observer API unavailable" in (note_receipt.error or "")
 
@@ -443,7 +545,7 @@ def test_worker_rejects_note_from_wrong_project_or_mr(
 
     assert result is not None and result.status == "succeeded"
     note_receipt = store.list_effect_receipts(run.run_id, "note_expected")[0]
-    assert note_receipt.state == "not_observed"
+    assert note_receipt.state == "blocked"
     assert note_receipt.external_identity is None
 
 
@@ -539,9 +641,8 @@ def test_worker_retries_agent_for_auto_fix_when_only_note_exists(tmp_path: Path)
     assert result is not None and result.status == "succeeded"
     assert result.agent_result is not None
     assert result.agent_result.stdout.strip() == "recovered"
-    assert gitlab.note_markers == [
-        canonical_note_marker(run.project_id, run.mr_iid, run.sha)
-    ]
+    marker = canonical_note_marker(run.project_id, run.mr_iid, run.sha)
+    assert gitlab.created_note_bodies == [f"{marker}\nreviewed"]
     intent = store.get_auto_fix_intent(run.run_id)
     assert intent is not None and intent.status == "created"
 

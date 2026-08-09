@@ -13,13 +13,20 @@ from threading import Event, Thread
 
 from .auto_fix_reconciler import AutoFixReconciler
 from .failures import FailureInfo, classify_exception
-from .gitlab import GitLabClient, canonical_note_marker, has_exact_note_marker, is_valid_sha
+from .gitlab import GitLabClient, canonical_note_marker, is_valid_sha
+from .note_publisher import NotePublisher
 from .notification_dispatcher import NotificationDispatcher
 from .notifications import FanoutNotifier, NotificationEvent
 from .operator_config import ResolvedBackend
 from .policy import ReviewPolicy
 from .repository import GitShaEnsurer
-from .runner import AgentContext, AgentResult, LeaseLostError, LocalCliAgentRunner
+from .runner import (
+    AgentContext,
+    AgentContractError,
+    AgentResult,
+    LeaseLostError,
+    LocalCliAgentRunner,
+)
 from .security import redact
 from .store import (
     DEFAULT_LEASE_SECONDS,
@@ -119,6 +126,13 @@ class ReviewWorker:
         self.max_retry_delay_seconds = max_retry_delay_seconds
         self.reconciliation_max_attempts = reconciliation_max_attempts
         self.project_id = configured_project_id.strip()
+        self.note_publisher = NotePublisher(
+            store,
+            gitlab,
+            self.project_id,
+            retry_delay_seconds=retry_delay_seconds,
+            max_retry_delay_seconds=max_retry_delay_seconds,
+        )
         self.auto_fix_reconciler = AutoFixReconciler(
             store,
             gitlab,
@@ -224,6 +238,21 @@ class ReviewWorker:
             project_id=self.project_id,
         )
         if run is None:
+            note_results = self.note_publisher.process(limit=1)
+            if note_results:
+                note_result = note_results[-1]
+                return WorkerResult(
+                    note_result.run_id,
+                    note_result.status,
+                    detail=note_result.detail,
+                )
+            note_reconciliation = self.note_publisher.reconcile_published()
+            if note_reconciliation is not None:
+                return WorkerResult(
+                    note_reconciliation.run_id,
+                    note_reconciliation.status,
+                    detail=note_reconciliation.detail,
+                )
             reconciliation = self.reconcile_auto_fixes(limit=1)
             log_event(
                 LOGGER,
@@ -237,6 +266,7 @@ class ReviewWorker:
         self._log_run(run, status="running", event="worker.run.claimed")
         receipts: dict[str, EffectReceipt] = {}
         agent_finished = False
+        note_request_id: int | None = None
 
         auto_fix_intent = None
         agent_started = False
@@ -369,7 +399,6 @@ class ReviewWorker:
                     raise
                 worktree_created = True
                 receipts = self._prepare_agent_effects(run, merge_request)
-                marker = self._agent_note_marker(run)
                 if self.policy.ai.auto_fix:
                     branch = f"autofix/MR-{merge_request.iid}/run-{run.run_id}"
                     try:
@@ -417,15 +446,8 @@ class ReviewWorker:
                         )
                         auto_fix_created = True
 
-                has_marker = False
-                has_note_marker = getattr(self.gitlab, "has_note_marker", None)
-                if callable(has_note_marker):
-                    try:
-                        has_marker = bool(has_note_marker(run.project_id, run.mr_iid, marker))
-                    except Exception:  # noqa: BLE001 - duplicate detection is best effort
-                        has_marker = False
                 if self.policy.ai.auto_fix and not auto_fix_created:
-                    if callable(has_note_marker):
+                    if callable(getattr(self.gitlab, "has_note_marker", None)):
                         reconcile_after_agent = True
                     else:
                         self.auto_fix_reconciler.schedule(
@@ -433,15 +455,8 @@ class ReviewWorker:
                             "Auto-fix MR was not observed yet",
                             run=run,
                         )
-                if has_marker and (not self.policy.ai.auto_fix or auto_fix_created):
-                    result = AgentResult(
-                        returncode=0,
-                        stdout="",
-                        stderr="review marker and coordinated Auto-fix MR already exist; skipped duplicate Agent run",
-                    )
-                else:
-                    agent_started = True
-                    result = self._run_agent(run, worktree)
+                agent_started = True
+                result = self._run_agent(run, worktree)
                 agent_finished = True
                 agent_receipt = receipts["agent_execution"]
                 if result.timed_out:
@@ -501,7 +516,24 @@ class ReviewWorker:
                     state="succeeded",
                     detail="Agent process exited successfully",
                 )
-                self._record_observed_note(run, receipts["note_expected"])
+                if result.output is None:
+                    raise AgentContractError(
+                        "successful Agent result did not contain parsed output"
+                    )
+                try:
+                    note_request = self.store.create_note_publication_request(
+                        run.run_id,
+                        receipts["note_expected"].receipt_id,
+                        result.output.review_markdown,
+                        run.claim_token,
+                    )
+                except ValueError as exc:
+                    raise AgentContractError(str(exc)) from exc
+                if note_request is None:
+                    raise LeaseLostError(
+                        "Review Run lease was lost before freezing the Note publication request"
+                    )
+                note_request_id = note_request.request_id
                 identity_error = (
                     self.auto_fix_reconciler.record_if_created(run, merge_request, receipts)
                     if reconcile_after_agent
@@ -552,6 +584,16 @@ class ReviewWorker:
                         detail = f"{detail}; worktree cleanup pending: {cleanup_detail}".strip("; ")
                         LOGGER.exception("worktree cleanup failed for Run %s", run.run_id)
             if completed_result is not None:
+                if note_request_id is not None:
+                    try:
+                        self.note_publisher.process(request_id=note_request_id)
+                    except Exception as exc:  # noqa: BLE001 - Note state is independently durable
+                        self._log_run(
+                            run,
+                            status="note_publication_deferred",
+                            level=logging.WARNING,
+                            diagnostic=exc,
+                        )
                 return WorkerResult(
                     completed_result.run_id,
                     completed_result.status,
@@ -711,7 +753,7 @@ class ReviewWorker:
                 self._agent_note_marker(run),
                 attempt=1,
                 state="planned",
-                detail="GitLab Note identity uses the exact ReviewKey marker",
+                detail="Program-owned GitLab Note awaits a valid Agent result",
             )
             if self.policy.ai.auto_fix:
                 branch = f"autofix/MR-{merge_request.iid}/run-{run.run_id}"
@@ -772,62 +814,6 @@ class ReviewWorker:
                 state="not_observed",
                 error=self._redact(error),
             )
-
-    def _record_observed_note(self, run: ReviewRun, receipt: EffectReceipt) -> None:
-        """Record a Note only after the adapter verifies its scoped marker and native ID."""
-
-        marker = self._agent_note_marker(run)
-        observer = getattr(self.gitlab, "find_note_by_marker", None)
-        if not callable(observer):
-            self._update_run_effect_receipt(
-                run,
-                receipt,
-                state="not_observed",
-                detail="GitLab adapter cannot verify the Agent-owned Note",
-            )
-            return
-        try:
-            note = observer(run.project_id, run.mr_iid, marker)
-        except Exception as exc:  # noqa: BLE001 - external observation is independent
-            self._update_run_effect_receipt(
-                run,
-                receipt,
-                state="not_observed",
-                detail="GitLab Note observation failed; Agent process status is independent",
-                error=self._redact(exc),
-            )
-            return
-
-        note_project_id = getattr(note, "project_id", None)
-        note_mr_iid = getattr(note, "mr_iid", None)
-        note_id = getattr(note, "note_id", None)
-        if (
-            note is None
-            or type(note_project_id) is not str
-            or note_project_id != run.project_id
-            or type(note_mr_iid) is not int
-            or note_mr_iid <= 0
-            or note_mr_iid != run.mr_iid
-            or type(note_id) is not int
-            or note_id <= 0
-            or not has_exact_note_marker(getattr(note, "body", None), marker)
-        ):
-            self._update_run_effect_receipt(
-                run,
-                receipt,
-                state="not_observed",
-                detail="No valid scoped GitLab Note was observed for the Agent run",
-            )
-            return
-
-        external_identity = f"gitlab:{run.project_id}!{run.mr_iid}#note-{note_id}"
-        self._update_run_effect_receipt(
-            run,
-            receipt,
-            state="observed",
-            external_identity=external_identity,
-            detail=f"Agent-owned GitLab Note observed with native id={note_id}",
-        )
 
     def _heartbeat(self, run: ReviewRun) -> bool:
         return self.store.extend_lease(

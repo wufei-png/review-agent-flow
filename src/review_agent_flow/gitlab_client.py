@@ -8,8 +8,10 @@ from typing import Any
 from .gitlab import (
     CreatedMergeRequest,
     GitLabClient,
+    GitLabIdentityConflict,
     MergeRequest,
     Note,
+    NoteMarkerLookup,
     Pipeline,
     has_exact_note_marker,
 )
@@ -106,40 +108,88 @@ class PythonGitLabClient(GitLabClient):
                     return collected
                 page += 1
 
-    def create_note(self, project_id: str, mr_iid: int, body: str) -> None:
-        self._project(project_id).mergerequests.get(mr_iid).notes.create({"body": body})
+    def create_note(self, project_id: str, mr_iid: int, body: str) -> Note:
+        if not self._review_bot_username:
+            raise RuntimeError("GITLAB_REVIEW_BOT_USERNAME is required for Note publication")
+        resource = self._project(project_id).mergerequests.get(mr_iid).notes.create({"body": body})
+        if self._note_author_username(resource) != self._review_bot_username:
+            raise GitLabIdentityConflict(
+                "created Note author does not match GITLAB_REVIEW_BOT_USERNAME"
+            )
+        note = self._note_from_resource(project_id, mr_iid, resource)
+        if note is None:
+            raise RuntimeError("GitLab returned an invalid created Note identity")
+        return note
+
+    def lookup_note_marker(
+        self, project_id: str, mr_iid: int, marker: str
+    ) -> NoteMarkerLookup:
+        if not self._review_bot_username:
+            raise RuntimeError("GITLAB_REVIEW_BOT_USERNAME is required for Note publication")
+        notes_manager = self._project(project_id).mergerequests.get(mr_iid).notes
+        exact: list[Note] = []
+        conflicts: list[Note] = []
+        for resource in self._list_all_notes(notes_manager):
+            if self._note_author_username(resource) != self._review_bot_username:
+                continue
+            body = getattr(resource, "body", None)
+            if not isinstance(body, str) or marker not in body:
+                continue
+            note = self._note_from_resource(project_id, mr_iid, resource)
+            if note is None:
+                raise RuntimeError("GitLab returned an invalid trusted Note identity")
+            if has_exact_note_marker(body, marker):
+                exact.append(note)
+            else:
+                conflicts.append(note)
+        return NoteMarkerLookup(tuple(exact), tuple(conflicts))
+
+    def get_trusted_note(
+        self, project_id: str, mr_iid: int, note_id: int
+    ) -> Note | None:
+        if not self._review_bot_username:
+            raise RuntimeError("GITLAB_REVIEW_BOT_USERNAME is required for Note reconciliation")
+        notes_manager = self._project(project_id).mergerequests.get(mr_iid).notes
+        try:
+            resource = notes_manager.get(note_id)
+        except Exception as exc:
+            status = getattr(exc, "response_code", None) or getattr(exc, "status_code", None)
+            if status == 404:
+                return None
+            raise
+        if self._note_author_username(resource) != self._review_bot_username:
+            raise GitLabIdentityConflict(
+                "persisted Note author does not match GITLAB_REVIEW_BOT_USERNAME"
+            )
+        note = self._note_from_resource(project_id, mr_iid, resource)
+        if note is None:
+            raise GitLabIdentityConflict("GitLab returned an invalid persisted Note identity")
+        return note
 
     def has_note_marker(self, project_id: str, mr_iid: int, marker: str) -> bool:
-        if not self._review_bot_username:
+        try:
+            lookup = self.lookup_note_marker(project_id, mr_iid, marker)
+        except RuntimeError:
             return False
-        notes_manager = self._project(project_id).mergerequests.get(mr_iid).notes
-        return any(
-            self._note_author_username(note) == self._review_bot_username
-            and has_exact_note_marker(getattr(note, "body", None), marker)
-            for note in self._list_all_notes(notes_manager)
-        )
+        return bool(lookup.exact)
 
     def find_note_by_marker(
         self, project_id: str, mr_iid: int, marker: str
     ) -> Note | None:
         if (
-            not self._review_bot_username
-            or type(project_id) is not str
+            type(project_id) is not str
             or not project_id.strip()
             or type(mr_iid) is not int
             or mr_iid <= 0
         ):
             return None
-        notes_manager = self._project(project_id).mergerequests.get(mr_iid).notes
-        matching = [
-            note
-            for note in self._list_all_notes(notes_manager)
-            if self._note_author_username(note) == self._review_bot_username
-            and has_exact_note_marker(getattr(note, "body", None), marker)
-        ]
-        if len(matching) != 1:
+        try:
+            lookup = self.lookup_note_marker(project_id, mr_iid, marker)
+        except RuntimeError:
             return None
-        return self._note_from_resource(project_id, mr_iid, matching[0])
+        if lookup.conflicts or len(lookup.exact) != 1:
+            return None
+        return lookup.exact[0]
 
     def create_branch(self, project_id: str, branch: str, ref: str) -> None:
         self._project(project_id).branches.create({"branch": branch, "ref": ref})

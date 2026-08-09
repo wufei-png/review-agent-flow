@@ -11,7 +11,7 @@ from pathlib import Path
 from urllib.parse import quote
 from uuid import uuid4
 
-from .gitlab import is_valid_sha
+from .gitlab import canonical_note_marker, has_exact_note_marker, is_valid_sha
 from .security import redact
 
 DEFAULT_LEASE_SECONDS = 1860
@@ -20,8 +20,11 @@ DEFAULT_NOTIFICATION_LEASE_SECONDS = 30
 DEFAULT_NOTIFICATION_MAX_ATTEMPTS = 3
 DEFAULT_WORKTREE_CLEANUP_LEASE_SECONDS = 60
 DEFAULT_WORKTREE_CLEANUP_MAX_ATTEMPTS = 5
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DEFAULT_EFFECT_LEASE_SECONDS = 60
+DEFAULT_NOTE_PUBLICATION_LEASE_SECONDS = 60
+DEFAULT_NOTE_PUBLICATION_MAX_ATTEMPTS = 5
+DEFAULT_NOTE_UNCERTAIN_LOOKUP_ATTEMPTS = 3
 
 
 def auto_fix_intent_marker(run_id: int, parent_sha: str) -> str:
@@ -75,6 +78,32 @@ class EffectReceipt:
     next_attempt_at: str | None = None
     lease_until: str | None = None
     claim_token: str | None = None
+
+
+@dataclass(frozen=True)
+class NotePublicationRequest:
+    request_id: int
+    run_id: int
+    receipt_id: int
+    project_id: str
+    mr_iid: int
+    sha: str
+    marker: str
+    body: str
+    state: str
+    attempts: int
+    write_uncertain: bool
+    external_note_id: int | None
+    next_attempt_at: str | None
+    lease_until: str | None
+    claim_token: str | None
+    created_at: str
+    updated_at: str
+    last_error: str | None
+    reconcile_attempts: int
+    reconcile_next_at: str | None
+    reconcile_lease_until: str | None
+    reconcile_claim_token: str | None
 
 
 @dataclass(frozen=True)
@@ -155,7 +184,7 @@ class WorktreeRecord:
 class SQLiteStore:
     """Small SQLite store.
 
-    Version 3 is intentionally a fresh schema.  There is no production database
+    Version 4 is intentionally a fresh schema.  There is no production database
     migration contract for this pre-release implementation; an older database
     must be recreated rather than guessed into a new notification or Auto-fix
     routing model.
@@ -320,6 +349,31 @@ class SQLiteStore:
                     claim_token TEXT,
                     UNIQUE(run_id, effect_kind, dedupe_key, attempt)
                 );
+                CREATE TABLE IF NOT EXISTS note_publication_requests (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id INTEGER NOT NULL UNIQUE REFERENCES review_runs(id),
+                    receipt_id INTEGER NOT NULL UNIQUE REFERENCES effect_receipts(id),
+                    project_id TEXT NOT NULL,
+                    mr_iid INTEGER NOT NULL,
+                    sha TEXT NOT NULL,
+                    marker TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    write_uncertain INTEGER NOT NULL DEFAULT 0,
+                    external_note_id INTEGER,
+                    next_attempt_at TEXT,
+                    lease_until TEXT,
+                    claim_token TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_error TEXT,
+                    reconcile_attempts INTEGER NOT NULL DEFAULT 0,
+                    reconcile_next_at TEXT,
+                    reconcile_lease_until TEXT,
+                    reconcile_claim_token TEXT,
+                    UNIQUE(project_id, mr_iid, sha)
+                );
                 CREATE TABLE IF NOT EXISTS auto_fix_mrs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     parent_project_id TEXT NOT NULL,
@@ -373,7 +427,7 @@ class SQLiteStore:
                     last_error TEXT,
                     UNIQUE(run_id, path)
                 );
-                PRAGMA user_version = 3;
+                PRAGMA user_version = 4;
                 """
             )
 
@@ -427,6 +481,22 @@ class SQLiteStore:
     @staticmethod
     def _effect_from_row(row: sqlite3.Row) -> EffectReceipt:
         return EffectReceipt(**dict(row))
+
+    @staticmethod
+    def _note_publication_from_row(row: sqlite3.Row) -> NotePublicationRequest:
+        values = dict(row)
+        values["write_uncertain"] = bool(values["write_uncertain"])
+        return NotePublicationRequest(**values)
+
+    @staticmethod
+    def _note_publication_columns() -> str:
+        return (
+            "id AS request_id, run_id, receipt_id, project_id, mr_iid, sha, marker, body, "
+            "state, attempts, write_uncertain, external_note_id, next_attempt_at, "
+            "lease_until, claim_token, created_at, updated_at, last_error, "
+            "reconcile_attempts, reconcile_next_at, reconcile_lease_until, "
+            "reconcile_claim_token"
+        )
 
     def enqueue(self, project_id: str, mr_iid: int, sha: str) -> ReviewRun:
         if not project_id or not str(project_id).strip():
@@ -1007,6 +1077,503 @@ class SQLiteStore:
         with self._connect() as connection:
             rows = connection.execute(query, parameters).fetchall()
         return tuple(self._effect_from_row(row) for row in rows)
+
+    def create_note_publication_request(
+        self,
+        run_id: int,
+        receipt_id: int,
+        review_markdown: str,
+        run_claim_token: str | None,
+    ) -> NotePublicationRequest | None:
+        """Freeze one Note body while the producing Review Run lease is active."""
+
+        if run_id <= 0 or receipt_id <= 0:
+            raise ValueError("run_id and receipt_id must be positive")
+        if not isinstance(review_markdown, str) or not review_markdown.strip():
+            raise ValueError("review_markdown must be a non-empty string")
+        if not run_claim_token:
+            return None
+        now = datetime.now(UTC).isoformat()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            run = connection.execute(
+                """
+                SELECT project_id, mr_iid, sha FROM review_runs
+                WHERE id = ? AND status = 'running' AND claim_token = ?
+                  AND lease_until IS NOT NULL AND lease_until > ?
+                """,
+                (run_id, run_claim_token, now),
+            ).fetchone()
+            if run is None:
+                return None
+            marker = canonical_note_marker(
+                str(run["project_id"]), int(run["mr_iid"]), str(run["sha"])
+            )
+            body = f"{marker}\n{review_markdown}"
+            initial_state = (
+                "pending" if has_exact_note_marker(body, marker) else "blocked"
+            )
+            initial_error = (
+                None
+                if initial_state == "pending"
+                else "review_markdown conflicts with the canonical Note marker"
+            )
+            receipt = connection.execute(
+                """
+                SELECT id FROM effect_receipts
+                WHERE id = ? AND run_id = ? AND effect_kind = 'note_expected'
+                  AND dedupe_key = ?
+                """,
+                (receipt_id, run_id, marker),
+            ).fetchone()
+            if receipt is None:
+                raise ValueError("Note effect receipt does not match the ReviewKey")
+            connection.execute(
+                """
+                INSERT INTO note_publication_requests(
+                    run_id, receipt_id, project_id, mr_iid, sha, marker, body,
+                    state, next_attempt_at, created_at, updated_at, last_error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id) DO NOTHING
+                """,
+                (
+                    run_id,
+                    receipt_id,
+                    run["project_id"],
+                    run["mr_iid"],
+                    run["sha"],
+                    marker,
+                    body,
+                    initial_state,
+                    now if initial_state == "pending" else None,
+                    now,
+                    now,
+                    initial_error,
+                ),
+            )
+            row = connection.execute(
+                f"SELECT {self._note_publication_columns()} "
+                "FROM note_publication_requests WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            assert row is not None
+            request = self._note_publication_from_row(row)
+            if (
+                request.receipt_id != receipt_id
+                or request.marker != marker
+                or request.body != body
+            ):
+                raise ValueError("Note Publication Request is immutable")
+            connection.execute(
+                """
+                UPDATE effect_receipts
+                SET state = ?, detail = ?, error = ?,
+                    next_attempt_at = ?, updated_at = ?
+                WHERE id = ? AND state = 'planned'
+                """,
+                (
+                    initial_state,
+                    "Program-owned GitLab Note publication queued"
+                    if initial_state == "pending"
+                    else "Program-owned GitLab Note publication blocked by marker conflict",
+                    initial_error,
+                    now if initial_state == "pending" else None,
+                    now,
+                    receipt_id,
+                ),
+            )
+        return request
+
+    def get_note_publication_request(
+        self, request_id: int
+    ) -> NotePublicationRequest | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                f"SELECT {self._note_publication_columns()} "
+                "FROM note_publication_requests WHERE id = ?",
+                (request_id,),
+            ).fetchone()
+        return self._note_publication_from_row(row) if row is not None else None
+
+    def get_note_publication_for_run(
+        self, run_id: int
+    ) -> NotePublicationRequest | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                f"SELECT {self._note_publication_columns()} "
+                "FROM note_publication_requests WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        return self._note_publication_from_row(row) if row is not None else None
+
+    def claim_note_publication(
+        self,
+        *,
+        request_id: int | None = None,
+        project_id: str | None = None,
+        excluded_request_ids: tuple[int, ...] = (),
+        lease_seconds: int = DEFAULT_NOTE_PUBLICATION_LEASE_SECONDS,
+        max_attempts: int = DEFAULT_NOTE_PUBLICATION_MAX_ATTEMPTS,
+    ) -> NotePublicationRequest | None:
+        if lease_seconds <= 0 or max_attempts <= 0:
+            raise ValueError("Note publication lease and attempt limits must be positive")
+        uncertain_limit = max_attempts + DEFAULT_NOTE_UNCERTAIN_LOOKUP_ATTEMPTS
+        now_value = datetime.now(UTC)
+        now = now_value.isoformat()
+        lease_until = (now_value + timedelta(seconds=lease_seconds)).isoformat()
+        filters = ""
+        parameters: list[object] = [now]
+        if request_id is not None:
+            filters += " AND id = ?"
+            parameters.append(request_id)
+        if project_id is not None:
+            filters += " AND project_id = ?"
+            parameters.append(project_id)
+        if excluded_request_ids:
+            if any(type(value) is not int or value <= 0 for value in excluded_request_ids):
+                raise ValueError("excluded Note request IDs must be positive integers")
+            placeholders = ",".join("?" for _ in excluded_request_ids)
+            filters += f" AND id NOT IN ({placeholders})"
+            parameters.extend(excluded_request_ids)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                UPDATE note_publication_requests
+                SET state = CASE
+                        WHEN attempts >= ? AND NOT (
+                            write_uncertain = 1 AND attempts < ?
+                        ) THEN 'blocked' ELSE 'pending' END,
+                    next_attempt_at = CASE
+                        WHEN attempts >= ? AND NOT (
+                            write_uncertain = 1 AND attempts < ?
+                        ) THEN NULL ELSE ? END,
+                    lease_until = NULL, claim_token = NULL, updated_at = ?,
+                    last_error = COALESCE(last_error, 'publication lease expired')
+                WHERE state = 'running' AND (lease_until IS NULL OR lease_until <= ?)
+                """,
+                (
+                    max_attempts,
+                    uncertain_limit,
+                    max_attempts,
+                    uncertain_limit,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE note_publication_requests
+                SET state = 'blocked', next_attempt_at = NULL, updated_at = ?,
+                    last_error = COALESCE(last_error, 'publication attempt limit reached')
+                WHERE state = 'pending' AND attempts >= ?
+                  AND NOT (write_uncertain = 1 AND attempts < ?)
+                """,
+                (now, max_attempts, uncertain_limit),
+            )
+            connection.execute(
+                """
+                UPDATE effect_receipts
+                SET state = (
+                        SELECT state FROM note_publication_requests
+                        WHERE receipt_id = effect_receipts.id
+                    ),
+                    error = (
+                        SELECT last_error FROM note_publication_requests
+                        WHERE receipt_id = effect_receipts.id
+                    ),
+                    next_attempt_at = (
+                        SELECT next_attempt_at FROM note_publication_requests
+                        WHERE receipt_id = effect_receipts.id
+                    ),
+                    lease_until = NULL, claim_token = NULL, updated_at = ?
+                WHERE id IN (
+                    SELECT receipt_id FROM note_publication_requests
+                    WHERE state IN ('pending', 'blocked')
+                ) AND state = 'running'
+                """,
+                (now,),
+            )
+            row = connection.execute(
+                f"""
+                SELECT id FROM note_publication_requests
+                WHERE state = 'pending' AND (
+                        attempts < ? OR (write_uncertain = 1 AND attempts < ?)
+                    )
+                  AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+                  {filters}
+                ORDER BY id LIMIT 1
+                """,
+                (max_attempts, uncertain_limit, *parameters),
+            ).fetchone()
+            if row is None:
+                return None
+            token = uuid4().hex
+            updated = connection.execute(
+                """
+                UPDATE note_publication_requests
+                SET state = 'running', attempts = attempts + 1, lease_until = ?,
+                    claim_token = ?, updated_at = ?
+                WHERE id = ? AND state = 'pending' AND (
+                    attempts < ? OR (write_uncertain = 1 AND attempts < ?)
+                )
+                """,
+                (
+                    lease_until,
+                    token,
+                    now,
+                    row["id"],
+                    max_attempts,
+                    uncertain_limit,
+                ),
+            )
+            if updated.rowcount != 1:
+                return None
+            claimed = connection.execute(
+                f"SELECT {self._note_publication_columns()} "
+                "FROM note_publication_requests WHERE id = ?",
+                (row["id"],),
+            ).fetchone()
+            assert claimed is not None
+            connection.execute(
+                """
+                UPDATE effect_receipts SET state = 'running', updated_at = ?
+                WHERE id = ?
+                """,
+                (now, claimed["receipt_id"]),
+            )
+        return self._note_publication_from_row(claimed)
+
+    def mark_note_write_uncertain(
+        self, request_id: int, claim_token: str | None
+    ) -> bool:
+        """Durably record the create boundary before invoking GitLab."""
+
+        now = datetime.now(UTC).isoformat()
+        with self._connect() as connection:
+            updated = connection.execute(
+                """
+                UPDATE note_publication_requests
+                SET write_uncertain = 1, updated_at = ?
+                WHERE id = ? AND state = 'running' AND claim_token = ?
+                  AND lease_until IS NOT NULL AND lease_until > ?
+                """,
+                (now, request_id, claim_token, now),
+            )
+        return updated.rowcount == 1
+
+    def finish_note_publication(
+        self,
+        request_id: int,
+        claim_token: str | None,
+        *,
+        state: str,
+        external_note_id: int | None = None,
+        detail: str | None = None,
+        error: str | None = None,
+        next_attempt_at: str | None = None,
+        reconcile_next_at: str | None = None,
+    ) -> bool:
+        allowed_states = {"pending", "published", "blocked", "superseded"}
+        if state not in allowed_states:
+            raise ValueError("invalid Note publication completion state")
+        if state == "published" and (
+            type(external_note_id) is not int or external_note_id <= 0
+        ):
+            raise ValueError("published Note requires a positive external_note_id")
+        now = datetime.now(UTC).isoformat()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT receipt_id, project_id, mr_iid FROM note_publication_requests
+                WHERE id = ? AND state = 'running' AND claim_token = ?
+                  AND lease_until IS NOT NULL AND lease_until > ?
+                """,
+                (request_id, claim_token, now),
+            ).fetchone()
+            if row is None:
+                return False
+            identity = (
+                f"gitlab:{row['project_id']}!{row['mr_iid']}#note-{external_note_id}"
+                if external_note_id is not None
+                else None
+            )
+            connection.execute(
+                """
+                UPDATE note_publication_requests
+                SET state = ?, external_note_id = ?, next_attempt_at = ?,
+                    lease_until = NULL, claim_token = NULL, updated_at = ?, last_error = ?,
+                    reconcile_attempts = CASE WHEN ? = 'published' THEN 0
+                                              ELSE reconcile_attempts END,
+                    reconcile_next_at = CASE WHEN ? = 'published' THEN ?
+                                             ELSE reconcile_next_at END,
+                    reconcile_lease_until = NULL, reconcile_claim_token = NULL
+                WHERE id = ?
+                """,
+                (
+                    state,
+                    external_note_id,
+                    next_attempt_at,
+                    now,
+                    self._redact(error) if error else None,
+                    state,
+                    state,
+                    reconcile_next_at,
+                    request_id,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE effect_receipts
+                SET state = ?, external_identity = ?, detail = ?, error = ?,
+                    next_attempt_at = ?, lease_until = NULL, claim_token = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    state,
+                    identity,
+                    self._redact(detail) if detail else None,
+                    self._redact(error) if error else None,
+                    next_attempt_at,
+                    now,
+                    row["receipt_id"],
+                ),
+            )
+        return True
+
+    def claim_published_note_reconciliation(
+        self,
+        *,
+        request_id: int | None = None,
+        project_id: str | None = None,
+        lease_seconds: int = DEFAULT_NOTE_PUBLICATION_LEASE_SECONDS,
+    ) -> NotePublicationRequest | None:
+        if lease_seconds <= 0:
+            raise ValueError("Note reconciliation lease must be positive")
+        now_value = datetime.now(UTC)
+        now = now_value.isoformat()
+        lease_until = (now_value + timedelta(seconds=lease_seconds)).isoformat()
+        filters = ""
+        parameters: list[object] = [now]
+        if request_id is not None:
+            filters += " AND id = ?"
+            parameters.append(request_id)
+        if project_id is not None:
+            filters += " AND project_id = ?"
+            parameters.append(project_id)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                UPDATE note_publication_requests
+                SET reconcile_lease_until = NULL, reconcile_claim_token = NULL,
+                    reconcile_next_at = ?, updated_at = ?,
+                    last_error = COALESCE(last_error, 'Note reconciliation lease expired')
+                WHERE state = 'published' AND reconcile_claim_token IS NOT NULL
+                  AND (reconcile_lease_until IS NULL OR reconcile_lease_until <= ?)
+                """,
+                (now, now, now),
+            )
+            row = connection.execute(
+                f"""
+                SELECT id FROM note_publication_requests
+                WHERE state = 'published' AND external_note_id IS NOT NULL
+                  AND reconcile_claim_token IS NULL
+                  AND (reconcile_next_at IS NULL OR reconcile_next_at <= ?)
+                  {filters}
+                ORDER BY id LIMIT 1
+                """,
+                tuple(parameters),
+            ).fetchone()
+            if row is None:
+                return None
+            token = uuid4().hex
+            updated = connection.execute(
+                """
+                UPDATE note_publication_requests
+                SET reconcile_attempts = reconcile_attempts + 1,
+                    reconcile_lease_until = ?, reconcile_claim_token = ?, updated_at = ?
+                WHERE id = ? AND state = 'published' AND reconcile_claim_token IS NULL
+                """,
+                (lease_until, token, now, row["id"]),
+            )
+            if updated.rowcount != 1:
+                return None
+            claimed = connection.execute(
+                f"SELECT {self._note_publication_columns()} "
+                "FROM note_publication_requests WHERE id = ?",
+                (row["id"],),
+            ).fetchone()
+        assert claimed is not None
+        return self._note_publication_from_row(claimed)
+
+    def finish_published_note_reconciliation(
+        self,
+        request_id: int,
+        reconcile_claim_token: str | None,
+        *,
+        state: str,
+        detail: str,
+        error: str | None = None,
+        reconcile_next_at: str | None = None,
+    ) -> bool:
+        if state not in {"published", "removed", "blocked"}:
+            raise ValueError("invalid Note reconciliation state")
+        now = datetime.now(UTC).isoformat()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT receipt_id, project_id, mr_iid, external_note_id
+                FROM note_publication_requests
+                WHERE id = ? AND state = 'published' AND reconcile_claim_token = ?
+                  AND reconcile_lease_until IS NOT NULL AND reconcile_lease_until > ?
+                """,
+                (request_id, reconcile_claim_token, now),
+            ).fetchone()
+            if row is None:
+                return False
+            connection.execute(
+                """
+                UPDATE note_publication_requests
+                SET state = ?, updated_at = ?, last_error = ?,
+                    reconcile_attempts = CASE WHEN ? IS NULL THEN 0
+                                              ELSE reconcile_attempts END,
+                    reconcile_next_at = ?, reconcile_lease_until = NULL,
+                    reconcile_claim_token = NULL
+                WHERE id = ?
+                """,
+                (
+                    state,
+                    now,
+                    self._redact(error) if error else None,
+                    error,
+                    reconcile_next_at,
+                    request_id,
+                ),
+            )
+            identity = (
+                f"gitlab:{row['project_id']}!{row['mr_iid']}#note-{row['external_note_id']}"
+            )
+            connection.execute(
+                """
+                UPDATE effect_receipts
+                SET state = ?, external_identity = ?, detail = ?, error = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    state,
+                    identity,
+                    self._redact(detail),
+                    self._redact(error) if error else None,
+                    now,
+                    row["receipt_id"],
+                ),
+            )
+        return True
 
     def update_effect_receipt(
         self,

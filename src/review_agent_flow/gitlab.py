@@ -14,6 +14,10 @@ _NOTE_MARKER_RE = re.compile(
 )
 
 
+class GitLabIdentityConflict(ValueError):
+    """Raised when a GitLab resource conflicts with the configured Bot identity."""
+
+
 def canonical_note_marker(project_id: str, mr_iid: int, sha: str) -> str:
     """Return the Program-owned Note identity for one exact ReviewKey."""
 
@@ -79,6 +83,14 @@ class Note:
     body: str
 
 
+@dataclass(frozen=True)
+class NoteMarkerLookup:
+    """Trusted Review Bot Notes that exactly or conflictingly contain one marker."""
+
+    exact: tuple[Note, ...]
+    conflicts: tuple[Note, ...]
+
+
 class NoteObserver(Protocol):
     """Capability for observing Program-owned GitLab Notes."""
 
@@ -87,6 +99,14 @@ class NoteObserver(Protocol):
     ) -> Note | None: ...
 
     def has_note_marker(self, project_id: str, mr_iid: int, marker: str) -> bool: ...
+
+    def lookup_note_marker(
+        self, project_id: str, mr_iid: int, marker: str
+    ) -> NoteMarkerLookup: ...
+
+    def get_trusted_note(
+        self, project_id: str, mr_iid: int, note_id: int
+    ) -> Note | None: ...
 
 
 @dataclass(frozen=True)
@@ -107,13 +127,21 @@ class GitLabClient(Protocol):
 
     def get_latest_pipeline(self, project_id: str, sha: str) -> Pipeline | None: ...
 
-    def create_note(self, project_id: str, mr_iid: int, body: str) -> None: ...
+    def create_note(self, project_id: str, mr_iid: int, body: str) -> Note: ...
 
     def find_note_by_marker(
         self, project_id: str, mr_iid: int, marker: str
     ) -> Note | None: ...
 
     def has_note_marker(self, project_id: str, mr_iid: int, marker: str) -> bool: ...
+
+    def lookup_note_marker(
+        self, project_id: str, mr_iid: int, marker: str
+    ) -> NoteMarkerLookup: ...
+
+    def get_trusted_note(
+        self, project_id: str, mr_iid: int, note_id: int
+    ) -> Note | None: ...
 
     def create_branch(self, project_id: str, branch: str, ref: str) -> None: ...
 

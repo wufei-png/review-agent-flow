@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from review_agent_flow.gitlab import Note, canonical_note_marker
+from review_agent_flow.gitlab import Note, NoteMarkerLookup, canonical_note_marker
 from review_agent_flow.gitlab_client import PythonGitLabClient
 
 SHA = "a" * 40
@@ -10,6 +10,12 @@ SHA = "a" * 40
 
 class ProjectId(str):
     pass
+
+
+class FakeGetError(RuntimeError):
+    def __init__(self, response_code: int) -> None:
+        super().__init__(f"GitLab HTTP {response_code}")
+        self.response_code = response_code
 
 
 class FakeNotes:
@@ -49,6 +55,12 @@ class FakeNotes:
         assert kwargs == {"get_all": True}
         return self.notes
 
+    def get(self, note_id: int) -> SimpleNamespace:
+        for note in self.notes:
+            if getattr(note, "id", None) == note_id:
+                return note
+        raise FakeGetError(404)
+
 
 class FakeMergeRequests:
     def __init__(self, notes: FakeNotes, listed: list[SimpleNamespace] | None = None) -> None:
@@ -78,8 +90,11 @@ def test_note_marker_paginates_and_requires_review_bot_author() -> None:
     marker = canonical_note_marker("42", 1, SHA)
     notes = FakeNotes(
         [
-            [SimpleNamespace(body=marker, author={"username": "alice"}) for _ in range(100)],
-            [SimpleNamespace(body=marker, author={"username": "review-bot"})],
+            [
+                SimpleNamespace(id=index + 1, body=marker, author={"username": "alice"})
+                for index in range(100)
+            ],
+            [SimpleNamespace(id=101, body=marker, author={"username": "review-bot"})],
         ]
     )
     project = SimpleNamespace(mergerequests=FakeMergeRequests(notes))
@@ -170,9 +185,53 @@ def test_python_gitlab_note_adapter_returns_and_observes_native_id() -> None:
     created = client.create_note("42", 1, "created")
     observed = client.find_note_by_marker("42", 1, marker)
 
-    assert created is None
+    assert created == Note("42", 1, 99, "created")
     assert observed == Note("42", 1, 17, f"{marker}\nFinding")
     assert notes.created_payloads == [{"body": "created"}]
+
+
+def test_python_gitlab_created_note_requires_configured_bot_author() -> None:
+    notes = FakeNotes([])
+
+    def create_as_alice(payload: dict[str, str]) -> SimpleNamespace:
+        return SimpleNamespace(
+            id=99,
+            body=payload["body"],
+            author={"username": "alice"},
+        )
+
+    notes.create = create_as_alice  # type: ignore[method-assign]
+    with pytest.raises(ValueError, match="author"):
+        _client(notes).create_note("42", 1, "created")
+
+
+def test_python_gitlab_get_trusted_note_distinguishes_404_and_author_conflict() -> None:
+    notes = FakeNotes(
+        [SimpleNamespace(id=17, body="body", author={"username": "review-bot"})]
+    )
+    client = _client(notes)
+
+    assert client.get_trusted_note("42", 1, 17) == Note("42", 1, 17, "body")
+    assert client.get_trusted_note("42", 1, 18) is None
+    notes.notes[0].author = {"username": "alice"}
+    with pytest.raises(ValueError, match="author"):
+        client.get_trusted_note("42", 1, 17)
+
+
+def test_python_gitlab_note_lookup_reports_exact_and_conflicting_bot_notes() -> None:
+    marker = canonical_note_marker("42", 1, SHA)
+    notes = FakeNotes(
+        [
+            SimpleNamespace(id=17, body=f"{marker}\nFinding"),
+            SimpleNamespace(id=18, body=f"prefix {marker}"),
+            SimpleNamespace(id=19, body=marker, author={"username": "alice"}),
+        ]
+    )
+
+    assert _client(notes).lookup_note_marker("42", 1, marker) == NoteMarkerLookup(
+        (Note("42", 1, 17, f"{marker}\nFinding"),),
+        (Note("42", 1, 18, f"prefix {marker}"),),
+    )
 
 
 @pytest.mark.parametrize(
