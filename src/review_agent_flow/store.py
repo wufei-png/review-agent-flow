@@ -20,7 +20,7 @@ DEFAULT_NOTIFICATION_LEASE_SECONDS = 30
 DEFAULT_NOTIFICATION_MAX_ATTEMPTS = 3
 DEFAULT_WORKTREE_CLEANUP_LEASE_SECONDS = 60
 DEFAULT_WORKTREE_CLEANUP_MAX_ATTEMPTS = 5
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DEFAULT_EFFECT_LEASE_SECONDS = 60
 
 
@@ -36,7 +36,6 @@ class ReviewRun:
     project_id: str
     mr_iid: int
     sha: str
-    kind: str
     status: str
     attempts: int = 0
     lease_until: str | None = None
@@ -156,7 +155,7 @@ class WorktreeRecord:
 class SQLiteStore:
     """Small SQLite store.
 
-    Version 2 is intentionally a fresh schema.  There is no production database
+    Version 3 is intentionally a fresh schema.  There is no production database
     migration contract for this pre-release implementation; an older database
     must be recreated rather than guessed into a new notification or Auto-fix
     routing model.
@@ -179,6 +178,7 @@ class SQLiteStore:
         if self._read_only:
             if not Path(self.path).is_file():
                 raise FileNotFoundError(self.path)
+            self._validate_schema_version()
         else:
             self._initialize()
 
@@ -238,6 +238,14 @@ class SQLiteStore:
             return {"status": "not_ready", "diagnostic": self._redact(exc, max_length=1000)}
         return {"status": "ok", "diagnostic": None}
 
+    def _validate_schema_version(self) -> None:
+        with self._connect() as connection:
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        if version != SCHEMA_VERSION:
+            raise RuntimeError(
+                f"unsupported SQLite schema version {version}; recreate {self.path}"
+            )
+
     def _initialize(self) -> None:
         with self._connect() as connection:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
@@ -258,7 +266,6 @@ class SQLiteStore:
                     project_id TEXT NOT NULL,
                     mr_iid INTEGER NOT NULL,
                     sha TEXT NOT NULL,
-                    kind TEXT NOT NULL DEFAULT 'normal',
                     status TEXT NOT NULL DEFAULT 'pending',
                     created_at TEXT NOT NULL,
                     finished_at TEXT,
@@ -269,7 +276,7 @@ class SQLiteStore:
                     claim_token TEXT,
                     failure_class TEXT,
                     retryable INTEGER NOT NULL DEFAULT 0,
-                    UNIQUE(project_id, mr_iid, sha, kind)
+                    UNIQUE(project_id, mr_iid, sha)
                 );
                 CREATE TABLE IF NOT EXISTS auto_fix_intents (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -366,7 +373,7 @@ class SQLiteStore:
                     last_error TEXT,
                     UNIQUE(run_id, path)
                 );
-                PRAGMA user_version = 2;
+                PRAGMA user_version = 3;
                 """
             )
 
@@ -387,7 +394,7 @@ class SQLiteStore:
     @staticmethod
     def _review_run_columns() -> str:
         return (
-            "id AS run_id, project_id, mr_iid, sha, kind, status, attempts, "
+            "id AS run_id, project_id, mr_iid, sha, status, attempts, "
             "lease_until, claim_token, failure_class, retryable, error, next_attempt_at, "
             "created_at, finished_at"
         )
@@ -421,7 +428,7 @@ class SQLiteStore:
     def _effect_from_row(row: sqlite3.Row) -> EffectReceipt:
         return EffectReceipt(**dict(row))
 
-    def enqueue(self, project_id: str, mr_iid: int, sha: str, kind: str = "normal") -> ReviewRun:
+    def enqueue(self, project_id: str, mr_iid: int, sha: str) -> ReviewRun:
         if not project_id or not str(project_id).strip():
             raise ValueError("project_id cannot be empty")
         if not is_valid_sha(sha):
@@ -430,24 +437,22 @@ class SQLiteStore:
         with self._connect() as connection:
             connection.execute(
                 """
-                INSERT INTO review_runs(
-                    project_id, mr_iid, sha, kind, created_at, next_attempt_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(project_id, mr_iid, sha, kind) DO NOTHING
+                INSERT INTO review_runs(project_id, mr_iid, sha, created_at, next_attempt_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, mr_iid, sha) DO NOTHING
                 """,
-                (project_id, mr_iid, sha, kind, created_at, created_at),
+                (project_id, mr_iid, sha, created_at, created_at),
             )
             row = connection.execute(
                 f"SELECT {self._review_run_columns()} FROM review_runs "
-                "WHERE project_id = ? AND mr_iid = ? AND sha = ? AND kind = ?",
-                (project_id, mr_iid, sha, kind),
+                "WHERE project_id = ? AND mr_iid = ? AND sha = ?",
+                (project_id, mr_iid, sha),
             ).fetchone()
         assert row is not None
         return self._review_run_from_row(row)
 
     def wake_run(self, project_id: str, mr_iid: int, sha: str) -> ReviewRun | None:
-        """Make a deferred normal Run immediately eligible after a green Pipeline."""
+        """Make a deferred Review Run immediately eligible after a green Pipeline."""
 
         now = self._now().isoformat()
         with self._connect() as connection:
@@ -455,14 +460,13 @@ class SQLiteStore:
                 """
                 UPDATE review_runs
                 SET next_attempt_at = ?, error = NULL
-                WHERE project_id = ? AND mr_iid = ? AND sha = ?
-                  AND kind = 'normal' AND status = 'pending'
+                WHERE project_id = ? AND mr_iid = ? AND sha = ? AND status = 'pending'
                 """,
                 (now, project_id, mr_iid, sha),
             )
             row = connection.execute(
                 f"SELECT {self._review_run_columns()} FROM review_runs "
-                "WHERE project_id = ? AND mr_iid = ? AND sha = ? AND kind = 'normal'",
+                "WHERE project_id = ? AND mr_iid = ? AND sha = ?",
                 (project_id, mr_iid, sha),
             ).fetchone()
         return self._review_run_from_row(row) if row is not None else None
@@ -531,7 +535,6 @@ class SQLiteStore:
             "project_id": run.project_id,
             "mr_iid": run.mr_iid,
             "sha": run.sha,
-            "kind": run.kind,
             "status": run.status,
             "attempt": run.attempts,
             "attempts": run.attempts,
@@ -1228,7 +1231,6 @@ class SQLiteStore:
         project_id: str,
         mr_iid: int,
         sha: str,
-        kind: str,
         reason: str,
         claim_token: str | None = None,
         failure_class: str | None = None,
@@ -1280,17 +1282,16 @@ class SQLiteStore:
 
             connection.execute(
                 """
-                INSERT INTO review_runs(
-                    project_id, mr_iid, sha, kind, created_at, next_attempt_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(project_id, mr_iid, sha, kind) DO NOTHING
+                INSERT INTO review_runs(project_id, mr_iid, sha, created_at, next_attempt_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, mr_iid, sha) DO NOTHING
                 """,
-                (project_id, mr_iid, sha, kind, created_at, created_at),
+                (project_id, mr_iid, sha, created_at, created_at),
             )
             row = connection.execute(
                 f"SELECT {self._review_run_columns()} FROM review_runs "
-                "WHERE project_id = ? AND mr_iid = ? AND sha = ? AND kind = ?",
-                (project_id, mr_iid, sha, kind),
+                "WHERE project_id = ? AND mr_iid = ? AND sha = ?",
+                (project_id, mr_iid, sha),
             ).fetchone()
         assert row is not None
         return self._review_run_from_row(row)

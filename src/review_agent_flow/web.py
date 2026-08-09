@@ -492,17 +492,20 @@ def create_app(
                     kind=decision.kind,
                 )
                 continue
-            kind = "autofix" if match is not None else "normal"
-            run = store.enqueue(
-                decision.project_id,
-                decision.mr_iid,
-                decision.sha,
-                kind,
-            )
+            if match is not None:
+                responses.append(
+                    {
+                        "accepted": True,
+                        "kind": "autofix",
+                        "status": "review run not created",
+                    }
+                )
+                continue
+            run = store.enqueue(decision.project_id, decision.mr_iid, decision.sha)
             responses.append(
                 {
                     "accepted": True,
-                    "kind": kind,
+                    "kind": "normal",
                     "run_id": run.run_id,
                     "status": run.status,
                 }
@@ -517,7 +520,7 @@ def create_app(
                 mr_iid=run.mr_iid,
                 run_id=run.run_id,
                 gitlab_event=x_gitlab_event or "unknown",
-                kind=run.kind,
+                kind="normal",
             )
         if len(responses) == 1:
             return responses[0]

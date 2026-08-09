@@ -5,6 +5,8 @@ import pytest
 from review_agent_flow.gitlab import Note, canonical_note_marker
 from review_agent_flow.gitlab_client import PythonGitLabClient
 
+SHA = "a" * 40
+
 
 class ProjectId(str):
     pass
@@ -73,7 +75,7 @@ def _client(value: FakeNotes | SimpleNamespace, username: str | None = "review-b
 
 
 def test_note_marker_paginates_and_requires_review_bot_author() -> None:
-    marker = canonical_note_marker(1)
+    marker = canonical_note_marker("42", 1, SHA)
     notes = FakeNotes(
         [
             [SimpleNamespace(body=marker, author={"username": "alice"}) for _ in range(100)],
@@ -87,7 +89,7 @@ def test_note_marker_paginates_and_requires_review_bot_author() -> None:
 
 
 def test_note_marker_is_not_trusted_without_review_bot_username() -> None:
-    marker = canonical_note_marker(1)
+    marker = canonical_note_marker("42", 1, SHA)
     notes = FakeNotes([[SimpleNamespace(body=marker, author={"username": "review-bot"})]])
     project = SimpleNamespace(mergerequests=FakeMergeRequests(notes))
 
@@ -96,7 +98,7 @@ def test_note_marker_is_not_trusted_without_review_bot_username() -> None:
 
 
 def test_note_marker_requires_one_standalone_canonical_line() -> None:
-    marker = canonical_note_marker(1)
+    marker = canonical_note_marker("42", 1, SHA)
     notes = FakeNotes(
         [[
             SimpleNamespace(body=f"prefix {marker}"),
@@ -106,6 +108,29 @@ def test_note_marker_requires_one_standalone_canonical_line() -> None:
     project = SimpleNamespace(mergerequests=FakeMergeRequests(notes))
 
     assert _client(project).has_note_marker("42", 1, marker) is False
+
+
+def test_canonical_note_marker_uses_only_the_review_key() -> None:
+    assert canonical_note_marker("42", 7, SHA) == (
+        f"<!-- reviewflow:v1;project=42;mr=7;sha={SHA};effect=note -->"
+    )
+
+
+@pytest.mark.parametrize(
+    ("project_id", "mr_iid", "sha"),
+    [
+        ("", 1, SHA),
+        ("42;effect=autofix", 1, SHA),
+        ("42", True, SHA),
+        ("42", 0, SHA),
+        ("42", 1, "short"),
+    ],
+)
+def test_canonical_note_marker_rejects_noncanonical_review_keys(
+    project_id: object, mr_iid: object, sha: object
+) -> None:
+    with pytest.raises(ValueError):
+        canonical_note_marker(project_id, mr_iid, sha)  # type: ignore[arg-type]
 
 
 def test_auto_fix_lookup_skips_old_same_branch_mr_without_current_marker() -> None:
@@ -138,7 +163,7 @@ def test_auto_fix_lookup_skips_old_same_branch_mr_without_current_marker() -> No
 
 
 def test_python_gitlab_note_adapter_returns_and_observes_native_id() -> None:
-    marker = canonical_note_marker(7)
+    marker = canonical_note_marker("42", 1, SHA)
     notes = FakeNotes([SimpleNamespace(id=17, body=f"{marker}\nFinding")])
     client = _client(notes)
 
@@ -155,13 +180,13 @@ def test_python_gitlab_note_adapter_returns_and_observes_native_id() -> None:
     ["", "prefix {marker}", "{marker} suffix", "{marker}\n{marker}"],
 )
 def test_python_gitlab_note_observer_requires_one_exact_marker_line(body: str) -> None:
-    marker = canonical_note_marker(7)
+    marker = canonical_note_marker("42", 1, SHA)
     notes = FakeNotes([SimpleNamespace(id=17, body=body.format(marker=marker))])
     assert _client(notes).find_note_by_marker("42", 1, marker) is None
 
 
 def test_python_gitlab_note_observer_rejects_multiple_exact_matches() -> None:
-    marker = canonical_note_marker(7)
+    marker = canonical_note_marker("42", 1, SHA)
     notes = FakeNotes(
         [
             SimpleNamespace(id=17, body=marker),
@@ -173,34 +198,34 @@ def test_python_gitlab_note_observer_rejects_multiple_exact_matches() -> None:
 
 @pytest.mark.parametrize("project_id", ["", "   ", True, 1.0, ProjectId("42")])
 def test_python_gitlab_note_observer_rejects_invalid_project_id_types(project_id: object) -> None:
-    marker = canonical_note_marker(7)
+    marker = canonical_note_marker("42", 1, SHA)
     notes = FakeNotes([SimpleNamespace(id=17, body=marker)])
     assert _client(notes).find_note_by_marker(project_id, 1, marker) is None  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize("mr_iid", [True, 1.0, "1", ProjectId("1"), 0, -1])
 def test_python_gitlab_note_observer_rejects_invalid_mr_iid_types(mr_iid: object) -> None:
-    marker = canonical_note_marker(7)
+    marker = canonical_note_marker("42", 1, SHA)
     notes = FakeNotes([SimpleNamespace(id=17, body=marker)])
     assert _client(notes).find_note_by_marker("42", mr_iid, marker) is None  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize("project_id", ["", "   ", True, 1.0, ProjectId("42")])
 def test_python_gitlab_note_resource_rejects_invalid_project_id_types(project_id: object) -> None:
-    marker = canonical_note_marker(7)
+    marker = canonical_note_marker("42", 1, SHA)
     resource = SimpleNamespace(id=17, body=marker)
     assert PythonGitLabClient._note_from_resource(project_id, 1, resource) is None  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize("mr_iid", [True, 1.0, "1", ProjectId("1"), 0, -1])
 def test_python_gitlab_note_resource_rejects_invalid_mr_iid_types(mr_iid: object) -> None:
-    marker = canonical_note_marker(7)
+    marker = canonical_note_marker("42", 1, SHA)
     resource = SimpleNamespace(id=17, body=marker)
     assert PythonGitLabClient._note_from_resource("42", mr_iid, resource) is None  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize("native_id", [None, 0, -1, True, 1.0, "1"])
 def test_python_gitlab_note_observer_rejects_non_positive_integer_ids(native_id: object) -> None:
-    marker = canonical_note_marker(7)
+    marker = canonical_note_marker("42", 1, SHA)
     notes = FakeNotes([SimpleNamespace(id=native_id, body=marker)])
     assert _client(notes).find_note_by_marker("42", 1, marker) is None

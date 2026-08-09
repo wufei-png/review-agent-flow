@@ -26,6 +26,33 @@ def test_enqueue_is_idempotent_and_claimable(tmp_path) -> None:
     assert store.claim_next() is None
 
 
+def test_review_run_schema_and_status_have_no_kind_discriminator(tmp_path) -> None:
+    database = tmp_path / "review.db"
+    store = SQLiteStore(database)
+    run = store.enqueue("42", 1, SHA)
+
+    with sqlite3.connect(database) as connection:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(review_runs)").fetchall()
+        }
+
+    assert "kind" not in columns
+    assert "kind" not in store.get_project_bound_review_run_status("42", run.run_id)
+
+
+@pytest.mark.parametrize("read_only", [False, True])
+def test_legacy_schema_is_rejected_for_writable_and_read_only_access(
+    tmp_path, read_only: bool
+) -> None:
+    database = tmp_path / f"legacy-{read_only}.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE legacy_record(id INTEGER PRIMARY KEY)")
+        connection.execute("PRAGMA user_version = 2")
+
+    with pytest.raises(RuntimeError, match="unsupported SQLite schema version 2"):
+        SQLiteStore(database, read_only=read_only)
+
+
 def test_deferred_run_does_not_block_a_later_run(tmp_path) -> None:
     store = SQLiteStore(tmp_path / "review.db")
     first = store.enqueue("42", 1, OLD_SHA)

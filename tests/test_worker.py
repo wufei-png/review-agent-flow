@@ -15,7 +15,7 @@ from review_agent_flow.gitlab import (
 from review_agent_flow.notifications import FanoutNotifier, NotificationEvent, NotificationResult
 from review_agent_flow.policy import AIPolicy, HumanPolicy, ReviewPolicy
 from review_agent_flow.runner import AgentResult
-from review_agent_flow.store import SQLiteStore
+from review_agent_flow.store import SQLiteStore, auto_fix_intent_marker
 from review_agent_flow.worker import ReviewWorker
 from review_agent_flow.worktree import GitWorktreeManager, WorktreeError
 
@@ -123,15 +123,6 @@ class EventualAutoFixGitLab(FakeGitLab):
     ) -> CreatedMergeRequest | None:
         self.find_calls += 1
         return self.auto_fix
-
-
-class AutoFixNotificationGitLab(FakeGitLab):
-    def __init__(self, parent: MergeRequest, auto_fix: MergeRequest) -> None:
-        super().__init__(auto_fix)
-        self.parent = parent
-
-    def get_merge_request(self, project_id: str, mr_iid: int) -> MergeRequest:
-        return self.parent if mr_iid == self.parent.iid else self.mr
 
 
 class RecordingNotifier(FanoutNotifier):
@@ -250,7 +241,7 @@ def test_agent_note_receipt_observes_native_id_without_equating_agent_success_to
 
     assert result is not None and result.status == "succeeded"
     assert result.agent_result is not None
-    marker = canonical_note_marker(run.run_id)
+    marker = canonical_note_marker(run.project_id, run.mr_iid, run.sha)
     assert result.agent_result.stdout.strip() == marker
     assert gitlab.note_markers == [marker]
     note_receipt = store.list_effect_receipts(run.run_id, "note_expected")[0]
@@ -259,18 +250,18 @@ def test_agent_note_receipt_observes_native_id_without_equating_agent_success_to
     assert store.list_effect_receipts(run.run_id, "agent_execution")[0].state == "succeeded"
 
 
-def test_note_marker_observation_reuses_historical_receipt_key(tmp_path: Path) -> None:
+def test_note_marker_observation_uses_review_key_receipt_key(tmp_path: Path) -> None:
     repository = tmp_path / "repo"
     repository.mkdir()
     sha = _git_repository(repository)
     mr = MergeRequest("42", 1, "Stable Note receipt key", "alice", "feature", "main", sha, "https://mr")
     store = SQLiteStore(tmp_path / "review.db")
     run = store.enqueue("42", 1, sha)
-    historical_key = f"review-run:{run.run_id}:note"
+    marker = canonical_note_marker(run.project_id, run.mr_iid, run.sha)
     existing = store.create_effect_receipt(
         run.run_id,
         "note_expected",
-        historical_key,
+        marker,
         state="planned",
     )
     gitlab = ObservedNoteGitLab(mr)
@@ -299,9 +290,9 @@ def test_note_marker_observation_reuses_historical_receipt_key(tmp_path: Path) -
     receipts = store.list_effect_receipts(run.run_id, "note_expected")
     assert len(receipts) == 1
     assert receipts[0].receipt_id == existing.receipt_id
-    assert receipts[0].dedupe_key == historical_key
+    assert receipts[0].dedupe_key == marker
     assert receipts[0].state == "observed"
-    assert gitlab.note_markers == [canonical_note_marker(run.run_id)]
+    assert gitlab.note_markers == [marker]
 
 
 @pytest.mark.parametrize(
@@ -510,7 +501,9 @@ def test_worker_retries_agent_for_auto_fix_when_only_note_exists(tmp_path: Path)
     assert result is not None and result.status == "succeeded"
     assert result.agent_result is not None
     assert result.agent_result.stdout.strip() == "recovered"
-    assert gitlab.note_markers == [canonical_note_marker(run.run_id)]
+    assert gitlab.note_markers == [
+        canonical_note_marker(run.project_id, run.mr_iid, run.sha)
+    ]
     intent = store.get_auto_fix_intent(run.run_id)
     assert intent is not None and intent.status == "created"
 
@@ -1569,70 +1562,32 @@ def test_reconciliation_rejects_mismatched_autofix_identity(
     assert relation_count == 0
 
 
-def test_autofix_run_rejects_wrong_branch_run_id(tmp_path: Path) -> None:
-    repository = tmp_path / "repo"
-    repository.mkdir()
-    sha = "a" * 40
-    auto_fix = MergeRequest(
-        "42",
-        9,
-        "Auto-fix notification",
-        "alice",
-        "autofix/MR-1/run-999",
-        "feature",
-        sha,
-        "https://mr",
-    )
-    store = SQLiteStore(tmp_path / "review.db")
-    run = store.enqueue("42", 9, sha, kind="autofix")
-    worker = ReviewWorker(
-        store,
-        FakeGitLab(auto_fix),
-        GitWorktreeManager(repository, tmp_path / "worktrees"),
-        ReviewPolicy(),
-        repository,
-        "https://gitlab",
-        project_id="42",
-    )
-
-    result = worker.process_one()
-
-    assert result is not None and result.status == "failed"
-    assert store.get_review_run(run.run_id).failure_class == "autofix_identity"
-    identity_receipt = store.list_effect_receipts(run.run_id, "autofix_identity")[0]
-    assert identity_receipt.state == "failed"
-    with sqlite3.connect(tmp_path / "review.db") as connection:
-        assert connection.execute("SELECT COUNT(*) FROM auto_fix_mrs").fetchone()[0] == 0
-
-
-def test_autofix_child_uses_persisted_parent_run_id_for_identity(tmp_path: Path) -> None:
+def test_known_autofix_child_pending_run_is_cancelled_before_effects(tmp_path: Path) -> None:
     repository = tmp_path / "repo"
     repository.mkdir()
     parent_sha = "a" * 40
     child_sha = "b" * 40
-    parent = MergeRequest(
-        "42", 1, "Parent", "alice", "feature", "main", parent_sha, "https://parent"
-    )
-    auto_fix = MergeRequest(
-        "42",
-        9,
-        "Auto-fix",
-        "review-bot",
-        "autofix/MR-1/run-1",
-        "feature",
-        child_sha,
-        "https://auto-fix",
-    )
     store = SQLiteStore(tmp_path / "review.db")
     parent_run = store.enqueue("42", 1, parent_sha)
     claimed_parent = store.claim_next(project_id="42")
     assert claimed_parent is not None
     assert store.finish(parent_run.run_id, "succeeded", claim_token=claimed_parent.claim_token)
     store.record_auto_fix("42", 1, parent_sha, parent_run.run_id, "42", 9)
-    child_run = store.enqueue("42", 9, child_sha, kind="autofix")
+    child_run = store.enqueue("42", 9, child_sha)
+    child = MergeRequest(
+        "42",
+        9,
+        "Auto-fix child",
+        "review-bot",
+        "autofix/MR-1/run-1",
+        "feature",
+        child_sha,
+        "https://auto-fix",
+        description=auto_fix_intent_marker(parent_run.run_id, parent_sha),
+    )
     worker = ReviewWorker(
         store,
-        AutoFixNotificationGitLab(parent, auto_fix),
+        FakeGitLab(child),
         GitWorktreeManager(repository, tmp_path / "worktrees"),
         ReviewPolicy(),
         repository,
@@ -1643,9 +1598,10 @@ def test_autofix_child_uses_persisted_parent_run_id_for_identity(tmp_path: Path)
     result = worker.process_one()
 
     assert result is not None and result.run_id == child_run.run_id
-    assert result.status == "succeeded"
-    saved = store.get_review_run(child_run.run_id)
-    assert saved is not None and saved.status == "succeeded"
+    assert result.status == "cancelled"
+    assert store.list_effect_receipts(child_run.run_id) == ()
+    with sqlite3.connect(tmp_path / "review.db") as connection:
+        assert connection.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0] == 0
 
 
 def test_closed_autofix_is_reconciled_without_parent_sha_suppression(tmp_path: Path) -> None:

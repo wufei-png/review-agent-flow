@@ -61,11 +61,11 @@ def test_runner_exposes_side_effect_idempotency_context(tmp_path: Path) -> None:
             tmp_path,
             auto_fix_target_branch="feature/source",
             auto_fix_marker="ReviewFlow-Auto-Fix-Run-ID:11 SHA:" + SHA,
-            note_marker=canonical_note_marker(11),
+            note_marker=canonical_note_marker("42", 7, SHA),
         )
     )
     assert result.stdout.splitlines() == [
-        canonical_note_marker(11),
+        canonical_note_marker("42", 7, SHA),
         "feature/source",
         "ReviewFlow-Auto-Fix-Run-ID:11 SHA:" + SHA,
     ]

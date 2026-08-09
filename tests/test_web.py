@@ -127,6 +127,8 @@ def test_auto_fix_intent_requires_description_marker(tmp_path) -> None:
 
     assert unmarked.json()["kind"] == "normal"
     assert marked.json()["kind"] == "autofix"
+    assert marked.json()["status"] == "review run not created"
+    assert "run_id" not in marked.json()
 
 
 def test_pipeline_hook_wakes_existing_deferred_run(tmp_path) -> None:

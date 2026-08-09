@@ -142,7 +142,7 @@ class ReviewWorker:
 
     @staticmethod
     def _agent_note_marker(run: ReviewRun) -> str:
-        return canonical_note_marker(run.run_id)
+        return canonical_note_marker(run.project_id, run.mr_iid, run.sha)
 
     def _require_active_lease(self, run: ReviewRun, detail: str) -> None:
         if not self.store.has_active_lease(run.run_id, run.claim_token):
@@ -258,6 +258,19 @@ class ReviewWorker:
                     return self._lease_recovery_result(run, detail)
                 return WorkerResult(run.run_id, "cancelled", detail=detail)
 
+            auto_fix_match = self.store.resolve_auto_fix_match(
+                run.project_id,
+                run.mr_iid,
+                merge_request.source_branch,
+                merge_request.target_branch,
+                merge_request.description,
+            )
+            if auto_fix_match is not None:
+                detail = "known Auto-fix child does not create or execute a Review Run"
+                if not self._finish_terminal(run, "cancelled", detail, "autofix_child"):
+                    return self._lease_recovery_result(run, detail)
+                return WorkerResult(run.run_id, "cancelled", detail=detail)
+
             if merge_request.sha != run.sha:
                 detail = f"stale run SHA; current Merge Request head is {merge_request.sha}"
                 current_run = self.store.cancel_and_enqueue_latest(
@@ -265,7 +278,6 @@ class ReviewWorker:
                     project_id=run.project_id,
                     mr_iid=run.mr_iid,
                     sha=merge_request.sha,
-                    kind=run.kind,
                     reason=detail,
                     claim_token=run.claim_token,
                     failure_class="stale_sha",
@@ -292,43 +304,6 @@ class ReviewWorker:
                     return self._lease_recovery_result(run, "Review Run lease lost before draft requeue")
                 self._log_run(run, status="deferred", diagnostic="draft merge request")
                 return WorkerResult(run.run_id, "deferred", detail="draft merge request")
-            auto_fix_match = self.store.resolve_auto_fix_match(
-                run.project_id,
-                run.mr_iid,
-                merge_request.source_branch,
-                merge_request.target_branch,
-                merge_request.description,
-            )
-            if run.kind == "autofix" or auto_fix_match is not None:
-                if auto_fix_match is None:
-                    return self._reject_autofix_run(
-                        run, "untrusted Auto-fix Run has no persisted relation"
-                    )
-                parent_merge_request = self.gitlab.get_merge_request(
-                    auto_fix_match.parent_project_id,
-                    auto_fix_match.parent_mr_iid,
-                )
-                identity_error = self.auto_fix_reconciler.validate_identity(
-                    run,
-                    parent_merge_request,
-                    merge_request,
-                    parent_mr_iid=auto_fix_match.parent_mr_iid,
-                    expected_run_id=auto_fix_match.run_id,
-                    expected_branch=(
-                        f"autofix/MR-{auto_fix_match.parent_mr_iid}/run-{auto_fix_match.run_id}"
-                    ),
-                )
-                if identity_error is not None:
-                    return self._reject_autofix_run(run, identity_error)
-                self._require_active_lease(run, "Review Run lease lost before Auto-fix notification")
-                self._notify_autofix(run, parent_merge_request, merge_request)
-                if not self.store.finish(run.run_id, "succeeded", claim_token=run.claim_token):
-                    return self._lease_recovery_result(
-                        run, "Review Run lease lost before Auto-fix notification completion"
-                    )
-                self._log_run(run, status="succeeded", diagnostic="auto-fix MR notification")
-                return WorkerResult(run.run_id, "succeeded", detail="auto-fix MR notification")
-
             if self.policy.pipeline_gate:
                 pipeline = self.gitlab.get_latest_pipeline(run.project_id, run.sha)
                 if pipeline is None or pipeline.status != "success":
@@ -731,10 +706,10 @@ class ReviewWorker:
             receipts["note_expected"] = self.store.create_effect_receipt(
                 run.run_id,
                 "note_expected",
-                f"review-run:{run.run_id}:note",
-                attempt=attempt,
+                self._agent_note_marker(run),
+                attempt=1,
                 state="planned",
-                detail="Agent-owned GitLab Note; observation uses the deterministic run marker",
+                detail="GitLab Note identity uses the exact ReviewKey marker",
             )
             if self.policy.ai.auto_fix:
                 branch = f"autofix/MR-{merge_request.iid}/run-{run.run_id}"
@@ -858,20 +833,6 @@ class ReviewWorker:
             run.claim_token,
             lease_seconds=self.lease_seconds,
         )
-
-    def _reject_autofix_run(self, run: ReviewRun, detail: str) -> WorkerResult:
-        self.store.create_effect_receipt(
-            run.run_id,
-            "autofix_identity",
-            f"review-run:{run.run_id}:autofix-identity",
-            attempt=max(run.attempts, 1),
-            state="failed",
-            detail="Auto-fix identity validation failed",
-            error=detail,
-        )
-        if not self._finish_terminal(run, "failed", detail, "autofix_identity"):
-            return self._lease_recovery_result(run, detail)
-        return WorkerResult(run.run_id, "failed", detail=detail)
 
     def reconcile_auto_fixes(self, limit: int = 1) -> WorkerResult | None:
         results = self.auto_fix_reconciler.process(limit=limit)
