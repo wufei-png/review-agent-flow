@@ -18,7 +18,7 @@ Note、Auto-fix MR 和通知。
 | Area | Decision |
 | --- | --- |
 | ReviewKey | `Project + 父 MR IID + 精确 SHA`；不含 `kind` |
-| Policy | 目标分支 Project Policy v4 按 Run 冻结；Operator v2 授权 Backend/Profile、通知和 Publisher |
+| Policy | 目标分支 Project Policy v4 按 Run 冻结；Operator v3 授权 Backend/Profile、通知、Publisher 和 Retention |
 | Review mode | v0.1 只有 Notify-only；不写 GitLab Approval |
 | Human/AI | 独立开关；AI 和 Auto-fix 默认关闭 |
 | Agent result | 受控 Result Path 中的严格 v1 JSON；stdout/stderr 只是诊断 |
@@ -32,7 +32,7 @@ Note、Auto-fix MR 和通知。
 | Recovery | Store 丢失后只有带理由和审计的本地 Operator CLI |
 | Outcome | Run Lifecycle 稳定；Review Outcome 随用户可见效果与通知变化 |
 | Trust | linked worktree 是 Trusted Workspace，非 sandbox；隔离由 Backend Profile/Operator 负责 |
-| Runtime | 一个受监管 Worker OS 进程，内部三个独立循环，SQLite claim/lease |
+| Runtime | 一个受监管 Worker OS 进程，内部三个独立循环；Retention 定时扫描属于 Reconciliation/Cleanup 循环；SQLite claim/lease |
 
 ## Explicit non-goals for v0.1
 
@@ -40,5 +40,5 @@ Note、Auto-fix MR 和通知。
 - Enforce/Approval Requirement、AI approval、AI blocking 或直接 merge
 - Agent 凭据隔离的通用 OS sandbox 实现
 - fork/cross-Project Auto-fix publication
-- 旧 Policy v1-v3、Operator v1、Run-ID marker 或 SQLite schema 迁移
+- 旧 Policy v1-v3、Operator v1-v2、Run-ID marker 或 SQLite schema 迁移
 - 独立 Dispatcher/Reconciler OS 进程、Redis 或 Postgres

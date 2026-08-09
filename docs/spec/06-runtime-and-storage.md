@@ -11,12 +11,12 @@ FastAPI API -------- SQLite Store
                            |
                  supervised Worker process
                     |       |       |
-                    |       |       +-- Reconciliation/Cleanup loop
+                    |       |       +-- Reconciliation/Cleanup loop (+ Retention sweep)
                     |       +---------- Notification loop
                     +------------------ Review/Publication loop
 ```
 
-The API acknowledges Webhooks quickly. One supervised Worker OS process runs three independent loops: Review/Publication, Notification and Reconciliation/Cleanup. Each loop isolates per-item errors and uses independent claims/backoff so a stuck notification does not block reviews. Unexpected death of any loop terminates the Worker process; the process supervisor restarts the whole Worker. The Agent remains a child process. Separate Dispatcher/Reconciler OS processes are deferred until operational evidence requires them.
+The API acknowledges Webhooks quickly. One supervised Worker OS process runs three independent loops: Review/Publication, Notification and Reconciliation/Cleanup. The third loop also runs the startup/hourly Retention sweep. Each loop isolates per-item errors and uses independent claims/backoff so a stuck notification does not block reviews. Unexpected death of any loop terminates the Worker process; the process supervisor restarts the whole Worker. The Agent remains a child process. Separate Dispatcher/Reconciler OS processes are deferred until operational evidence requires them.
 
 ## Review Run and effect lifecycle
 

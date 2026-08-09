@@ -275,6 +275,30 @@ def test_cli_routes_separate_notification_resend(monkeypatch) -> None:
     assert captured["args"].reason == "resend approved"
 
 
+def test_notification_resend_requires_frozen_policy_authority(
+    monkeypatch, tmp_path: Path
+) -> None:
+    store = SimpleNamespace(
+        get_program_auto_fix_relation_by_child=lambda project_id, mr_iid: SimpleNamespace(
+            run_id=7
+        ),
+        get_policy_snapshot=lambda run_id: None,
+    )
+    monkeypatch.setattr(
+        cli,
+        "_recovery_service",
+        lambda args: SimpleNamespace(store=store),
+    )
+    args = SimpleNamespace(
+        project_id="42",
+        operator_config=str(tmp_path / "operator.yml"),
+        child_mr_iid=9,
+    )
+
+    with pytest.raises(SystemExit, match="frozen Policy Snapshot"):
+        cli._run_resend_auto_fix_notification(args)
+
+
 def test_cli_routes_operator_plan_transitions(monkeypatch) -> None:
     captured = []
 

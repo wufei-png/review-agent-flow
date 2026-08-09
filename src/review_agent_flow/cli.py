@@ -240,25 +240,17 @@ def _run_resend_auto_fix_notification(args: argparse.Namespace) -> int:
     operator_path = Path(
         _required(args.operator_config, "REVIEW_AGENT_FLOW_OPERATOR_CONFIG")
     ).expanduser().resolve()
+    relation = service.store.get_program_auto_fix_relation_by_child(
+        project_id, args.child_mr_iid
+    )
+    if relation is None:
+        raise SystemExit("Auto-fix Relation was not found")
+    snapshot = service.store.get_policy_snapshot(relation.run_id)
+    if snapshot is None:
+        raise SystemExit("notification resend requires the frozen Policy Snapshot")
     try:
         operator_config = load_operator_config(operator_path)
-        relation = service.store.get_program_auto_fix_relation_by_child(
-            project_id, args.child_mr_iid
-        )
-        snapshot = (
-            service.store.get_policy_snapshot(relation.run_id)
-            if relation is not None
-            else None
-        )
-        channel_ids = (
-            policy_from_json(snapshot.policy_json).notifications.channels
-            if snapshot is not None
-            else tuple(
-                channel_id
-                for channel_id, channel in operator_config.notification_channels.items()
-                if project_id in channel.allowed_projects
-            )
-        )
+        channel_ids = policy_from_json(snapshot.policy_json).notifications.channels
         resolved = resolve_notification_channels(operator_config, channel_ids, project_id)
     except OperatorConfigError as exc:
         raise SystemExit(f"invalid Operator configuration: {exc}") from exc

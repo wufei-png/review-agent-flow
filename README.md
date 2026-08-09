@@ -28,8 +28,8 @@ GitLab Note、Auto-fix MR 和通知。
 - Store 丢失后只能由本地 Operator CLI 显式、完整校验并审计地恢复。
 - Run Lifecycle 与 Review Outcome 分离；进程成功不代表用户已看到结果。
 - v0.1 使用一个受 supervisor 管理的 Worker OS 进程，内含独立
-  Review/Publication、Notification、Reconciliation/Cleanup 和 Retention
-  循环；Webhook API 是独立 OS 进程。
+  Review/Publication、Notification 和 Reconciliation/Cleanup 三个循环；
+  Retention 定时扫描属于第三个循环；Webhook API 是独立 OS 进程。
 
 完整规格见 [docs/spec/README.md](docs/spec/README.md)，领域语言见
 [CONTEXT.md](CONTEXT.md)，当前代码与目标的差距见
