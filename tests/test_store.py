@@ -3,7 +3,7 @@ import sqlite3
 import pytest
 
 from review_agent_flow.autofix_planner import canonical_json
-from review_agent_flow.store import SQLiteStore, auto_fix_intent_marker
+from review_agent_flow.store import SQLiteStore
 
 SHA = "a" * 40
 OLD_SHA = "b" * 40
@@ -39,6 +39,28 @@ def test_review_run_schema_and_status_have_no_kind_discriminator(tmp_path) -> No
 
     assert "kind" not in columns
     assert "kind" not in store.get_project_bound_review_run_status("42", run.run_id)
+
+
+def test_fresh_schema_has_no_agent_owned_autofix_tables(tmp_path) -> None:
+    database = tmp_path / "review.db"
+    SQLiteStore(database)
+
+    with sqlite3.connect(database) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+
+    assert {"auto_fix_intents", "auto_fix_mrs", "auto_fix_merge_events"}.isdisjoint(
+        tables
+    )
+    assert {
+        "auto_fix_publication_intents",
+        "auto_fix_publication_plans",
+        "auto_fix_relations",
+    } <= tables
 
 
 @pytest.mark.parametrize("read_only", [False, True])
@@ -163,14 +185,14 @@ def test_effect_receipt_claim_reclaim_is_project_scoped(tmp_path) -> None:
     assert store.finish(project_a_run.run_id, "succeeded", claim_token=claimed_a.claim_token)
     project_a_receipt = store.create_effect_receipt(
         project_a_run.run_id,
-        "autofix_reconciliation",
-        "autofix/MR-1/run-1",
+        "test_effect",
+        "effect-1",
         state="pending",
     )
     project_b_receipt = store.create_effect_receipt(
         project_b_run.run_id,
-        "autofix_reconciliation",
-        "autofix/MR-1/run-2",
+        "test_effect",
+        "effect-2",
         state="running",
     )
     with sqlite3.connect(database) as connection:
@@ -184,7 +206,7 @@ def test_effect_receipt_claim_reclaim_is_project_scoped(tmp_path) -> None:
         )
 
     claimed = store.claim_pending_effect_receipts(
-        "autofix_reconciliation",
+        "test_effect",
         project_id="A",
     )
 
@@ -198,25 +220,6 @@ def test_effect_receipt_claim_reclaim_is_project_scoped(tmp_path) -> None:
     assert row == ("running", "project-b-token")
 
 
-def test_autofix_reconciliation_waits_for_terminal_parent_run(tmp_path) -> None:
-    store = SQLiteStore(tmp_path / "review.db")
-    run = store.enqueue("42", 1, SHA)
-    receipt = store.create_effect_receipt(
-        run.run_id,
-        "autofix_reconciliation",
-        "autofix/MR-1/run-1",
-        state="pending",
-    )
-
-    assert store.claim_pending_effect_receipts("autofix_reconciliation", project_id="42") == ()
-    claimed_run = store.claim_next(project_id="42")
-    assert claimed_run is not None
-    assert store.finish(run.run_id, "succeeded", claim_token=claimed_run.claim_token)
-    claimed_receipts = store.claim_pending_effect_receipts(
-        "autofix_reconciliation", project_id="42"
-    )
-    assert [item.receipt_id for item in claimed_receipts] == [receipt.receipt_id]
-
 
 def test_effect_receipt_crash_reclaim_stops_at_max_attempts(tmp_path) -> None:
     database = tmp_path / "review.db"
@@ -227,13 +230,13 @@ def test_effect_receipt_crash_reclaim_stops_at_max_attempts(tmp_path) -> None:
     assert store.finish(run.run_id, "succeeded", claim_token=claimed_run.claim_token)
     receipt = store.create_effect_receipt(
         run.run_id,
-        "autofix_reconciliation",
-        "autofix/MR-1/run-1",
+        "test_effect",
+        "effect-1",
         state="pending",
     )
 
     first_claim = store.claim_pending_effect_receipts(
-        "autofix_reconciliation", max_attempts=3, project_id="42"
+        "test_effect", max_attempts=3, project_id="42"
     )
     assert len(first_claim) == 1
     assert first_claim[0].attempt == 2
@@ -245,7 +248,7 @@ def test_effect_receipt_crash_reclaim_stops_at_max_attempts(tmp_path) -> None:
         )
 
     second_claim = store.claim_pending_effect_receipts(
-        "autofix_reconciliation", max_attempts=3, project_id="42"
+        "test_effect", max_attempts=3, project_id="42"
     )
     assert len(second_claim) == 1
     assert second_claim[0].attempt == 3
@@ -258,7 +261,7 @@ def test_effect_receipt_crash_reclaim_stops_at_max_attempts(tmp_path) -> None:
 
     assert (
         store.claim_pending_effect_receipts(
-            "autofix_reconciliation", max_attempts=3, project_id="42"
+            "test_effect", max_attempts=3, project_id="42"
         )
         == ()
     )
@@ -280,8 +283,8 @@ def test_pending_effect_receipt_at_max_attempts_is_not_claimed(tmp_path) -> None
     assert store.finish(run.run_id, "succeeded", claim_token=claimed_run.claim_token)
     receipt = store.create_effect_receipt(
         run.run_id,
-        "autofix_reconciliation",
-        "autofix/MR-1/run-1",
+        "test_effect",
+        "effect-1",
         state="pending",
     )
     with sqlite3.connect(database) as connection:
@@ -292,7 +295,7 @@ def test_pending_effect_receipt_at_max_attempts_is_not_claimed(tmp_path) -> None
 
     assert (
         store.claim_pending_effect_receipts(
-            "autofix_reconciliation", max_attempts=2, project_id="42"
+            "test_effect", max_attempts=2, project_id="42"
         )
         == ()
     )
@@ -302,68 +305,8 @@ def test_pending_effect_receipt_at_max_attempts_is_not_claimed(tmp_path) -> None
     assert exhausted.next_attempt_at is None
 
 
-def test_auto_fix_merge_suppresses_only_the_merged_parent_sha(tmp_path) -> None:
-    store = SQLiteStore(tmp_path / "review.db")
-    run = store.enqueue("42", 1, SHA)
-    relation = store.record_auto_fix("42", 1, SHA, run.run_id, "42", 9)
-    assert relation.parent_mr_iid == 1
-    assert store.is_suppressed_parent_sha("42", 1, SHA) is False
-    store.mark_auto_fix_merged("42", 9, MERGED_SHA)
-    assert store.is_suppressed_parent_sha("42", 1, MERGED_SHA) is True
-    assert store.is_suppressed_parent_sha("42", 1, LATER_SHA) is False
 
 
-def test_closed_auto_fix_merged_sha_is_not_recorded_or_suppressed(tmp_path) -> None:
-    store = SQLiteStore(tmp_path / "review.db")
-    run = store.enqueue("42", 1, SHA)
-
-    relation = store.record_auto_fix(
-        "42",
-        1,
-        SHA,
-        run.run_id,
-        "42",
-        9,
-        status="closed",
-        merged_sha=MERGED_SHA,
-    )
-
-    assert relation.status == "closed"
-    assert relation.merged_sha is None
-    assert store.is_suppressed_parent_sha("42", 1, MERGED_SHA) is False
-
-
-def test_auto_fix_merge_before_relation_write_is_preserved(tmp_path) -> None:
-    store = SQLiteStore(tmp_path / "review.db")
-    store.mark_auto_fix_merged("42", 9, MERGED_SHA)
-    run = store.enqueue("42", 1, SHA)
-    relation = store.record_auto_fix("42", 1, SHA, run.run_id, "42", 9)
-    assert relation.status == "merged"
-    assert relation.merged_sha == MERGED_SHA
-    assert store.is_suppressed_parent_sha("42", 1, MERGED_SHA) is True
-
-
-def test_merged_auto_fix_sha_is_backfilled_without_changing_existing_sha(tmp_path) -> None:
-    store = SQLiteStore(tmp_path / "review.db")
-    run = store.enqueue("42", 1, SHA)
-    initial = store.record_auto_fix(
-        "42", 1, SHA, run.run_id, "42", 9, status="merged"
-    )
-    assert initial.status == "merged"
-    assert initial.merged_sha is None
-
-    backfilled = store.record_auto_fix(
-        "42", 1, SHA, run.run_id, "42", 9, status="merged", merged_sha=MERGED_SHA
-    )
-    assert backfilled.status == "merged"
-    assert backfilled.merged_sha == MERGED_SHA
-    assert store.is_suppressed_parent_sha("42", 1, MERGED_SHA) is True
-
-    preserved = store.record_auto_fix(
-        "42", 1, SHA, run.run_id, "42", 9, status="merged", merged_sha=LATER_SHA
-    )
-    assert preserved.merged_sha == MERGED_SHA
-    assert store.is_suppressed_parent_sha("42", 1, LATER_SHA) is False
 
 
 def test_invalid_sha_is_rejected_before_enqueue(tmp_path) -> None:
@@ -372,29 +315,6 @@ def test_invalid_sha_is_rejected_before_enqueue(tmp_path) -> None:
         store.enqueue("42", 1, "abc")
     assert store.claim_next() is None
 
-
-def test_auto_fix_intent_attaches_child_before_worker_reconciliation(tmp_path) -> None:
-    store = SQLiteStore(tmp_path / "review.db")
-    run = store.enqueue("42", 1, SHA)
-    store.create_auto_fix_intent(
-        "42",
-        1,
-        SHA,
-        run.run_id,
-        "autofix/MR-1/run-1",
-        "feature/validation",
-        "[ReviewFlow Auto-Fix] Improve validation",
-    )
-    match = store.resolve_auto_fix_match(
-        "42",
-        9,
-        "autofix/MR-1/run-1",
-        "feature/validation",
-        auto_fix_intent_marker(run.run_id, SHA),
-    )
-    assert match is not None
-    assert match.parent_mr_iid == 1
-    assert match.auto_fix_mr_iid == 9
 
 
 def test_program_auto_fix_intent_is_immutable_and_lease_fenced(tmp_path) -> None:
@@ -477,62 +397,6 @@ def test_program_auto_fix_plan_freezes_canonical_inputs_and_marker(tmp_path) -> 
         )
 
 
-def test_auto_fix_intent_rejects_reused_run_id_without_current_marker(tmp_path) -> None:
-    store = SQLiteStore(tmp_path / "review.db")
-    run = store.enqueue("42", 1, SHA)
-    store.create_auto_fix_intent(
-        "42",
-        1,
-        SHA,
-        run.run_id,
-        "autofix/MR-1/run-1",
-        "feature/validation",
-        "[ReviewFlow Auto-Fix] Improve validation",
-    )
-    assert (
-        store.resolve_auto_fix_match(
-            "42",
-            9,
-            "autofix/MR-1/run-1",
-            "feature/validation",
-            "ReviewFlow-Auto-Fix-Run-ID:1 SHA:old-sha",
-        )
-        is None
-    )
-    claimed = store.claim_next(project_id="42")
-    assert claimed is not None
-    assert store.finish(run.run_id, "succeeded", claim_token=claimed.claim_token)
-    assert store.abandon_auto_fix_intent(run.run_id) is True
-    assert store.get_auto_fix_intent(run.run_id).status == "abandoned"
-
-
-def test_abandoned_auto_fix_intent_is_not_reclaimed(tmp_path) -> None:
-    store = SQLiteStore(tmp_path / "review.db")
-    run = store.enqueue("42", 1, SHA)
-    store.create_auto_fix_intent(
-        "42",
-        1,
-        SHA,
-        run.run_id,
-        "autofix/MR-1/run-1",
-        "feature/validation",
-        "[ReviewFlow Auto-Fix] Improve validation",
-    )
-    assert store.abandon_auto_fix_intent(run.run_id) is False
-    claimed = store.claim_next(project_id="42")
-    assert claimed is not None
-    assert store.finish(run.run_id, "succeeded", claim_token=claimed.claim_token)
-    assert store.abandon_auto_fix_intent(run.run_id) is True
-    assert (
-        store.resolve_auto_fix_match(
-            "42",
-            9,
-            "autofix/MR-1/run-1",
-            "feature/validation",
-            auto_fix_intent_marker(run.run_id, SHA),
-        )
-        is None
-    )
 
 
 def test_notification_channel_identity_survives_configuration_reordering(tmp_path) -> None:
@@ -727,12 +591,12 @@ def test_expired_claims_cannot_finish_before_reclaim(tmp_path) -> None:
     )
     receipt = store.create_effect_receipt(
         effect_run.run_id,
-        "autofix_reconciliation",
-        "autofix/MR-2/run-2",
+        "test_effect",
+        "effect-2",
         state="pending",
     )
     claimed_receipt = store.claim_pending_effect_receipts(
-        "autofix_reconciliation", project_id="42"
+        "test_effect", project_id="42"
     )[0]
     with sqlite3.connect(database) as connection:
         connection.execute(

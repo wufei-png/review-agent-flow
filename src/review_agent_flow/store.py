@@ -21,19 +21,13 @@ DEFAULT_NOTIFICATION_LEASE_SECONDS = 30
 DEFAULT_NOTIFICATION_MAX_ATTEMPTS = 3
 DEFAULT_WORKTREE_CLEANUP_LEASE_SECONDS = 60
 DEFAULT_WORKTREE_CLEANUP_MAX_ATTEMPTS = 5
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 DEFAULT_EFFECT_LEASE_SECONDS = 60
 DEFAULT_NOTE_PUBLICATION_LEASE_SECONDS = 60
 DEFAULT_NOTE_PUBLICATION_MAX_ATTEMPTS = 5
 DEFAULT_NOTE_UNCERTAIN_LOOKUP_ATTEMPTS = 3
 DEFAULT_AUTO_FIX_PUBLICATION_LEASE_SECONDS = 60
 DEFAULT_AUTO_FIX_RECONCILIATION_LEASE_SECONDS = 60
-
-
-def auto_fix_intent_marker(run_id: int, parent_sha: str) -> str:
-    """Return the stable identity marker required in an Auto-fix MR."""
-
-    return f"ReviewFlow-Auto-Fix-Run-ID:{run_id} SHA:{parent_sha}"
 
 
 @dataclass(frozen=True)
@@ -107,21 +101,6 @@ class NotePublicationRequest:
     reconcile_next_at: str | None
     reconcile_lease_until: str | None
     reconcile_claim_token: str | None
-
-
-@dataclass(frozen=True)
-class AutoFixIntent:
-    intent_id: int
-    parent_project_id: str
-    parent_mr_iid: int
-    parent_sha: str
-    run_id: int
-    source_branch: str
-    target_branch: str
-    title: str
-    status: str
-    auto_fix_project_id: str | None
-    auto_fix_mr_iid: int | None
 
 
 @dataclass(frozen=True)
@@ -205,30 +184,6 @@ class NotificationRequest:
 
 
 @dataclass(frozen=True)
-class AutoFixRelation:
-    relation_id: int
-    parent_project_id: str
-    parent_mr_iid: int
-    parent_sha: str
-    run_id: int
-    auto_fix_project_id: str
-    auto_fix_mr_iid: int
-    merged_sha: str | None
-    status: str
-
-
-@dataclass(frozen=True)
-class AutoFixMatch:
-    parent_project_id: str
-    parent_mr_iid: int
-    parent_sha: str
-    run_id: int
-    auto_fix_project_id: str
-    auto_fix_mr_iid: int
-    status: str
-
-
-@dataclass(frozen=True)
 class NotificationDelivery:
     delivery_id: int
     correlation_id: str
@@ -267,7 +222,7 @@ class WorktreeRecord:
 class SQLiteStore:
     """Small SQLite store.
 
-    Version 7 is intentionally a fresh schema.  There is no production database
+    Version 8 is intentionally a fresh schema.  There is no production database
     migration contract for this pre-release implementation; an older database
     must be recreated rather than guessed into a new notification or Auto-fix
     routing model.
@@ -389,22 +344,6 @@ class SQLiteStore:
                     failure_class TEXT,
                     retryable INTEGER NOT NULL DEFAULT 0,
                     UNIQUE(project_id, mr_iid, sha)
-                );
-                CREATE TABLE IF NOT EXISTS auto_fix_intents (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    parent_project_id TEXT NOT NULL,
-                    parent_mr_iid INTEGER NOT NULL,
-                    parent_sha TEXT NOT NULL,
-                    run_id INTEGER NOT NULL REFERENCES review_runs(id),
-                    source_branch TEXT NOT NULL,
-                    target_branch TEXT NOT NULL,
-                    title TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'planned',
-                    auto_fix_project_id TEXT,
-                    auto_fix_mr_iid INTEGER,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    UNIQUE(run_id)
                 );
                 CREATE TABLE IF NOT EXISTS auto_fix_publication_intents (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -534,25 +473,6 @@ class SQLiteStore:
                     reconcile_claim_token TEXT,
                     UNIQUE(project_id, mr_iid, sha)
                 );
-                CREATE TABLE IF NOT EXISTS auto_fix_mrs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    parent_project_id TEXT NOT NULL,
-                    parent_mr_iid INTEGER NOT NULL,
-                    parent_sha TEXT NOT NULL,
-                    run_id INTEGER NOT NULL REFERENCES review_runs(id),
-                    auto_fix_project_id TEXT NOT NULL,
-                    auto_fix_mr_iid INTEGER NOT NULL,
-                    merged_sha TEXT,
-                    status TEXT NOT NULL DEFAULT 'opened',
-                    UNIQUE(auto_fix_project_id, auto_fix_mr_iid)
-                );
-                CREATE TABLE IF NOT EXISTS auto_fix_merge_events (
-                    auto_fix_project_id TEXT NOT NULL,
-                    auto_fix_mr_iid INTEGER NOT NULL,
-                    merged_sha TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    PRIMARY KEY(auto_fix_project_id, auto_fix_mr_iid)
-                );
                 CREATE TABLE IF NOT EXISTS notification_outbox (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     correlation_id TEXT NOT NULL,
@@ -587,7 +507,7 @@ class SQLiteStore:
                     last_error TEXT,
                     UNIQUE(run_id, path)
                 );
-                PRAGMA user_version = 7;
+                PRAGMA user_version = 8;
                 """
             )
 
@@ -1870,14 +1790,6 @@ class SQLiteStore:
             project_parameters = (project_id,)
         run_status_scope = ""
         joined_run_status_scope = ""
-        if effect_kind == "autofix_reconciliation":
-            run_status_scope = (
-                " AND EXISTS ("
-                "SELECT 1 FROM review_runs "
-                "WHERE review_runs.id = effect_receipts.run_id "
-                "AND review_runs.status IN ('succeeded', 'failed', 'cancelled'))"
-            )
-            joined_run_status_scope = " AND review_runs.status IN ('succeeded', 'failed', 'cancelled')"
         if max_attempts is None:
             reclaim_state = "'pending'"
             reclaim_next_attempt = "?"
@@ -3327,426 +3239,11 @@ class SQLiteStore:
         recipients = tuple(json.loads(values.pop("recipients_json")))
         return NotificationRequest(**values, recipients=recipients)
 
-    def create_auto_fix_intent(
-        self,
-        parent_project_id: str,
-        parent_mr_iid: int,
-        parent_sha: str,
-        run_id: int,
-        source_branch: str,
-        target_branch: str,
-        title: str,
-    ) -> AutoFixIntent:
-        now = self._now().isoformat()
-        with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO auto_fix_intents(
-                    parent_project_id, parent_mr_iid, parent_sha, run_id,
-                    source_branch, target_branch, title, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(run_id) DO UPDATE SET
-                    parent_project_id = excluded.parent_project_id,
-                    parent_mr_iid = excluded.parent_mr_iid,
-                    parent_sha = excluded.parent_sha,
-                    source_branch = excluded.source_branch,
-                    target_branch = excluded.target_branch,
-                    title = excluded.title,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    parent_project_id,
-                    parent_mr_iid,
-                    parent_sha,
-                    run_id,
-                    source_branch,
-                    target_branch,
-                    title,
-                    now,
-                    now,
-                ),
-            )
-            row = connection.execute(
-                """
-                SELECT id AS intent_id, parent_project_id, parent_mr_iid, parent_sha,
-                       run_id, source_branch, target_branch, title, status,
-                       auto_fix_project_id, auto_fix_mr_iid
-                FROM auto_fix_intents WHERE run_id = ?
-                """,
-                (run_id,),
-            ).fetchone()
-        assert row is not None
-        return AutoFixIntent(**dict(row))
-
-    def get_auto_fix_intent(self, run_id: int) -> AutoFixIntent | None:
-        with self._connect() as connection:
-            row = connection.execute(
-                """
-                SELECT id AS intent_id, parent_project_id, parent_mr_iid, parent_sha,
-                       run_id, source_branch, target_branch, title, status,
-                       auto_fix_project_id, auto_fix_mr_iid
-                FROM auto_fix_intents WHERE run_id = ?
-                """,
-                (run_id,),
-            ).fetchone()
-        return AutoFixIntent(**dict(row)) if row is not None else None
-
-    def abandon_auto_fix_intent(self, run_id: int) -> bool:
-        """Close an intent after a terminal Agent run produced no Auto-fix MR."""
-
-        with self._connect() as connection:
-            cursor = connection.execute(
-                """
-                UPDATE auto_fix_intents
-                SET status = 'abandoned', updated_at = ?
-                WHERE run_id = ? AND status IN ('planned', 'created')
-                  AND auto_fix_mr_iid IS NULL
-                  AND EXISTS (
-                      SELECT 1 FROM review_runs
-                      WHERE review_runs.id = auto_fix_intents.run_id
-                        AND review_runs.status IN ('succeeded', 'failed', 'cancelled')
-                  )
-                """,
-                (self._now().isoformat(), run_id),
-            )
-        return cursor.rowcount == 1
-
-    @staticmethod
-    def _auto_fix_match_from_row(row: sqlite3.Row) -> AutoFixMatch:
-        return AutoFixMatch(
-            parent_project_id=str(row["parent_project_id"]),
-            parent_mr_iid=int(row["parent_mr_iid"]),
-            parent_sha=str(row["parent_sha"]),
-            run_id=int(row["run_id"]),
-            auto_fix_project_id=str(row["auto_fix_project_id"]),
-            auto_fix_mr_iid=int(row["auto_fix_mr_iid"]),
-            status=str(row["status"]),
-        )
-
-    @staticmethod
-    def _select_relation(
-        connection: sqlite3.Connection, project_id: str, mr_iid: int
-    ) -> sqlite3.Row | None:
-        return connection.execute(
-            """
-            SELECT parent_project_id, parent_mr_iid, parent_sha, run_id,
-                   auto_fix_project_id, auto_fix_mr_iid, status
-            FROM auto_fix_mrs
-            WHERE auto_fix_project_id = ? AND auto_fix_mr_iid = ?
-            """,
-            (project_id, mr_iid),
-        ).fetchone()
-
-    def _attach_intent(
-        self,
-        connection: sqlite3.Connection,
-        intent: sqlite3.Row,
-        auto_fix_project_id: str,
-        auto_fix_mr_iid: int,
-    ) -> sqlite3.Row:
-        connection.execute(
-            """
-            INSERT INTO auto_fix_mrs(
-                parent_project_id, parent_mr_iid, parent_sha, run_id,
-                auto_fix_project_id, auto_fix_mr_iid
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(auto_fix_project_id, auto_fix_mr_iid) DO UPDATE SET
-                parent_project_id = excluded.parent_project_id,
-                parent_mr_iid = excluded.parent_mr_iid,
-                parent_sha = excluded.parent_sha,
-                run_id = excluded.run_id
-            """,
-            (
-                intent["parent_project_id"],
-                intent["parent_mr_iid"],
-                intent["parent_sha"],
-                intent["run_id"],
-                auto_fix_project_id,
-                auto_fix_mr_iid,
-            ),
-        )
-        connection.execute(
-            """
-            UPDATE auto_fix_intents
-            SET status = 'created', auto_fix_project_id = ?, auto_fix_mr_iid = ?,
-                updated_at = ?
-            WHERE id = ?
-            """,
-            (auto_fix_project_id, auto_fix_mr_iid, self._now().isoformat(), intent["id"]),
-        )
-        pending = connection.execute(
-            """
-            SELECT merged_sha FROM auto_fix_merge_events
-            WHERE auto_fix_project_id = ? AND auto_fix_mr_iid = ?
-            """,
-            (auto_fix_project_id, auto_fix_mr_iid),
-        ).fetchone()
-        if pending is not None:
-            connection.execute(
-                """
-                UPDATE auto_fix_mrs SET status = 'merged', merged_sha = ?
-                WHERE auto_fix_project_id = ? AND auto_fix_mr_iid = ?
-                """,
-                (pending["merged_sha"], auto_fix_project_id, auto_fix_mr_iid),
-            )
-            connection.execute(
-                """
-                UPDATE auto_fix_intents SET status = 'merged', updated_at = ?
-                WHERE id = ?
-                """,
-                (self._now().isoformat(), intent["id"]),
-            )
-            connection.execute(
-                """
-                DELETE FROM auto_fix_merge_events
-                WHERE auto_fix_project_id = ? AND auto_fix_mr_iid = ?
-                """,
-                (auto_fix_project_id, auto_fix_mr_iid),
-            )
-        row = self._select_relation(connection, auto_fix_project_id, auto_fix_mr_iid)
-        assert row is not None
-        return row
-
-    def resolve_auto_fix_match(
-        self,
-        project_id: str,
-        mr_iid: int,
-        source_branch: str | None = None,
-        target_branch: str | None = None,
-        description: str | None = None,
-    ) -> AutoFixMatch | None:
-        """Resolve only a server-recorded Auto-fix relation or intent.
-
-        A branch-shaped MR may be attached to an intent only when its
-        description carries the intent's run/SHA marker.  This prevents a
-        fresh database whose numeric run IDs have reset from adopting an old
-        GitLab MR that happens to reuse the same branch name.
-        """
-
-        with self._connect() as connection:
-            relation = self._select_relation(connection, project_id, mr_iid)
-            if relation is None and source_branch:
-                intents = connection.execute(
-                    """
-                    SELECT * FROM auto_fix_intents
-                    WHERE parent_project_id = ? AND source_branch = ?
-                      AND status IN ('planned', 'created')
-                      AND (auto_fix_mr_iid IS NULL OR auto_fix_mr_iid = ?)
-                      AND (? IS NULL OR target_branch = ?)
-                    ORDER BY id DESC
-                    """,
-                    (
-                        project_id,
-                        source_branch,
-                        mr_iid,
-                        target_branch,
-                        target_branch,
-                    ),
-                ).fetchall()
-                for intent in intents:
-                    marker = auto_fix_intent_marker(
-                        int(intent["run_id"]), str(intent["parent_sha"])
-                    )
-                    if description is None or marker not in description:
-                        continue
-                    relation = self._attach_intent(connection, intent, project_id, mr_iid)
-                    break
-            return self._auto_fix_match_from_row(relation) if relation is not None else None
-
-    def record_auto_fix(
-        self,
-        parent_project_id: str,
-        parent_mr_iid: int,
-        parent_sha: str,
-        run_id: int,
-        auto_fix_project_id: str,
-        auto_fix_mr_iid: int,
-        status: str = "opened",
-        merged_sha: str | None = None,
-        run_claim_token: str | None = None,
-        effect_receipt_id: int | None = None,
-        effect_claim_token: str | None = None,
-    ) -> AutoFixRelation | None:
-        if not is_valid_sha(parent_sha):
-            raise ValueError("invalid SHA: expected 40 or 64 hexadecimal characters")
-        if status not in {"opened", "closed", "merged"}:
-            raise ValueError(f"invalid Auto-fix status: {status}")
-        if status != "merged":
-            merged_sha = None
-        elif merged_sha is not None and not is_valid_sha(merged_sha):
-            raise ValueError("invalid SHA: expected 40 or 64 hexadecimal characters")
-        if (effect_receipt_id is None) != (effect_claim_token is None):
-            raise ValueError(
-                "effect_receipt_id and effect_claim_token must be provided together"
-            )
-        with self._connect() as connection:
-            if run_claim_token is not None or effect_receipt_id is not None:
-                now_text = datetime.now(UTC).isoformat()
-                connection.execute("BEGIN IMMEDIATE")
-                if run_claim_token is not None:
-                    active = connection.execute(
-                        """
-                        SELECT 1 FROM review_runs
-                        WHERE id = ? AND status = 'running' AND claim_token = ?
-                          AND lease_until IS NOT NULL AND lease_until > ?
-                        """,
-                        (run_id, run_claim_token, now_text),
-                    ).fetchone()
-                    if active is None:
-                        return None
-                if effect_receipt_id is not None and effect_claim_token is not None:
-                    active_receipt = connection.execute(
-                        """
-                        SELECT 1 FROM effect_receipts
-                        WHERE id = ? AND run_id = ? AND state = 'running'
-                          AND claim_token = ? AND lease_until IS NOT NULL
-                          AND lease_until > ?
-                        """,
-                        (effect_receipt_id, run_id, effect_claim_token, now_text),
-                    ).fetchone()
-                    if active_receipt is None:
-                        return None
-            connection.execute(
-                """
-                INSERT INTO auto_fix_mrs(
-                    parent_project_id, parent_mr_iid, parent_sha, run_id,
-                    auto_fix_project_id, auto_fix_mr_iid, status, merged_sha
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(auto_fix_project_id, auto_fix_mr_iid) DO UPDATE SET
-                    parent_project_id = excluded.parent_project_id,
-                    parent_mr_iid = excluded.parent_mr_iid,
-                    parent_sha = excluded.parent_sha,
-                    run_id = excluded.run_id,
-                    status = CASE
-                        WHEN auto_fix_mrs.status = 'merged' THEN 'merged'
-                        ELSE excluded.status
-                    END,
-                    merged_sha = CASE
-                        WHEN auto_fix_mrs.status = 'merged'
-                            THEN COALESCE(auto_fix_mrs.merged_sha, excluded.merged_sha)
-                        WHEN excluded.status = 'merged' THEN excluded.merged_sha
-                        ELSE NULL
-                    END
-                """,
-                (
-                    parent_project_id,
-                    parent_mr_iid,
-                    parent_sha,
-                    run_id,
-                    auto_fix_project_id,
-                    auto_fix_mr_iid,
-                    status,
-                    merged_sha,
-                ),
-            )
-            connection.execute(
-                """
-                UPDATE auto_fix_intents
-                SET status = CASE WHEN status = 'merged' THEN status ELSE 'created' END,
-                    auto_fix_project_id = ?, auto_fix_mr_iid = ?, updated_at = ?
-                WHERE run_id = ?
-                """,
-                (auto_fix_project_id, auto_fix_mr_iid, self._now().isoformat(), run_id),
-            )
-            pending = connection.execute(
-                """
-                SELECT merged_sha FROM auto_fix_merge_events
-                WHERE auto_fix_project_id = ? AND auto_fix_mr_iid = ?
-                """,
-                (auto_fix_project_id, auto_fix_mr_iid),
-            ).fetchone()
-            if pending is not None:
-                connection.execute(
-                    """
-                    UPDATE auto_fix_mrs SET status = 'merged', merged_sha = ?
-                    WHERE auto_fix_project_id = ? AND auto_fix_mr_iid = ?
-                    """,
-                    (pending["merged_sha"], auto_fix_project_id, auto_fix_mr_iid),
-                )
-                connection.execute(
-                    """
-                    UPDATE auto_fix_intents SET status = 'merged', updated_at = ?
-                    WHERE run_id = ?
-                    """,
-                    (self._now().isoformat(), run_id),
-                )
-                connection.execute(
-                    """
-                    DELETE FROM auto_fix_merge_events
-                    WHERE auto_fix_project_id = ? AND auto_fix_mr_iid = ?
-                    """,
-                    (auto_fix_project_id, auto_fix_mr_iid),
-                )
-            row = connection.execute(
-                """
-                SELECT id AS relation_id, parent_project_id, parent_mr_iid, parent_sha,
-                       run_id, auto_fix_project_id, auto_fix_mr_iid, merged_sha, status
-                FROM auto_fix_mrs
-                WHERE auto_fix_project_id = ? AND auto_fix_mr_iid = ?
-                """,
-                (auto_fix_project_id, auto_fix_mr_iid),
-            ).fetchone()
-        assert row is not None
-        return AutoFixRelation(**dict(row))
-
-    def mark_auto_fix_merged(
-        self, auto_fix_project_id: str, auto_fix_mr_iid: int, merged_sha: str
-    ) -> None:
-        if not is_valid_sha(merged_sha):
-            raise ValueError("invalid SHA: expected 40 or 64 hexadecimal characters")
-        with self._connect() as connection:
-            cursor = connection.execute(
-                """
-                UPDATE auto_fix_mrs SET status = 'merged', merged_sha = ?
-                WHERE auto_fix_project_id = ? AND auto_fix_mr_iid = ?
-                """,
-                (merged_sha, auto_fix_project_id, auto_fix_mr_iid),
-            )
-            if cursor.rowcount:
-                connection.execute(
-                    """
-                    UPDATE auto_fix_intents
-                    SET status = 'merged', updated_at = ?
-                    WHERE auto_fix_project_id = ? AND auto_fix_mr_iid = ?
-                    """,
-                    (self._now().isoformat(), auto_fix_project_id, auto_fix_mr_iid),
-                )
-                connection.execute(
-                    """
-                    DELETE FROM auto_fix_merge_events
-                    WHERE auto_fix_project_id = ? AND auto_fix_mr_iid = ?
-                    """,
-                    (auto_fix_project_id, auto_fix_mr_iid),
-                )
-            else:
-                connection.execute(
-                    """
-                    INSERT INTO auto_fix_merge_events(
-                        auto_fix_project_id, auto_fix_mr_iid, merged_sha, created_at
-                    ) VALUES (?, ?, ?, ?)
-                    ON CONFLICT(auto_fix_project_id, auto_fix_mr_iid) DO UPDATE SET
-                        merged_sha = excluded.merged_sha,
-                        created_at = excluded.created_at
-                    """,
-                    (
-                        auto_fix_project_id,
-                        auto_fix_mr_iid,
-                        merged_sha,
-                        self._now().isoformat(),
-                    ),
-                )
-
     def is_suppressed_parent_sha(self, project_id: str, mr_iid: int, sha: str) -> bool:
         with self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT 1 FROM (
-                    SELECT parent_project_id, parent_mr_iid, status, merged_sha
-                    FROM auto_fix_relations
-                    UNION ALL
-                    SELECT parent_project_id, parent_mr_iid, status, merged_sha
-                    FROM auto_fix_mrs
-                )
+                SELECT 1 FROM auto_fix_relations
                 WHERE parent_project_id = ? AND parent_mr_iid = ?
                   AND status = 'merged' AND merged_sha = ?
                 LIMIT 1

@@ -1371,38 +1371,6 @@ def test_worker_claims_only_its_bound_project(tmp_path: Path) -> None:
     assert pending is not None
 
 
-def test_worker_does_not_reconcile_another_project_receipt(tmp_path: Path) -> None:
-    repository = tmp_path / "repo"
-    repository.mkdir()
-    sha = "f" * 40
-    store = SQLiteStore(tmp_path / "review.db")
-    run = store.enqueue("99", 1, sha)
-    receipt = store.create_effect_receipt(
-        run.run_id,
-        "autofix_reconciliation",
-        "autofix/MR-1/run-1",
-        state="pending",
-    )
-    gitlab = EventualAutoFixGitLab(
-        MergeRequest("99", 1, "Other project", "alice", "feature", "main", sha, "https://mr")
-    )
-    worker = ReviewWorker(
-        store,
-        gitlab,
-        GitWorktreeManager(repository, tmp_path / "worktrees"),
-        ReviewPolicy(),
-        repository,
-        "https://gitlab",
-        project_id="42",
-    )
-
-    assert worker.reconcile_auto_fixes() is None
-    assert gitlab.get_calls == 0
-    assert gitlab.find_calls == 0
-    saved = store.get_effect_receipt(receipt.receipt_id)
-    assert saved is not None
-    assert saved.state == "pending"
-
 
 def test_retryable_gitlab_failure_requeues_then_fails_at_attempt_cap(tmp_path: Path) -> None:
     repository = tmp_path / "repo"
@@ -1641,7 +1609,9 @@ def test_agent_success_does_not_write_after_lease_expires(
     assert store.list_effect_receipts(run.run_id, "autofix_plan")[0].state == "planned"
     assert store.list_effect_receipts(run.run_id, "agent_execution")[0].state == "not_observed"
     with sqlite3.connect(database) as connection:
-        relation_count = connection.execute("SELECT COUNT(*) FROM auto_fix_mrs").fetchone()[0]
+        relation_count = connection.execute(
+            "SELECT COUNT(*) FROM auto_fix_relations"
+        ).fetchone()[0]
     assert relation_count == 0
 
 

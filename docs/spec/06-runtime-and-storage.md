@@ -40,7 +40,7 @@ The pre-release implementation performs a hard cutover to a fresh schema; it doe
 - `review_runs`: ReviewKey, status, attempts, lease/token, timestamps and redacted diagnostics;
 - `requested_outputs`, `effective_run_decisions` and `output_expectations`: immutable decisions used by the Outcome projection;
 - `note_publication_requests` and effect receipts: canonical marker, state, attempt, trusted external identity and deletion observation;
-- `auto_fix_intents`: immutable generation and nonce, with at most one active generation per ReviewKey;
+- `auto_fix_publication_intents`: immutable generation and nonce, with at most one active generation per ReviewKey;
 - `auto_fix_publication_plans`: full canonical Plan, digest, verification evidence and publication state;
 - `auto_fix_relations`: parent identity, child identity, observed state, divergence and merge SHA;
 - `notification_requests` and delivery outbox: immutable event identity, rendered fields, channel, attempts, lease and status;

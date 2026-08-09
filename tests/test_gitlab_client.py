@@ -6,6 +6,8 @@ from review_agent_flow.gitlab import Note, NoteMarkerLookup, canonical_note_mark
 from review_agent_flow.gitlab_client import PythonGitLabClient
 
 SHA = "a" * 40
+NONCE = "b" * 32
+AUTO_FIX_BRANCH = f"autofix/MR-1/sha-{SHA}/intent-{NONCE}"
 
 
 class ProjectId(str):
@@ -72,7 +74,7 @@ class FakeMergeRequests:
 
     def list(self, **kwargs: object) -> list[SimpleNamespace]:
         assert kwargs["state"] == "all"
-        assert kwargs["source_branch"] == "autofix/MR-1/run-1"
+        assert kwargs["source_branch"] == AUTO_FIX_BRANCH
         assert kwargs["target_branch"] == "feature"
         return self.listed
 
@@ -242,23 +244,26 @@ def test_canonical_note_marker_rejects_noncanonical_review_keys(
 
 
 def test_auto_fix_lookup_skips_old_same_branch_mr_without_current_marker() -> None:
-    marker = "ReviewFlow-Auto-Fix-Run-ID:1 SHA:new-sha"
+    marker = (
+        f"<!-- reviewflow:v1;project=42;mr=1;sha={SHA};effect=autofix;"
+        f"intent={NONCE};plan_sha256={'e' * 64} -->"
+    )
     notes = FakeNotes([[]])
     listed = [
         SimpleNamespace(
             iid=8,
             title="old",
             author={"username": "review-bot"},
-            source_branch="autofix/MR-1/run-1",
+            source_branch=AUTO_FIX_BRANCH,
             target_branch="feature",
             web_url="old-url",
-            description="ReviewFlow-Auto-Fix-Run-ID:1 SHA:old-sha",
+            description="old marker",
         ),
         SimpleNamespace(
             iid=9,
             title="new",
             author={"username": "review-bot"},
-            source_branch="autofix/MR-1/run-1",
+            source_branch=AUTO_FIX_BRANCH,
             target_branch="feature",
             web_url="new-url",
             description=marker,
@@ -267,7 +272,7 @@ def test_auto_fix_lookup_skips_old_same_branch_mr_without_current_marker() -> No
     project = SimpleNamespace(mergerequests=FakeMergeRequests(notes, listed))
 
     found = _client(project).find_merge_request_by_source_branch(
-        "42", "autofix/MR-1/run-1", "feature", marker
+        "42", AUTO_FIX_BRANCH, "feature", marker
     )
     assert found is not None and found.iid == 9
 
