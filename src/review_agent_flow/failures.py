@@ -9,6 +9,7 @@ from urllib.error import URLError
 
 from .policy import PolicyError
 from .repository import ShaFetchError, ShaUnavailableError
+from .runner import AgentContractError
 from .security import redact
 from .worktree import WorktreeError
 
@@ -70,6 +71,8 @@ def classify_exception(
         return FailureInfo("repository_sha_unavailable", False, detail)
     if isinstance(error, (FileNotFoundError, PermissionError)):
         return FailureInfo("agent_configuration", False, detail)
+    if isinstance(error, AgentContractError):
+        return FailureInfo("agent_contract", False, detail)
     if isinstance(error, PolicyError):
         return FailureInfo("policy_error", False, detail)
     if isinstance(error, ValueError):

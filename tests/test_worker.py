@@ -45,6 +45,13 @@ def ReviewWorker(*args, **kwargs):
     command = _TEST_AGENT_COMMANDS.get(id(policy.ai))
     if policy.ai.enabled and "agent_backend" not in kwargs:
         assert command
+        if len(command) >= 3 and command[0] == sys.executable and command[1] == "-c":
+            result_prefix = (
+                "import json, os, pathlib; "
+                "pathlib.Path(os.environ['REVIEW_AGENT_FLOW_RESULT_PATH']).write_text("
+                "json.dumps({'version': 1, 'review_markdown': 'reviewed'})); "
+            )
+            command = (command[0], command[1], result_prefix + command[2], *command[3:])
         kwargs["agent_backend"] = ResolvedBackend(
             "test-agent", "default", command, 1800, {}, None
         )
@@ -259,7 +266,7 @@ def test_agent_note_receipt_observes_native_id_without_equating_agent_success_to
                 command=(
                     sys.executable,
                     "-c",
-                    "import os; print(os.environ['REVIEW_AGENT_FLOW_NOTE_MARKER'])",
+                    "print('reviewed')",
                 ),
             )
         ),
@@ -273,7 +280,7 @@ def test_agent_note_receipt_observes_native_id_without_equating_agent_success_to
     assert result is not None and result.status == "succeeded"
     assert result.agent_result is not None
     marker = canonical_note_marker(run.project_id, run.mr_iid, run.sha)
-    assert result.agent_result.stdout.strip() == marker
+    assert result.agent_result.stdout.strip() == "reviewed"
     assert gitlab.note_markers == [marker]
     note_receipt = store.list_effect_receipts(run.run_id, "note_expected")[0]
     assert note_receipt.state == "observed"
@@ -306,7 +313,7 @@ def test_note_marker_observation_uses_review_key_receipt_key(tmp_path: Path) -> 
                 command=(
                     sys.executable,
                     "-c",
-                    "import os; print(os.environ['REVIEW_AGENT_FLOW_NOTE_MARKER'])",
+                    "print('reviewed')",
                 ),
             )
         ),
@@ -1231,6 +1238,47 @@ def test_agent_nonzero_exit_is_terminal_and_recorded_without_retry(tmp_path: Pat
     assert token not in (agent_receipt[0].error or "")
 
 
+def test_malformed_agent_result_is_terminal_agent_contract_failure(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    sha = _git_repository(repository)
+    mr = MergeRequest("42", 1, "Bad result", "alice", "feature", "main", sha, "https://mr")
+    store = SQLiteStore(tmp_path / "review.db")
+    run = store.enqueue("42", 1, sha)
+    worker = ReviewWorker(
+        store,
+        FakeGitLab(mr),
+        GitWorktreeManager(repository, tmp_path / "worktrees"),
+        ReviewPolicy(
+            ai=AIPolicy(
+                enabled=True,
+                command=(
+                    sys.executable,
+                    "-c",
+                    (
+                        "import os, pathlib; pathlib.Path("
+                        "os.environ['REVIEW_AGENT_FLOW_RESULT_PATH']).write_text('not-json')"
+                    ),
+                ),
+            )
+        ),
+        repository,
+        "https://gitlab",
+        project_id="42",
+    )
+
+    result = worker.process_one()
+
+    assert result is not None and result.status == "failed"
+    saved = store.get_review_run(run.run_id)
+    assert saved is not None
+    assert saved.status == "failed"
+    assert saved.failure_class == "agent_contract"
+    assert saved.retryable is False
+    receipt = store.list_effect_receipts(run.run_id, "agent_execution")[0]
+    assert receipt.state == "failed"
+
+
 def test_failed_agent_keeps_autofix_reconciliation_for_eventual_merge(
     tmp_path: Path,
 ) -> None:
@@ -1316,7 +1364,7 @@ def test_agent_success_does_not_write_after_lease_expires(
         retry_delay_seconds=0,
     )
 
-    def finish_after_expiry(claimed_run, merge_request, worktree, *_agent_context):
+    def finish_after_expiry(claimed_run, worktree):
         with sqlite3.connect(database) as connection:
             connection.execute(
                 "UPDATE review_runs SET lease_until = ? WHERE id = ?",

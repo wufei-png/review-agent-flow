@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -440,13 +441,7 @@ class ReviewWorker:
                     )
                 else:
                     agent_started = True
-                    result = self._run_agent(
-                        run,
-                        merge_request,
-                        worktree,
-                        auto_fix_intent,
-                        marker,
-                    )
+                    result = self._run_agent(run, worktree)
                 agent_finished = True
                 agent_receipt = receipts["agent_execution"]
                 if result.timed_out:
@@ -708,7 +703,7 @@ class ReviewWorker:
                 f"review-run:{run.run_id}:agent",
                 attempt=attempt,
                 state="running",
-                detail="Local Agent execution; no JSON output is required",
+                detail="Local Agent execution requires strict RESULT_PATH v1 output",
             )
             receipts["note_expected"] = self.store.create_effect_receipt(
                 run.run_id,
@@ -912,10 +907,7 @@ class ReviewWorker:
     def _run_agent(
         self,
         run: ReviewRun,
-        merge_request,
         worktree: Path,
-        auto_fix_intent,
-        marker: str,
     ) -> AgentResult:
         if self.agent_backend is None:
             raise ValueError("AI Review has no Operator-authorized Agent Backend/Profile")
@@ -928,31 +920,28 @@ class ReviewWorker:
                 skill_path = configured_path
         if not self._heartbeat(run):
             raise LeaseLostError("Review Run lease could not be extended before Agent execution")
-        return runner.run(
-            AgentContext(
-                project_id=run.project_id,
-                mr_iid=run.mr_iid,
-                run_id=run.run_id,
-                sha=run.sha,
-                gitlab_url=self.gitlab_url,
-                worktree=worktree,
-                skill_path=skill_path,
-                gitlab_token=self.gitlab_token,
-                auto_fix_enabled=self.policy.ai.auto_fix,
-                auto_fix_branch=auto_fix_intent.source_branch if auto_fix_intent else None,
-                auto_fix_target_branch=auto_fix_intent.target_branch if auto_fix_intent else None,
-                auto_fix_title=auto_fix_intent.title if auto_fix_intent else None,
-                auto_fix_marker=(
-                    auto_fix_intent_marker(run.run_id, run.sha) if auto_fix_intent else None
+        result_root = self.worktrees.root / "agent-results"
+        result_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(result_root, 0o700)
+        with tempfile.TemporaryDirectory(prefix=f"run-{run.run_id}-", dir=result_root) as directory:
+            os.chmod(directory, 0o700)
+            return runner.run(
+                AgentContext(
+                    project_id=run.project_id,
+                    mr_iid=run.mr_iid,
+                    run_id=run.run_id,
+                    sha=run.sha,
+                    worktree=worktree,
+                    result_path=Path(directory) / "result.json",
+                    skill_path=skill_path,
+                    auto_fix_enabled=self.policy.ai.auto_fix,
                 ),
-                note_marker=marker,
-            ),
-            heartbeat=lambda: self._heartbeat(run),
-            heartbeat_interval_seconds=max(
-                0.1, min(30.0, self.lease_seconds / 3)
-            ),
-            extra_env=self.agent_backend.environment,
-        )
+                heartbeat=lambda: self._heartbeat(run),
+                heartbeat_interval_seconds=max(
+                    0.1, min(30.0, self.lease_seconds / 3)
+                ),
+                extra_env=self.agent_backend.environment,
+            )
 
     def _notify_humans(self, run: ReviewRun, merge_request) -> None:
         if not self.policy.human.enabled:
