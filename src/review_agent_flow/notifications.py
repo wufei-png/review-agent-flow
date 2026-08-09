@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import dataclass
 from html import escape
 from typing import Protocol
 from urllib.error import URLError
 from urllib.request import Request, urlopen
+
+from .operator_config import ResolvedNotificationChannel
+
+MAX_PROVIDER_RESPONSE_BYTES = 64 * 1024
 
 
 @dataclass(frozen=True)
@@ -60,7 +63,7 @@ class WebhookNotifier:
         try:
             with urlopen(request, timeout=10) as response:
                 status = int(getattr(response, "status", 200))
-                raw_body = response.read()
+                raw_body = response.read(MAX_PROVIDER_RESPONSE_BYTES + 1)
         except (OSError, TimeoutError, URLError) as exc:  # pragma: no cover
             return NotificationResult(self.channel_id, False, str(exc))
         if status < 200 or status >= 300:
@@ -68,6 +71,12 @@ class WebhookNotifier:
                 self.channel_id,
                 False,
                 f"HTTP status {status}: {raw_body[:500].decode('utf-8', errors='replace')}",
+            )
+        if len(raw_body) > MAX_PROVIDER_RESPONSE_BYTES:
+            return NotificationResult(
+                self.channel_id,
+                False,
+                f"provider response exceeds {MAX_PROVIDER_RESPONSE_BYTES} bytes",
             )
         try:
             response_body = json.loads(raw_body or b"{}")
@@ -114,14 +123,24 @@ class FanoutNotifier:
             and not webhook_url.isspace()
         )
 
-    def channel_specs(self) -> tuple[tuple[str, str], ...]:
-        return tuple(
+    def channel_specs(
+        self, channel_ids: tuple[str, ...] | None = None
+    ) -> tuple[tuple[str, str], ...]:
+        specs = tuple(
             (
                 str(getattr(notifier, "channel_id", getattr(notifier, "channel", f"channel-{index}"))),
                 str(getattr(notifier, "channel", f"channel-{index}")),
             )
             for index, notifier in enumerate(self.notifiers)
         )
+        if channel_ids is None:
+            return specs
+        requested = set(channel_ids)
+        selected = tuple(spec for spec in specs if spec[0] in requested)
+        if len(selected) != len(requested):
+            missing = sorted(requested - {channel_id for channel_id, _ in selected})
+            raise ValueError(f"notification channels are not configured: {', '.join(missing)}")
+        return selected
 
     def notify_channel(self, event: NotificationEvent, channel_id: str) -> NotificationResult:
         notifier = next(
@@ -149,22 +168,21 @@ class FanoutNotifier:
         )
 
 
-def notifiers_from_policy(channels: tuple[dict[str, object], ...]) -> FanoutNotifier:
+def notifiers_from_operator(
+    channels: tuple[ResolvedNotificationChannel, ...],
+) -> FanoutNotifier:
+    """Construct adapters only from trusted, already-resolved Operator config."""
+
     notifiers: list[Notifier] = []
     for channel in channels:
-        channel_type = channel.get("type")
-        webhook_env = channel.get("webhook_env")
-        if not isinstance(channel_type, str) or not isinstance(webhook_env, str):
-            raise TypeError("notification channel requires type and webhook_env")
-        channel_id = channel.get("id")
-        if not isinstance(channel_id, str) or not channel_id:
-            raise TypeError("notification channel requires a non-empty id")
-        webhook_url = os.getenv(webhook_env)
-        if not webhook_url:
-            raise RuntimeError(f"notification webhook environment variable is missing: {webhook_env}")
-        raw_user_ids = channel.get("user_ids", {})
-        user_ids = raw_user_ids if isinstance(raw_user_ids, dict) else {}
-        notifiers.append(WebhookNotifier(channel_type, webhook_url, user_ids, channel_id))
+        notifiers.append(
+            WebhookNotifier(
+                channel.channel_type,
+                channel.webhook_url,
+                dict(channel.user_ids),
+                channel.channel_id,
+            )
+        )
     if len({str(notifier.channel_id) for notifier in notifiers}) != len(notifiers):
         raise ValueError("notification channel IDs must be unique")
     return FanoutNotifier(tuple(notifiers))

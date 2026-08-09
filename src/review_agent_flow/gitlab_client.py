@@ -17,8 +17,10 @@ from .gitlab import (
     Pipeline,
     RepositoryAction,
     RepositoryCommitObservation,
+    RepositoryFile,
     has_exact_note_marker,
     is_valid_sha,
+    normalize_sha,
 )
 
 
@@ -76,6 +78,33 @@ class PythonGitLabClient(GitLabClient):
             return None
         pipeline = pipelines[0]
         return Pipeline(str(project_id), int(pipeline.id), sha, str(pipeline.status))
+
+    def get_repository_file(
+        self, project_id: str, file_path: str, branch: str
+    ) -> RepositoryFile:
+        project = self._project(project_id)
+        branch_resource = project.branches.get(branch)
+        commit = getattr(branch_resource, "commit", {}) or {}
+        raw_sha = commit.get("id") if isinstance(commit, dict) else getattr(commit, "id", None)
+        ref_sha = normalize_sha(raw_sha)
+        try:
+            resource = project.files.get(file_path=file_path, ref=ref_sha)
+        except Exception as exc:
+            status = getattr(exc, "response_code", None) or getattr(exc, "status_code", None)
+            if status == 404:
+                return RepositoryFile(str(project_id), file_path, ref_sha, None)
+            raise
+        content = resource.decode()
+        if isinstance(content, bytes):
+            try:
+                decoded = content.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError("Project Policy must be UTF-8 text") from exc
+        elif isinstance(content, str):
+            decoded = content
+        else:
+            raise TypeError("GitLab returned an invalid repository file payload")
+        return RepositoryFile(str(project_id), file_path, ref_sha, decoded)
 
     @staticmethod
     def _note_from_resource(project_id: str, mr_iid: int, note: Any) -> Note | None:

@@ -21,7 +21,7 @@ DEFAULT_NOTIFICATION_LEASE_SECONDS = 30
 DEFAULT_NOTIFICATION_MAX_ATTEMPTS = 3
 DEFAULT_WORKTREE_CLEANUP_LEASE_SECONDS = 60
 DEFAULT_WORKTREE_CLEANUP_MAX_ATTEMPTS = 5
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 12
 DEFAULT_EFFECT_LEASE_SECONDS = 60
 DEFAULT_NOTE_PUBLICATION_LEASE_SECONDS = 60
 DEFAULT_NOTE_PUBLICATION_MAX_ATTEMPTS = 5
@@ -48,6 +48,50 @@ class ReviewRun:
     next_attempt_at: str | None = None
     created_at: str | None = None
     finished_at: str | None = None
+
+
+@dataclass(frozen=True)
+class PolicySnapshot:
+    run_id: int
+    target_branch: str
+    target_sha: str
+    policy_version: int
+    policy_json: str
+    policy_sha256: str
+    created_at: str
+
+
+@dataclass(frozen=True)
+class RequestedOutputs:
+    run_id: int
+    human_review: bool
+    ai_review: bool
+    auto_fix: bool
+    notification_channels: tuple[str, ...]
+    created_at: str
+
+
+@dataclass(frozen=True)
+class EffectiveRunDecision:
+    run_id: int
+    decision: str
+    human_review: bool
+    ai_review: bool
+    auto_fix: bool
+    suppressed: bool
+    recipients: tuple[str, ...]
+    notification_channels: tuple[str, ...]
+    reason: str | None
+    created_at: str
+
+
+@dataclass(frozen=True)
+class OutputExpectation:
+    expectation_id: int
+    run_id: int
+    output_kind: str
+    dedupe_key: str
+    created_at: str
 
 
 @dataclass(frozen=True)
@@ -248,7 +292,7 @@ class WorktreeRecord:
 class SQLiteStore:
     """Small SQLite store.
 
-    Version 10 is intentionally a fresh schema.  There is no production database
+    Version 12 is intentionally a fresh schema.  There is no production database
     migration contract for this pre-release implementation; an older database
     must be recreated rather than guessed into a new notification or Auto-fix
     routing model.
@@ -372,6 +416,43 @@ class SQLiteStore:
                     failure_class TEXT,
                     retryable INTEGER NOT NULL DEFAULT 0,
                     UNIQUE(project_id, mr_iid, sha)
+                );
+                CREATE TABLE IF NOT EXISTS policy_snapshots (
+                    run_id INTEGER PRIMARY KEY REFERENCES review_runs(id),
+                    target_branch TEXT NOT NULL,
+                    target_sha TEXT NOT NULL,
+                    policy_version INTEGER NOT NULL,
+                    policy_json TEXT NOT NULL,
+                    policy_sha256 TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS requested_outputs (
+                    run_id INTEGER PRIMARY KEY REFERENCES review_runs(id),
+                    human_review INTEGER NOT NULL,
+                    ai_review INTEGER NOT NULL,
+                    auto_fix INTEGER NOT NULL,
+                    notification_channels_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS effective_run_decisions (
+                    run_id INTEGER PRIMARY KEY REFERENCES review_runs(id),
+                    decision TEXT NOT NULL,
+                    human_review INTEGER NOT NULL,
+                    ai_review INTEGER NOT NULL,
+                    auto_fix INTEGER NOT NULL,
+                    suppressed INTEGER NOT NULL,
+                    recipients_json TEXT NOT NULL,
+                    notification_channels_json TEXT NOT NULL,
+                    reason TEXT,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS output_expectations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id INTEGER NOT NULL REFERENCES review_runs(id),
+                    output_kind TEXT NOT NULL,
+                    dedupe_key TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(run_id, output_kind, dedupe_key)
                 );
                 CREATE TABLE IF NOT EXISTS auto_fix_publication_intents (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -558,7 +639,7 @@ class SQLiteStore:
                     last_error TEXT,
                     UNIQUE(run_id, path)
                 );
-                PRAGMA user_version = 10;
+                PRAGMA user_version = 12;
                 """
             )
 
@@ -730,6 +811,393 @@ class SQLiteStore:
             ).fetchone()
         return self._review_run_from_row(row) if row is not None else None
 
+    def get_policy_snapshot(self, run_id: int) -> PolicySnapshot | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT run_id, target_branch, target_sha, policy_version,
+                       policy_json, policy_sha256, created_at
+                FROM policy_snapshots WHERE run_id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+        return PolicySnapshot(**dict(row)) if row is not None else None
+
+    def freeze_policy_snapshot(
+        self,
+        run_id: int,
+        claim_token: str | None,
+        *,
+        target_branch: str,
+        target_sha: str,
+        policy_version: int,
+        policy_json: str,
+    ) -> PolicySnapshot | None:
+        """Persist the exact target-branch policy once, fenced by the Run lease."""
+
+        if not claim_token:
+            return None
+        if not target_branch or target_branch.strip() != target_branch:
+            raise ValueError("target_branch must be a non-empty trimmed string")
+        target_sha = normalize_sha(target_sha)
+        if type(policy_version) is not int or policy_version <= 0:
+            raise ValueError("policy_version must be a positive integer")
+        try:
+            parsed_policy = json.loads(policy_json)
+        except json.JSONDecodeError as exc:
+            raise ValueError("policy snapshot must be valid JSON") from exc
+        canonical_policy = json.dumps(
+            parsed_policy, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        if canonical_policy != policy_json or not isinstance(parsed_policy, dict):
+            raise ValueError("policy snapshot must be a canonical JSON object")
+        policy_sha256 = hashlib.sha256(policy_json.encode("utf-8")).hexdigest()
+        now = self._now().isoformat()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            active = connection.execute(
+                """
+                SELECT 1 FROM review_runs
+                WHERE id = ? AND status = 'running' AND claim_token = ?
+                  AND lease_until IS NOT NULL AND lease_until > ?
+                """,
+                (run_id, claim_token, now),
+            ).fetchone()
+            if active is None:
+                return None
+            connection.execute(
+                """
+                INSERT INTO policy_snapshots(
+                    run_id, target_branch, target_sha, policy_version,
+                    policy_json, policy_sha256, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id) DO NOTHING
+                """,
+                (
+                    run_id,
+                    target_branch,
+                    target_sha,
+                    policy_version,
+                    policy_json,
+                    policy_sha256,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT run_id, target_branch, target_sha, policy_version,
+                       policy_json, policy_sha256, created_at
+                FROM policy_snapshots WHERE run_id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+        assert row is not None
+        snapshot = PolicySnapshot(**dict(row))
+        if (
+            snapshot.target_branch != target_branch
+            or snapshot.target_sha != target_sha
+            or snapshot.policy_version != policy_version
+            or snapshot.policy_json != policy_json
+            or snapshot.policy_sha256 != policy_sha256
+        ):
+            raise ValueError("Policy Snapshot is immutable for a Review Run")
+        return snapshot
+
+    @staticmethod
+    def _decode_string_tuple(value: str, field_name: str) -> tuple[str, ...]:
+        try:
+            loaded = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"stored {field_name} is invalid JSON") from exc
+        if not isinstance(loaded, list) or not all(isinstance(item, str) for item in loaded):
+            raise ValueError(f"stored {field_name} must be a string list")
+        return tuple(loaded)
+
+    @classmethod
+    def _requested_outputs_from_row(cls, row: sqlite3.Row) -> RequestedOutputs:
+        return RequestedOutputs(
+            run_id=int(row["run_id"]),
+            human_review=bool(row["human_review"]),
+            ai_review=bool(row["ai_review"]),
+            auto_fix=bool(row["auto_fix"]),
+            notification_channels=cls._decode_string_tuple(
+                row["notification_channels_json"], "notification channels"
+            ),
+            created_at=str(row["created_at"]),
+        )
+
+    def get_requested_outputs(self, run_id: int) -> RequestedOutputs | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM requested_outputs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        return self._requested_outputs_from_row(row) if row is not None else None
+
+    def freeze_requested_outputs(
+        self,
+        run_id: int,
+        claim_token: str | None,
+        *,
+        human_review: bool,
+        ai_review: bool,
+        auto_fix: bool,
+        notification_channels: tuple[str, ...],
+    ) -> RequestedOutputs | None:
+        if not claim_token:
+            return None
+        if len(set(notification_channels)) != len(notification_channels):
+            raise ValueError("requested notification channel IDs must be unique")
+        channels_json = json.dumps(list(notification_channels), separators=(",", ":"))
+        now = self._now().isoformat()
+        expected = (
+            int(human_review),
+            int(ai_review),
+            int(auto_fix),
+            channels_json,
+        )
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            active = connection.execute(
+                """
+                SELECT 1 FROM review_runs
+                WHERE id = ? AND status = 'running' AND claim_token = ?
+                  AND lease_until IS NOT NULL AND lease_until > ?
+                """,
+                (run_id, claim_token, now),
+            ).fetchone()
+            if active is None:
+                return None
+            connection.execute(
+                """
+                INSERT INTO requested_outputs(
+                    run_id, human_review, ai_review, auto_fix,
+                    notification_channels_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id) DO NOTHING
+                """,
+                (run_id, *expected, now),
+            )
+            row = connection.execute(
+                "SELECT * FROM requested_outputs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        assert row is not None
+        if tuple(row[key] for key in (
+            "human_review", "ai_review", "auto_fix", "notification_channels_json"
+        )) != expected:
+            raise ValueError("Requested Outputs are immutable for a Review Run")
+        return self._requested_outputs_from_row(row)
+
+    @classmethod
+    def _effective_decision_from_row(cls, row: sqlite3.Row) -> EffectiveRunDecision:
+        return EffectiveRunDecision(
+            run_id=int(row["run_id"]),
+            decision=str(row["decision"]),
+            human_review=bool(row["human_review"]),
+            ai_review=bool(row["ai_review"]),
+            auto_fix=bool(row["auto_fix"]),
+            suppressed=bool(row["suppressed"]),
+            recipients=cls._decode_string_tuple(row["recipients_json"], "recipients"),
+            notification_channels=cls._decode_string_tuple(
+                row["notification_channels_json"], "notification channels"
+            ),
+            reason=str(row["reason"]) if row["reason"] is not None else None,
+            created_at=str(row["created_at"]),
+        )
+
+    def get_effective_run_decision(self, run_id: int) -> EffectiveRunDecision | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM effective_run_decisions WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        return self._effective_decision_from_row(row) if row is not None else None
+
+    def list_output_expectations(self, run_id: int) -> tuple[OutputExpectation, ...]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id AS expectation_id, run_id, output_kind, dedupe_key, created_at
+                FROM output_expectations WHERE run_id = ? ORDER BY id
+                """,
+                (run_id,),
+            ).fetchall()
+        return tuple(OutputExpectation(**dict(row)) for row in rows)
+
+    def freeze_effective_run_decision(
+        self,
+        run_id: int,
+        claim_token: str | None,
+        *,
+        decision: str,
+        human_review: bool,
+        ai_review: bool,
+        auto_fix: bool,
+        suppressed: bool,
+        recipients: tuple[str, ...],
+        notification_channels: tuple[str, ...],
+        reason: str | None = None,
+        expectations: tuple[tuple[str, str], ...] = (),
+    ) -> EffectiveRunDecision | None:
+        if not claim_token:
+            return None
+        if decision not in {"execute", "cancelled", "suppressed"}:
+            raise ValueError("invalid Effective Run Decision")
+        if len(set(notification_channels)) != len(notification_channels):
+            raise ValueError("effective notification channel IDs must be unique")
+        if len(set(expectations)) != len(expectations):
+            raise ValueError("Output Expectations must be unique")
+        if any(
+            kind not in {"note", "notification", "autofix"} or not key
+            for kind, key in expectations
+        ):
+            raise ValueError("invalid Output Expectation")
+        recipients_json = json.dumps(list(recipients), separators=(",", ":"))
+        channels_json = json.dumps(list(notification_channels), separators=(",", ":"))
+        safe_reason = self._redact(reason) if reason else None
+        now = self._now().isoformat()
+        expected = (
+            decision,
+            int(human_review),
+            int(ai_review),
+            int(auto_fix),
+            int(suppressed),
+            recipients_json,
+            channels_json,
+            safe_reason,
+        )
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            active = connection.execute(
+                """
+                SELECT 1 FROM review_runs
+                WHERE id = ? AND status = 'running' AND claim_token = ?
+                  AND lease_until IS NOT NULL AND lease_until > ?
+                """,
+                (run_id, claim_token, now),
+            ).fetchone()
+            if active is None:
+                return None
+            connection.execute(
+                """
+                INSERT INTO effective_run_decisions(
+                    run_id, decision, human_review, ai_review, auto_fix, suppressed,
+                    recipients_json, notification_channels_json, reason, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id) DO NOTHING
+                """,
+                (run_id, *expected, now),
+            )
+            row = connection.execute(
+                "SELECT * FROM effective_run_decisions WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            assert row is not None
+            actual = tuple(row[key] for key in (
+                "decision", "human_review", "ai_review", "auto_fix", "suppressed",
+                "recipients_json", "notification_channels_json", "reason"
+            ))
+            if actual != expected:
+                raise ValueError("Effective Run Decision is immutable for a Review Run")
+            for output_kind, dedupe_key in expectations:
+                connection.execute(
+                    """
+                    INSERT INTO output_expectations(
+                        run_id, output_kind, dedupe_key, created_at
+                    ) VALUES (?, ?, ?, ?)
+                    ON CONFLICT(run_id, output_kind, dedupe_key) DO NOTHING
+                    """,
+                    (run_id, output_kind, dedupe_key, now),
+                )
+            saved_expectations = {
+                (saved["output_kind"], saved["dedupe_key"])
+                for saved in connection.execute(
+                    "SELECT output_kind, dedupe_key FROM output_expectations WHERE run_id = ?",
+                    (run_id,),
+                )
+            }
+            requested_expectations = set(expectations)
+            if not requested_expectations.issubset(saved_expectations) or any(
+                expectation not in requested_expectations and expectation[0] != "autofix"
+                for expectation in saved_expectations
+            ):
+                raise ValueError("Output Expectations are immutable for a Review Run")
+        return self._effective_decision_from_row(row)
+
+    def project_review_outcome(self, run_id: int) -> str:
+        """Project user-visible delivery without mutating the stable Run lifecycle."""
+
+        run = self.get_review_run(run_id)
+        if run is None:
+            raise ValueError("Review Run does not exist")
+        if run.status in {"pending", "running"}:
+            return "pending"
+        requested = self.get_requested_outputs(run_id)
+        decision = self.get_effective_run_decision(run_id)
+        if decision is None:
+            with self._connect() as connection:
+                if connection.execute(
+                    "SELECT 1 FROM auto_fix_relations WHERE run_id = ?", (run_id,)
+                ).fetchone() is not None:
+                    return "delivered"
+            return "indeterminate" if requested is not None else "no_effect"
+        expectations = self.list_output_expectations(run_id)
+        with self._connect() as connection:
+            optional_delivered = connection.execute(
+                "SELECT 1 FROM auto_fix_relations WHERE run_id = ?", (run_id,)
+            ).fetchone() is not None
+        if not expectations:
+            return "delivered" if optional_delivered else "no_effect"
+
+        states: list[str] = []
+        with self._connect() as connection:
+            for expectation in expectations:
+                if expectation.output_kind == "notification":
+                    row = connection.execute(
+                        """
+                        SELECT status FROM notification_outbox
+                        WHERE correlation_id = ? AND channel_id = ?
+                        """,
+                        (f"review-run:{run_id}:human", expectation.dedupe_key),
+                    ).fetchone()
+                    state = str(row["status"]) if row is not None else "missing"
+                    states.append(
+                        "delivered" if state == "delivered"
+                        else "pending" if state in {"pending", "running"}
+                        else "failed"
+                    )
+                elif expectation.output_kind == "note":
+                    row = connection.execute(
+                        "SELECT state FROM note_publication_requests WHERE run_id = ?",
+                        (run_id,),
+                    ).fetchone()
+                    state = str(row["state"]) if row is not None else "missing"
+                    states.append(
+                        "delivered" if state in {"published", "superseded"}
+                        else "pending" if state in {"pending", "running", "uncertain"}
+                        else "failed"
+                    )
+                else:
+                    row = connection.execute(
+                        """
+                        SELECT state FROM auto_fix_publication_plans
+                        WHERE run_id = ? AND plan_sha256 = ?
+                        """,
+                        (run_id, expectation.dedupe_key),
+                    ).fetchone()
+                    state = str(row["state"]) if row is not None else "missing"
+                    states.append(
+                        "delivered" if state in {"published", "superseded"}
+                        else "pending" if state in {
+                            "frozen", "running", "needs_reconciliation", "reconciling"
+                        }
+                        else "failed"
+                    )
+        if "pending" in states:
+            return "pending"
+        if all(state == "delivered" for state in states):
+            return "delivered"
+        if optional_delivered or "delivered" in states:
+            return "degraded"
+        return "undelivered"
+
     def get_project_bound_review_run_status(
         self, project_id: str, run_id: int
     ) -> dict[str, object] | None:
@@ -762,6 +1230,10 @@ class SQLiteStore:
             for failure in failures[-20:]
         ]
         latest_failure = failure_items[-1] if failure_items else None
+        policy_snapshot = self.get_policy_snapshot(run_id)
+        requested = self.get_requested_outputs(run_id)
+        effective = self.get_effective_run_decision(run_id)
+        expectations = self.list_output_expectations(run_id)
         receipt_items = [
             {
                 "receipt_id": receipt.receipt_id,
@@ -792,6 +1264,49 @@ class SQLiteStore:
             "claim_count": run.attempts,
             "failure_attempts": run.failure_attempts,
             "lease_recoveries": run.lease_recoveries,
+            "review_outcome": self.project_review_outcome(run_id),
+            "policy_snapshot": (
+                {
+                    "target_branch": policy_snapshot.target_branch,
+                    "target_sha": policy_snapshot.target_sha,
+                    "version": policy_snapshot.policy_version,
+                    "sha256": policy_snapshot.policy_sha256,
+                }
+                if policy_snapshot is not None
+                else None
+            ),
+            "requested_outputs": (
+                {
+                    "human_review": requested.human_review,
+                    "ai_review": requested.ai_review,
+                    "auto_fix": requested.auto_fix,
+                    "notification_channels": list(requested.notification_channels),
+                }
+                if requested is not None
+                else None
+            ),
+            "effective_decision": (
+                {
+                    "decision": effective.decision,
+                    "human_review": effective.human_review,
+                    "ai_review": effective.ai_review,
+                    "auto_fix": effective.auto_fix,
+                    "suppressed": effective.suppressed,
+                    "recipients": list(effective.recipients),
+                    "notification_channels": list(effective.notification_channels),
+                    "reason": effective.reason,
+                }
+                if effective is not None
+                else None
+            ),
+            "output_expectations": [
+                {
+                    "expectation_id": expectation.expectation_id,
+                    "output_kind": expectation.output_kind,
+                    "dedupe_key": expectation.dedupe_key,
+                }
+                for expectation in expectations
+            ],
             "failure": latest_failure,
             "failures": failure_items,
             "effect_receipts": receipt_items,
@@ -2374,6 +2889,15 @@ class SQLiteStore:
                     WHERE id = ? AND state = 'planned'
                     """,
                     (now, receipt_id),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO output_expectations(
+                        run_id, output_kind, dedupe_key, created_at
+                    ) VALUES (?, 'autofix', ?, ?)
+                    ON CONFLICT(run_id, output_kind, dedupe_key) DO NOTHING
+                    """,
+                    (run_id, plan_sha256, now),
                 )
                 existing = connection.execute(
                     f"SELECT {self._auto_fix_publication_plan_columns()} "

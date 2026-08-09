@@ -17,7 +17,7 @@ def test_loads_project_policy(tmp_path: Path) -> None:
     path.parent.mkdir()
     path.write_text(
         """
-version: 3
+version: 4
 pipeline_gate: true
 human:
   reviewers: [alice, bob]
@@ -29,9 +29,7 @@ ai:
   auto_fix: true
 notifications:
       channels:
-        - id: feishu-reviewers
-          type: feishu
-          webhook_env: FEISHU_WEBHOOK
+        - feishu-reviewers
 """,
         encoding="utf-8",
     )
@@ -41,9 +39,7 @@ notifications:
     assert policy.ai.backend == "local-agent"
     assert policy.ai.profile == "default"
     assert policy.ai.auto_fix is True
-    assert policy.notifications.channels[0]["id"] == "feishu-reviewers"
-    assert policy.notifications.channels[0]["type"] == "feishu"
-    assert policy.notifications.channels[0]["webhook_env"] == "FEISHU_WEBHOOK"
+    assert policy.notifications.channels == ("feishu-reviewers",)
 
 
 def test_example_policy_matches_current_schema() -> None:
@@ -59,6 +55,25 @@ def test_rejects_invalid_policy(tmp_path: Path) -> None:
     path = tmp_path / "reviewflow.yml"
     path.write_text("ai:\n  enabled: maybe\n", encoding="utf-8")
     with pytest.raises(PolicyError):
+        load_policy(path)
+
+
+def test_policy_rejects_oversized_project_input(tmp_path: Path) -> None:
+    path = tmp_path / "reviewflow.yml"
+    path.write_text("#" + "x" * (256 * 1024), encoding="utf-8")
+
+    with pytest.raises(PolicyError, match="exceeds"):
+        load_policy(path)
+
+
+def test_policy_rejects_duplicate_authority_keys(tmp_path: Path) -> None:
+    path = tmp_path / "reviewflow.yml"
+    path.write_text(
+        "version: 4\nai:\n  enabled: false\n  enabled: true\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PolicyError, match="duplicate key: enabled"):
         load_policy(path)
 
 
@@ -86,11 +101,20 @@ def test_requires_explicit_policy_schema_upgrade(tmp_path: Path) -> None:
 def test_policy_rejects_project_owned_command_and_version_two(tmp_path: Path) -> None:
     path = tmp_path / "reviewflow.yml"
     path.write_text(
-        "version: 3\nai:\n  enabled: true\n  command: [opencode, run]\n",
+        "version: 4\nai:\n  enabled: true\n  command: [opencode, run]\n",
         encoding="utf-8",
     )
     with pytest.raises(PolicyError, match="unknown fields: command"):
         load_policy(path)
     path.write_text("version: 2\n", encoding="utf-8")
     with pytest.raises(PolicyError, match="unsupported policy version: 2"):
+        load_policy(path)
+
+
+@pytest.mark.parametrize("skill", ["../../operator/SKILL.md", "/etc/review/SKILL.md"])
+def test_policy_rejects_skill_paths_outside_the_repository(tmp_path: Path, skill: str) -> None:
+    path = tmp_path / "reviewflow.yml"
+    path.write_text(f"version: 4\nai:\n  skill: {skill}\n", encoding="utf-8")
+
+    with pytest.raises(PolicyError, match="repository-relative"):
         load_policy(path)

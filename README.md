@@ -10,8 +10,9 @@ GitLab Note、Auto-fix MR 和通知。
 
 ## Target design
 
-- Project Policy 是仓库级请求；Operator 配置在仓库外定义可执行
-  Backend/Profile、环境 allowlist、校验和发布权限。
+- Project Policy 从 MR 目标分支精确 commit 读取并按 Run 冻结；Operator
+  配置在仓库外定义可执行 Backend/Profile、通知 channel、环境 allowlist、
+  校验和发布权限。
 - AI Review 和 Auto-fix 默认关闭；v0.1 是 Notify-only，不批准、不阻塞、
   不直接合并父 MR。
 - Agent 不持有 GitLab 发布凭据，不提交、push、创建 MR 或发 Note。
@@ -44,8 +45,9 @@ ruff check .
 ```
 
 当前代码已完成从 checkpoint 中 Agent-owned 预发布实现到 Program-owned
-发布路径的硬切换；Review Outcome、目标分支 Policy Snapshot 和生产运维门禁
-仍在实现中。不提供旧 Policy/SQLite/marker 兼容契约；项目尚在无生产数据的
+发布路径的硬切换；Review Outcome、目标分支 Policy Snapshot 和 Operator-owned
+通知绑定已实现，生产运维门禁仍在实现中。不提供旧 Policy/SQLite/marker
+兼容契约；项目尚在无生产数据的
 开发阶段，schema 变化时直接重建数据库，请以当前测试和
 implementation-status 为准。
 
@@ -61,7 +63,7 @@ review-agent-flow recover-autofix-relation \
   --reason "restore lost local Store" --db /trusted/path/reviewflow.db
 
 review-agent-flow resend-autofix-notification \
-  --project-id 42 --child-mr-iid 9 --policy /trusted/path/reviewflow.yml \
+  --project-id 42 --child-mr-iid 9 --operator-config /trusted/path/operator.yml \
   --reason "Operator approved notification resend" \
   --db /trusted/path/reviewflow.db
 ```

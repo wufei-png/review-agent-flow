@@ -6,6 +6,7 @@ from review_agent_flow.operator_config import (
     OperatorConfigError,
     load_operator_config,
     resolve_backend,
+    resolve_notification_channels,
 )
 from review_agent_flow.policy import AIPolicy
 
@@ -13,7 +14,7 @@ from review_agent_flow.policy import AIPolicy
 def _write_config(path: Path, publication: str = "") -> Path:
     path.write_text(
         f"""
-version: 1
+version: 2
 backends:
   local-agent:
     command: [opencode, run]
@@ -107,9 +108,9 @@ def test_operator_backend_kill_switch_denies_execution(tmp_path) -> None:
 @pytest.mark.parametrize(
     "replacement",
     [
-        "version: 2",
-        "version: 1\nunknown: true",
-        "version: 1\nbackends: []",
+        "version: 3",
+        "version: 2\nunknown: true",
+        "version: 2\nbackends: []",
     ],
 )
 def test_operator_config_is_strict(tmp_path, replacement: str) -> None:
@@ -167,7 +168,7 @@ def test_operator_yaml_rejects_duplicate_nested_authority_key(tmp_path) -> None:
     path = tmp_path / "operator.yml"
     path.write_text(
         """
-version: 1
+version: 2
 backends:
   local-agent:
     command: [opencode, run]
@@ -180,4 +181,57 @@ backends:
         encoding="utf-8",
     )
     with pytest.raises(OperatorConfigError, match="duplicate key: command"):
+        load_operator_config(path)
+
+
+def test_notification_bindings_are_operator_owned_and_project_scoped(
+    tmp_path, monkeypatch
+) -> None:
+    path = _write_config(tmp_path / "operator.yml")
+    path.write_text(
+        path.read_text(encoding="utf-8")
+        + """
+notifications:
+  channels:
+    reviewers:
+      type: feishu
+      webhook_env: REVIEWERS_WEBHOOK
+      allowed_projects: ["42"]
+      user_ids:
+        alice: ou_alice
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("REVIEWERS_WEBHOOK", "https://hooks.example.invalid/reviewers")
+    config = load_operator_config(path)
+
+    resolved = resolve_notification_channels(config, ("reviewers",), "42")
+
+    assert resolved[0].channel_id == "reviewers"
+    assert resolved[0].channel_type == "feishu"
+    assert resolved[0].user_ids == {"alice": "ou_alice"}
+    with pytest.raises(OperatorConfigError, match="does not allow Project"):
+        resolve_notification_channels(config, ("reviewers",), "99")
+
+
+def test_operator_config_does_not_expose_notification_credentials_to_agent(
+    tmp_path,
+) -> None:
+    path = _write_config(tmp_path / "operator.yml")
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            "environment: [MODEL_TOKEN]", "environment: [REVIEWERS_WEBHOOK]"
+        )
+        + """
+notifications:
+  channels:
+    reviewers:
+      type: feishu
+      webhook_env: REVIEWERS_WEBHOOK
+      allowed_projects: ["42"]
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(OperatorConfigError, match="overlaps Operator notification"):
         load_operator_config(path)

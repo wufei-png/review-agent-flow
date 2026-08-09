@@ -6,8 +6,9 @@ from review_agent_flow.notifications import (
     FanoutNotifier,
     NotificationEvent,
     NotificationResult,
-    notifiers_from_policy,
+    notifiers_from_operator,
 )
+from review_agent_flow.operator_config import ResolvedNotificationChannel
 from review_agent_flow.store import SQLiteStore
 
 
@@ -223,15 +224,9 @@ def test_custom_webhook_secret_is_redacted_from_log_and_store(
     tmp_path, monkeypatch, caplog
 ) -> None:
     secret = "https://hooks.example.invalid/custom-secret"
-    monkeypatch.setenv("CUSTOM_REVIEW_HOOK", secret)
-    notifier = notifiers_from_policy(
+    notifier = notifiers_from_operator(
         (
-            {
-                "id": "custom",
-                "type": "feishu",
-                "webhook_env": "CUSTOM_REVIEW_HOOK",
-                "user_ids": {},
-            },
+            ResolvedNotificationChannel("custom", "feishu", secret, {}),
         )
     )
     store = SQLiteStore(tmp_path / "review.db")
@@ -258,15 +253,9 @@ def test_rotated_webhook_secret_is_redacted_before_store_write(
 ) -> None:
     original = "https://hooks.example.invalid/original"
     rotated = "https://hooks.example.invalid/rotated"
-    monkeypatch.setenv("CUSTOM_REVIEW_HOOK", original)
-    notifier = notifiers_from_policy(
+    notifier = notifiers_from_operator(
         (
-            {
-                "id": "custom",
-                "type": "feishu",
-                "webhook_env": "CUSTOM_REVIEW_HOOK",
-                "user_ids": {},
-            },
+            ResolvedNotificationChannel("custom", "feishu", original, {}),
         )
     )
     store = SQLiteStore(tmp_path / "review.db")

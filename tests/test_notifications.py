@@ -22,7 +22,7 @@ def test_notification_title_is_sent_to_webhook(monkeypatch) -> None:
         def __exit__(self, exc_type, exc_value, traceback):
             return False
 
-        def read(self):
+        def read(self, size):
             return b'{"code": 0}'
 
     def fake_urlopen(request, timeout):
@@ -46,7 +46,7 @@ def test_notification_requires_provider_business_success(monkeypatch) -> None:
         def __exit__(self, exc_type, exc_value, traceback):
             return False
 
-        def read(self):
+        def read(self, size):
             return b'{"code": 99, "msg": "invalid token"}'
 
     monkeypatch.setattr(notifications, "urlopen", lambda request, timeout: Response())
@@ -55,3 +55,26 @@ def test_notification_requires_provider_business_success(monkeypatch) -> None:
     )
     assert result.delivered is False
     assert "provider rejected" in result.detail
+
+
+def test_notification_rejects_an_oversized_provider_response(monkeypatch) -> None:
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+        def read(self, size):
+            return b"x" * size
+
+    monkeypatch.setattr(notifications, "urlopen", lambda request, timeout: Response())
+
+    result = WebhookNotifier("feishu", "https://example.invalid").notify(
+        NotificationEvent(title="MR title", body="review body")
+    )
+
+    assert result.delivered is False
+    assert "exceeds" in result.detail

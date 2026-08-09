@@ -26,7 +26,8 @@ from .note_publisher import NotePublisher
 from .notification_dispatcher import NotificationDispatcher
 from .notifications import FanoutNotifier, NotificationEvent
 from .operator_config import AutoFixPublicationConfig, ResolvedBackend
-from .policy import ReviewPolicy
+from .policy import ReviewPolicy, policy_from_json, policy_json
+from .policy_resolver import ProjectPolicyResolver
 from .repository import GitShaEnsurer
 from .runner import (
     AgentContext,
@@ -91,6 +92,8 @@ class ReviewWorker:
         reconciliation_max_attempts: int = DEFAULT_RECONCILIATION_MAX_ATTEMPTS,
         agent_backend: ResolvedBackend | None = None,
         autofix_publication: AutoFixPublicationConfig | None = None,
+        policy_resolver: ProjectPolicyResolver | None = None,
+        backend_resolver: Callable[[ReviewPolicy], ResolvedBackend | None] | None = None,
     ) -> None:
         configured_project_id = (
             project_id if project_id is not None else os.getenv("REVIEW_AGENT_FLOW_PROJECT_ID")
@@ -104,9 +107,13 @@ class ReviewWorker:
         self.gitlab = gitlab
         self.worktrees = worktrees
         self.policy = policy
+        self._startup_policy = policy
+        self.policy_resolver = policy_resolver
+        self.backend_resolver = backend_resolver
         if policy.ai.enabled and agent_backend is None:
             raise ValueError("AI Review requires an Operator-authorized Agent Backend/Profile")
         self.agent_backend = agent_backend
+        self._startup_agent_backend = agent_backend
         self.repository = repository
         self.gitlab_url = gitlab_url
         self.gitlab_token = gitlab_token
@@ -176,6 +183,109 @@ class ReviewWorker:
         self.sha_ensurer = sha_ensurer or GitShaEnsurer(repository)
         self.worktree_cleanup_lease_seconds = worktree_cleanup_lease_seconds
         self.worktree_cleanup_max_attempts = worktree_cleanup_max_attempts
+
+    def _activate_run_policy(self, run: ReviewRun, target_branch: str) -> None:
+        """Load the immutable Project snapshot, then apply current Operator authorization."""
+
+        if self.policy_resolver is None:
+            policy = self._startup_policy
+            backend = self._startup_agent_backend
+        else:
+            snapshot = self.store.get_policy_snapshot(run.run_id)
+            if snapshot is None:
+                resolved = self.policy_resolver.resolve(run.project_id, target_branch)
+                snapshot = self.store.freeze_policy_snapshot(
+                    run.run_id,
+                    run.claim_token,
+                    target_branch=resolved.target_branch,
+                    target_sha=resolved.target_sha,
+                    policy_version=resolved.policy.version,
+                    policy_json=policy_json(resolved.policy),
+                )
+                if snapshot is None:
+                    raise LeaseLostError(
+                        "Review Run lease was lost before freezing the Policy Snapshot"
+                    )
+            policy = policy_from_json(snapshot.policy_json)
+            backend = None
+
+        requested = self.store.freeze_requested_outputs(
+            run.run_id,
+            run.claim_token,
+            human_review=policy.human.enabled,
+            ai_review=policy.ai.enabled,
+            auto_fix=policy.ai.auto_fix,
+            notification_channels=policy.notifications.channels,
+        )
+        if requested is None:
+            raise LeaseLostError(
+                "Review Run lease was lost before freezing Requested Outputs"
+            )
+        if self.policy_resolver is not None:
+            backend = (
+                self.backend_resolver(policy) if self.backend_resolver is not None else None
+            )
+            self.notifier.channel_specs(policy.notifications.channels)
+        if policy.ai.enabled and backend is None:
+            raise ValueError("AI Review requires an Operator-authorized Agent Backend/Profile")
+        auto_fix_enabled = bool(
+            policy.ai.auto_fix
+            and self.autofix_publication.enabled
+            and self.project_id in self.autofix_publication.allowed_projects
+        )
+        if policy.ai.auto_fix and not auto_fix_enabled:
+            raise ValueError(
+                "Auto-fix requires Operator-owned publication authorization for this Project"
+            )
+        self.policy = policy
+        self.agent_backend = backend
+        self.auto_fix_enabled = auto_fix_enabled
+        if backend is not None:
+            self.agent_timeout_seconds = backend.timeout_seconds
+
+    def _effective_notification_channels(self) -> tuple[str, ...]:
+        if self.policy_resolver is not None:
+            return self.policy.notifications.channels
+        return tuple(channel_id for channel_id, _ in self.notifier.channel_specs())
+
+    def _freeze_effective_decision(
+        self,
+        run: ReviewRun,
+        *,
+        cancelled: bool = False,
+        reason: str | None = None,
+    ) -> None:
+        if self.store.get_effective_run_decision(run.run_id) is not None:
+            return
+        suppressed = (
+            not cancelled
+            and self.store.is_suppressed_parent_sha(run.project_id, run.mr_iid, run.sha)
+        )
+        human_review = self.policy.human.enabled and not cancelled
+        ai_review = self.policy.ai.enabled and not suppressed and not cancelled
+        auto_fix = self.auto_fix_enabled and ai_review
+        channels = self._effective_notification_channels() if human_review else ()
+        expectations = tuple(("notification", channel_id) for channel_id in channels)
+        if ai_review:
+            expectations += (("note", self._agent_note_marker(run)),)
+        decision = "cancelled" if cancelled else ("suppressed" if suppressed else "execute")
+        frozen = self.store.freeze_effective_run_decision(
+            run.run_id,
+            run.claim_token,
+            decision=decision,
+            human_review=human_review,
+            ai_review=ai_review,
+            auto_fix=auto_fix,
+            suppressed=suppressed,
+            recipients=self.policy.human.reviewers if human_review else (),
+            notification_channels=channels,
+            reason=reason,
+            expectations=expectations,
+        )
+        if frozen is None:
+            raise LeaseLostError(
+                "Review Run lease was lost before freezing the Effective Run Decision"
+            )
 
     def _redaction_secrets(self) -> tuple[str, ...]:
         return tuple(
@@ -375,16 +485,19 @@ class ReviewWorker:
                     return self._lease_recovery_result(run, detail)
                 return WorkerResult(run.run_id, "cancelled", detail=detail)
 
-            state = str(merge_request.state or "opened").lower()
-            if state in {"closed", "merged"}:
-                detail = f"merge request is {state}"
-                if not self._finish_terminal(run, "cancelled", detail, "closed_or_merged"):
-                    return self._lease_recovery_result(run, detail)
-                return WorkerResult(run.run_id, "cancelled", detail=detail)
-
             if not is_valid_sha(merge_request.sha):
                 detail = "GitLab returned an invalid current Merge Request head SHA"
                 if not self._finish_terminal(run, "cancelled", detail, "invalid_sha"):
+                    return self._lease_recovery_result(run, detail)
+                return WorkerResult(run.run_id, "cancelled", detail=detail)
+
+            self._activate_run_policy(run, merge_request.target_branch)
+
+            state = str(merge_request.state or "opened").lower()
+            if state in {"closed", "merged"}:
+                detail = f"merge request is {state}"
+                self._freeze_effective_decision(run, cancelled=True, reason=detail)
+                if not self._finish_terminal(run, "cancelled", detail, "closed_or_merged"):
                     return self._lease_recovery_result(run, detail)
                 return WorkerResult(run.run_id, "cancelled", detail=detail)
 
@@ -397,6 +510,7 @@ class ReviewWorker:
                 or parse_auto_fix_marker(merge_request.description) is not None
             ):
                 detail = "Auto-fix child does not create or execute a Review Run"
+                self._freeze_effective_decision(run, cancelled=True, reason=detail)
                 if not self._finish_terminal(run, "cancelled", detail, "autofix_child"):
                     return self._lease_recovery_result(run, detail)
                 return WorkerResult(run.run_id, "cancelled", detail=detail)
@@ -404,6 +518,7 @@ class ReviewWorker:
             current_sha = merge_request.sha.lower()
             if current_sha != run.sha:
                 detail = f"stale run SHA; current Merge Request head is {current_sha}"
+                self._freeze_effective_decision(run, cancelled=True, reason=detail)
                 current_run = self.store.cancel_and_enqueue_latest(
                     run_id=run.run_id,
                     project_id=run.project_id,
@@ -451,10 +566,11 @@ class ReviewWorker:
                     self._log_run(run, status="deferred", diagnostic="pipeline gate")
                     return WorkerResult(run.run_id, "deferred", detail="pipeline gate")
 
+            self._freeze_effective_decision(run)
+            effective_decision = self.store.get_effective_run_decision(run.run_id)
+            assert effective_decision is not None
             self._notify_humans(run, merge_request)
-            if not self.policy.ai.enabled or self.store.is_suppressed_parent_sha(
-                run.project_id, run.mr_iid, run.sha
-            ):
+            if not effective_decision.ai_review:
                 if not self.store.finish(run.run_id, "succeeded", claim_token=run.claim_token):
                     return self._lease_recovery_result(
                         run, "Review Run lease lost before human-path completion"
@@ -1123,7 +1239,8 @@ class ReviewWorker:
                 url=merge_request.web_url,
                 recipients=self.policy.human.reviewers,
                 correlation_id=f"review-run:{run.run_id}:human",
-            )
+            ),
+            self.policy.notifications.channels if self.policy_resolver is not None else None,
         )
 
     def _notify_autofix(self, run: ReviewRun, parent_merge_request, auto_fix_merge_request) -> None:

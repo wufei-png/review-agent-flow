@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from .gitlab import CreatedCommit, CreatedMergeRequest, GitLabClient, is_valid_sha
 from .notifications import FanoutNotifier
 from .operator_config import AutoFixPublicationConfig
+from .policy import policy_from_json
 from .security import redact
 from .store import (
     DEFAULT_AUTO_FIX_PUBLICATION_LEASE_SECONDS,
@@ -164,6 +165,13 @@ class AutoFixPublisher:
                 raise ValueError("frozen Auto-fix Plan belongs to another Project")
             if readiness not in {"draft", "ready"}:
                 raise ValueError("frozen Auto-fix readiness is invalid")
+            snapshot = self.store.get_policy_snapshot(plan.run_id)
+            requested_channels = (
+                policy_from_json(snapshot.policy_json).notifications.channels
+                if snapshot is not None
+                else None
+            )
+            channel_specs = self.notifier.channel_specs(requested_channels)
         except (KeyError, TypeError, ValueError) as exc:
             return self._finish(plan, "blocked", str(exc))
 
@@ -313,7 +321,7 @@ class AutoFixPublisher:
             body="A Program-owned Auto-fix Merge Request is ready for review.",
             url=child.web_url,
             recipients=(parent.author_username,),
-            channels=self.notifier.channel_specs(),
+            channels=channel_specs,
         )
         if completed is None:
             return AutoFixPublicationResult(

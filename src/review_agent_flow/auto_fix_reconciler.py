@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from .failures import classify_exception
 from .gitlab import CreatedMergeRequest, GitLabClient, is_valid_sha
 from .notifications import FanoutNotifier
+from .policy import policy_from_json
 from .security import redact
 from .store import (
     DEFAULT_AUTO_FIX_RECONCILIATION_LEASE_SECONDS,
@@ -155,6 +156,18 @@ class AutoFixReconciler:
         target_branch: str,
         parent_author: str,
     ) -> AutoFixReconciliationResult:
+        snapshot = self.store.get_policy_snapshot(plan.run_id)
+        requested_channels = (
+            policy_from_json(snapshot.policy_json).notifications.channels
+            if snapshot is not None
+            else None
+        )
+        try:
+            channel_specs = self.notifier.channel_specs(requested_channels)
+        except ValueError:
+            # A recovered remote MR is stronger evidence than a now-disabled
+            # notification binding. Persist the Relation and leave delivery empty.
+            channel_specs = ()
         completed = self.store.complete_auto_fix_publication(
             plan.plan_id,
             plan.claim_token,
@@ -167,7 +180,7 @@ class AutoFixReconciler:
             body="A Program-owned Auto-fix Merge Request is ready for review.",
             url=child.web_url,
             recipients=(parent_author,),
-            channels=self.notifier.channel_specs(),
+            channels=channel_specs,
         )
         if completed is None:
             return AutoFixReconciliationResult(

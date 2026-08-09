@@ -171,10 +171,24 @@ class RepositoryCommitObservation:
     actions: tuple[RepositoryAction, ...]
 
 
+@dataclass(frozen=True)
+class RepositoryFile:
+    """One repository file read at an exact resolved branch commit."""
+
+    project_id: str
+    file_path: str
+    ref_sha: str
+    content: str | None
+
+
 class GitLabClient(Protocol):
     def get_merge_request(self, project_id: str, mr_iid: int) -> MergeRequest: ...
 
     def get_latest_pipeline(self, project_id: str, sha: str) -> Pipeline | None: ...
+
+    def get_repository_file(
+        self, project_id: str, file_path: str, branch: str
+    ) -> RepositoryFile: ...
 
     def create_note(self, project_id: str, mr_iid: int, body: str) -> Note: ...
 

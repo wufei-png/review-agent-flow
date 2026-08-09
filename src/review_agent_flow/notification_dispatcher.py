@@ -60,10 +60,18 @@ class NotificationDispatcher:
     def _redact(self, value: object) -> str:
         return redact(value, secrets=self._secrets())
 
-    def enqueue(self, event: NotificationEvent) -> tuple[NotificationDelivery, ...]:
+    def enqueue(
+        self,
+        event: NotificationEvent,
+        channel_ids: tuple[str, ...] | None = None,
+    ) -> tuple[NotificationDelivery, ...]:
         """Persist one delivery per configured channel without sending HTTP."""
 
-        channels = self.notifier.channel_specs()
+        channels = (
+            self.notifier.channel_specs()
+            if channel_ids is None
+            else self.notifier.channel_specs(channel_ids)
+        )
         if not channels:
             return ()
         correlation_id = event.correlation_id or f"notification:{uuid4().hex}"

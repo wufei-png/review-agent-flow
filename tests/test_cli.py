@@ -5,7 +5,6 @@ from types import SimpleNamespace
 import pytest
 
 from review_agent_flow import cli
-from review_agent_flow.policy import ReviewPolicy
 from review_agent_flow.worker import WorkerResult
 
 
@@ -18,14 +17,10 @@ class FakeNotificationDispatcher:
         return 0
 
 
-def test_worker_resolves_relative_policy_from_repository(monkeypatch, tmp_path: Path) -> None:
+def test_worker_configures_target_branch_policy_resolver(monkeypatch, tmp_path: Path) -> None:
     repository = tmp_path / "project"
     repository.mkdir()
     captured = {}
-
-    def fake_load_policy(path):
-        captured["policy_path"] = path
-        return ReviewPolicy()
 
     class FakeWorker:
         def __init__(self, **kwargs):
@@ -45,18 +40,25 @@ def test_worker_resolves_relative_policy_from_repository(monkeypatch, tmp_path: 
         def run_forever(self, poll_interval):
             raise AssertionError("test must use --once")
 
-    monkeypatch.setattr(cli, "load_policy", fake_load_policy)
     monkeypatch.setattr(cli, "SQLiteStore", lambda path: object())
     monkeypatch.setenv("GITLAB_REVIEW_BOT_USERNAME", "review-bot")
     monkeypatch.setattr(cli, "PythonGitLabClient", lambda url, token, username: object())
     monkeypatch.setattr(cli, "GitWorktreeManager", lambda repository, root: object())
     monkeypatch.setattr(cli, "ReviewWorker", FakeWorker)
-    monkeypatch.setattr(cli, "notifiers_from_policy", lambda channels: object())
+    monkeypatch.setattr(cli, "notifiers_from_operator", lambda channels: object())
+    monkeypatch.setattr(cli, "resolve_notification_channels", lambda *args: ())
+    monkeypatch.setattr(
+        cli,
+        "GitLabTargetBranchPolicyResolver",
+        lambda gitlab, path: captured.update(policy_path=path) or object(),
+    )
     monkeypatch.setattr(
         cli,
         "load_operator_config",
         lambda path: SimpleNamespace(
-            autofix_publication=SimpleNamespace(enabled=False, allowed_projects=frozenset())
+            autofix_publication=SimpleNamespace(enabled=False, allowed_projects=frozenset()),
+            notification_channels={},
+            backends={},
         ),
     )
     monkeypatch.setattr(cli, "resolve_backend", lambda *args, **kwargs: None)
@@ -75,7 +77,7 @@ def test_worker_resolves_relative_policy_from_repository(monkeypatch, tmp_path: 
         once=True,
     )
     assert cli._run_worker(args) == 0
-    assert captured["policy_path"] == repository / ".gitlab/reviewflow.yml"
+    assert captured["policy_path"] == ".gitlab/reviewflow.yml"
     assert captured["worker"]["project_id"] == "42"
     assert captured["notification_dispatcher"].batch_calls == 1
 
@@ -102,18 +104,21 @@ def test_worker_once_emits_json_run_status(monkeypatch, tmp_path: Path, capsys) 
         def run_forever(self, poll_interval):
             raise AssertionError("test must use --once")
 
-    monkeypatch.setattr(cli, "load_policy", lambda path: ReviewPolicy())
     monkeypatch.setattr(cli, "SQLiteStore", lambda path: object())
     monkeypatch.setenv("GITLAB_REVIEW_BOT_USERNAME", "review-bot")
     monkeypatch.setattr(cli, "PythonGitLabClient", lambda url, token, username: object())
     monkeypatch.setattr(cli, "GitWorktreeManager", lambda repository, root: object())
     monkeypatch.setattr(cli, "ReviewWorker", FakeWorker)
-    monkeypatch.setattr(cli, "notifiers_from_policy", lambda channels: object())
+    monkeypatch.setattr(cli, "notifiers_from_operator", lambda channels: object())
+    monkeypatch.setattr(cli, "resolve_notification_channels", lambda *args: ())
+    monkeypatch.setattr(cli, "GitLabTargetBranchPolicyResolver", lambda gitlab, path: object())
     monkeypatch.setattr(
         cli,
         "load_operator_config",
         lambda path: SimpleNamespace(
-            autofix_publication=SimpleNamespace(enabled=False, allowed_projects=frozenset())
+            autofix_publication=SimpleNamespace(enabled=False, allowed_projects=frozenset()),
+            notification_channels={},
+            backends={},
         ),
     )
     monkeypatch.setattr(cli, "resolve_backend", lambda *args, **kwargs: None)
@@ -244,13 +249,13 @@ def test_cli_routes_separate_notification_resend(monkeypatch) -> None:
             "resend-autofix-notification",
             "--child-mr-iid",
             "9",
-            "--policy",
-            "/trusted/policy.yml",
+            "--operator-config",
+            "/trusted/operator.yml",
             "--reason",
             "resend approved",
         ]
     )
 
     assert result == 8
-    assert captured["args"].policy == "/trusted/policy.yml"
+    assert captured["args"].operator_config == "/trusted/operator.yml"
     assert captured["args"].reason == "resend approved"

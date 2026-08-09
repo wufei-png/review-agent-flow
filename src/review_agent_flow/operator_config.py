@@ -14,7 +14,7 @@ import yaml
 
 from .policy import AIPolicy
 
-OPERATOR_CONFIG_VERSION = 1
+OPERATOR_CONFIG_VERSION = 2
 _ENVIRONMENT_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _FORBIDDEN_AGENT_ENVIRONMENT = {
     "GITLAB_TOKEN",
@@ -84,10 +84,27 @@ class AutoFixPublicationConfig:
 
 
 @dataclass(frozen=True)
+class NotificationChannelConfig:
+    channel_type: str
+    webhook_env: str
+    allowed_projects: frozenset[str]
+    user_ids: Mapping[str, str]
+
+
+@dataclass(frozen=True)
+class ResolvedNotificationChannel:
+    channel_id: str
+    channel_type: str
+    webhook_url: str
+    user_ids: Mapping[str, str]
+
+
+@dataclass(frozen=True)
 class OperatorConfig:
     version: int
     backends: Mapping[str, AgentBackend]
     autofix_publication: AutoFixPublicationConfig
+    notification_channels: Mapping[str, NotificationChannelConfig]
 
 
 @dataclass(frozen=True)
@@ -133,6 +150,13 @@ def _environment_name(value: Any) -> str:
     return name
 
 
+def _notification_environment_name(value: Any) -> str:
+    name = _name(value, "notification webhook environment")
+    if _ENVIRONMENT_NAME_RE.fullmatch(name) is None:
+        raise OperatorConfigError(f"invalid environment variable name: {name}")
+    return name
+
+
 def _projects(value: Any, field: str) -> frozenset[str]:
     if not isinstance(value, list):
         raise OperatorConfigError(f"{field} must be a list")
@@ -154,7 +178,11 @@ def load_operator_config(path: str | Path) -> OperatorConfig:
     except yaml.YAMLError as exc:
         raise OperatorConfigError(f"invalid operator config YAML: {exc}") from exc
     root = _mapping(loaded, "operator config")
-    _reject_unknown(root, {"version", "backends", "autofix_publication"}, "operator config")
+    _reject_unknown(
+        root,
+        {"version", "backends", "autofix_publication", "notifications"},
+        "operator config",
+    )
     version = root.get("version")
     if type(version) is not int or version != OPERATOR_CONFIG_VERSION:
         raise OperatorConfigError(f"unsupported operator config version: {version}")
@@ -224,6 +252,58 @@ def load_operator_config(path: str | Path) -> OperatorConfig:
         raise OperatorConfigError("ci_trigger must be manual or automatic")
     if readiness == "ready" and ci_trigger == "manual":
         raise OperatorConfigError("ready/manual Auto-fix publication is not supported")
+    notification_root = _mapping(root.get("notifications", {}), "notifications")
+    _reject_unknown(notification_root, {"channels"}, "notifications")
+    notification_values = _mapping(
+        notification_root.get("channels", {}), "notifications.channels"
+    )
+    notification_channels: dict[str, NotificationChannelConfig] = {}
+    for channel_id, channel_value in notification_values.items():
+        channel_id = _name(channel_id, "notification channel ID")
+        channel = _mapping(channel_value, f"notifications.channels.{channel_id}")
+        _reject_unknown(
+            channel,
+            {"type", "webhook_env", "allowed_projects", "user_ids"},
+            f"notifications.channels.{channel_id}",
+        )
+        channel_type = channel.get("type")
+        if channel_type not in {"feishu", "wecom"}:
+            raise OperatorConfigError(
+                f"notifications.channels.{channel_id}.type must be feishu or wecom"
+            )
+        webhook_env = _notification_environment_name(channel.get("webhook_env"))
+        allowed_projects = _projects(
+            channel.get("allowed_projects", []),
+            f"notifications.channels.{channel_id}.allowed_projects",
+        )
+        user_ids_value = _mapping(
+            channel.get("user_ids", {}),
+            f"notifications.channels.{channel_id}.user_ids",
+        )
+        user_ids = {
+            _name(username, f"notifications.channels.{channel_id}.user_ids key"):
+            _name(user_id, f"notifications.channels.{channel_id}.user_ids value")
+            for username, user_id in user_ids_value.items()
+        }
+        notification_channels[channel_id] = NotificationChannelConfig(
+            channel_type,
+            webhook_env,
+            allowed_projects,
+            MappingProxyType(user_ids),
+        )
+
+    notification_credentials = {
+        channel.webhook_env for channel in notification_channels.values()
+    }
+    for backend_name, backend in backends.items():
+        for profile_name, profile in backend.profiles.items():
+            exposed = sorted(set(profile.environment) & notification_credentials)
+            if exposed:
+                raise OperatorConfigError(
+                    "Agent environment overlaps Operator notification credentials "
+                    f"for {backend_name}/{profile_name}: {', '.join(exposed)}"
+                )
+
     return OperatorConfig(
         version,
         MappingProxyType(backends),
@@ -233,7 +313,51 @@ def load_operator_config(path: str | Path) -> OperatorConfig:
             readiness,
             ci_trigger,
         ),
+        MappingProxyType(notification_channels),
     )
+
+
+def resolve_notification_channels(
+    config: OperatorConfig,
+    requested_channel_ids: Iterable[str],
+    project_id: str,
+    environ: Mapping[str, str] | None = None,
+) -> tuple[ResolvedNotificationChannel, ...]:
+    """Resolve Project-requested channel IDs through trusted Operator bindings."""
+
+    requested = tuple(requested_channel_ids)
+    if len(set(requested)) != len(requested):
+        raise OperatorConfigError("requested notification channel IDs must be unique")
+    source = os.environ if environ is None else environ
+    resolved: list[ResolvedNotificationChannel] = []
+    for channel_id in requested:
+        channel = config.notification_channels.get(channel_id)
+        if channel is None:
+            raise OperatorConfigError(
+                f"notification channel is not Operator-authorized: {channel_id}"
+            )
+        if project_id not in channel.allowed_projects:
+            raise OperatorConfigError(
+                f"notification channel {channel_id} does not allow Project {project_id}"
+            )
+        webhook_url = source.get(channel.webhook_env)
+        if not webhook_url:
+            raise OperatorConfigError(
+                f"notification webhook environment variable is missing: {channel.webhook_env}"
+            )
+        if not webhook_url.startswith("https://"):
+            raise OperatorConfigError(
+                f"notification channel {channel_id} requires an https webhook URL"
+            )
+        resolved.append(
+            ResolvedNotificationChannel(
+                channel_id,
+                channel.channel_type,
+                webhook_url,
+                channel.user_ids,
+            )
+        )
+    return tuple(resolved)
 
 
 def resolve_backend(

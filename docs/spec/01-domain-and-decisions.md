@@ -18,7 +18,7 @@ Note、Auto-fix MR 和通知。
 | Area | Decision |
 | --- | --- |
 | ReviewKey | `Project + 父 MR IID + 精确 SHA`；不含 `kind` |
-| Policy | Project Policy v3 只表达请求；Operator 配置授权 Backend/Profile 和 Publisher |
+| Policy | 目标分支 Project Policy v4 按 Run 冻结；Operator v2 授权 Backend/Profile、通知和 Publisher |
 | Review mode | v0.1 只有 Notify-only；不写 GitLab Approval |
 | Human/AI | 独立开关；AI 和 Auto-fix 默认关闭 |
 | Agent result | 受控 Result Path 中的严格 v1 JSON；stdout/stderr 只是诊断 |
@@ -40,5 +40,5 @@ Note、Auto-fix MR 和通知。
 - Enforce/Approval Requirement、AI approval、AI blocking 或直接 merge
 - Agent 凭据隔离的通用 OS sandbox 实现
 - fork/cross-Project Auto-fix publication
-- 旧 Policy v1/v2、Run-ID marker 或 SQLite schema 迁移
+- 旧 Policy v1-v3、Operator v1、Run-ID marker 或 SQLite schema 迁移
 - 独立 Dispatcher/Reconciler OS 进程、Redis 或 Postgres

@@ -3,9 +3,15 @@ from pathlib import Path
 
 from review_agent_flow.auto_fix_reconciler import AutoFixReconciler
 from review_agent_flow.autofix_publisher import AutoFixPublisher
-from review_agent_flow.gitlab import CreatedCommit, CreatedMergeRequest, MergeRequest
+from review_agent_flow.gitlab import (
+    CreatedCommit,
+    CreatedMergeRequest,
+    MergeRequest,
+    canonical_note_marker,
+)
 from review_agent_flow.notifications import FanoutNotifier, NotificationEvent, NotificationResult
 from review_agent_flow.operator_config import AutoFixPublicationConfig
+from review_agent_flow.policy import NotificationPolicy, ReviewPolicy, policy_json
 from review_agent_flow.store import SQLiteStore
 
 SHA = "a" * 40
@@ -105,11 +111,65 @@ class FakeGitLab:
         return self.found_merge_request
 
 
-def _frozen_plan(tmp_path: Path) -> tuple[SQLiteStore, int, int, str]:
+def _frozen_plan(
+    tmp_path: Path,
+    *,
+    policy_channels: tuple[str, ...] | None = None,
+    with_delivered_note: bool = False,
+) -> tuple[SQLiteStore, int, int, str]:
     store = SQLiteStore(tmp_path / "review.db")
     run = store.enqueue("42", 1, SHA)
     claimed = store.claim_next(project_id="42")
     assert claimed is not None
+    if policy_channels is not None:
+        policy = ReviewPolicy(
+            notifications=NotificationPolicy(channels=policy_channels)
+        )
+        assert store.freeze_policy_snapshot(
+            run.run_id,
+            claimed.claim_token,
+            target_branch="main",
+            target_sha="b" * 40,
+            policy_version=policy.version,
+            policy_json=policy_json(policy),
+        )
+    note_request_id = None
+    if with_delivered_note:
+        marker = canonical_note_marker("42", 1, SHA)
+        assert store.freeze_requested_outputs(
+            run.run_id,
+            claimed.claim_token,
+            human_review=False,
+            ai_review=True,
+            auto_fix=True,
+            notification_channels=(),
+        )
+        assert store.freeze_effective_run_decision(
+            run.run_id,
+            claimed.claim_token,
+            decision="execute",
+            human_review=False,
+            ai_review=True,
+            auto_fix=True,
+            suppressed=False,
+            recipients=(),
+            notification_channels=(),
+            expectations=(("note", marker),),
+        )
+        note_receipt = store.create_effect_receipt(
+            run.run_id,
+            "note_expected",
+            marker,
+            state="planned",
+        )
+        note_request = store.create_note_publication_request(
+            run.run_id,
+            note_receipt.receipt_id,
+            "reviewed",
+            claimed.claim_token,
+        )
+        assert note_request is not None
+        note_request_id = note_request.request_id
     intent = store.create_auto_fix_publication_intent(
         claimed.run_id, claimed.claim_token
     )
@@ -155,6 +215,15 @@ def _frozen_plan(tmp_path: Path) -> tuple[SQLiteStore, int, int, str]:
     )
     assert plan is not None
     assert store.finish(claimed.run_id, "succeeded", claim_token=claimed.claim_token)
+    if note_request_id is not None:
+        claimed_note = store.claim_note_publication(request_id=note_request_id)
+        assert claimed_note is not None
+        assert store.finish_note_publication(
+            note_request_id,
+            claimed_note.claim_token,
+            state="published",
+            external_note_id=7,
+        )
     return store, run.run_id, plan.plan_id, branch
 
 
@@ -236,6 +305,58 @@ def test_lost_lease_before_commit_prevents_external_write(
     assert result is not None and result.status == "deferred"
     assert gitlab.commit_payloads == []
     assert gitlab.mr_payloads == []
+
+
+def test_publisher_blocks_before_external_write_when_frozen_channel_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    store, _run_id, plan_id, _branch = _frozen_plan(
+        tmp_path, policy_channels=("removed-channel",)
+    )
+    gitlab = FakeGitLab(
+        MergeRequest("42", 1, "Parent", "alice", "feature", "main", SHA, "https://parent")
+    )
+
+    result = _publisher(store, gitlab).process(plan_id=plan_id)
+
+    assert result is not None and result.status == "blocked"
+    assert "not configured" in result.detail
+    assert gitlab.commit_payloads == []
+    assert gitlab.mr_payloads == []
+
+
+def test_review_outcome_tracks_pending_and_blocked_autofix_plan(tmp_path: Path) -> None:
+    store, run_id, plan_id, _branch = _frozen_plan(
+        tmp_path, with_delivered_note=True
+    )
+    gitlab = FakeGitLab(
+        MergeRequest("42", 1, "Parent", "alice", "feature", "main", SHA, "https://parent")
+    )
+
+    assert store.project_review_outcome(run_id) == "pending"
+    result = AutoFixPublisher(
+        store,
+        gitlab,
+        "42",
+        AutoFixPublicationConfig(enabled=False),
+    ).process(plan_id=plan_id)
+
+    assert result is not None and result.status == "blocked"
+    assert store.project_review_outcome(run_id) == "degraded"
+
+
+def test_review_outcome_is_delivered_after_note_and_autofix_publish(tmp_path: Path) -> None:
+    store, run_id, plan_id, _branch = _frozen_plan(
+        tmp_path, with_delivered_note=True
+    )
+    gitlab = FakeGitLab(
+        MergeRequest("42", 1, "Parent", "alice", "feature", "main", SHA, "https://parent")
+    )
+
+    result = _publisher(store, gitlab).process(plan_id=plan_id)
+
+    assert result is not None and result.status == "published"
+    assert store.project_review_outcome(run_id) == "delivered"
 
 
 def test_lost_lease_before_merge_request_stops_after_commit(

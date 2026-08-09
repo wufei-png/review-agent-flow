@@ -7,7 +7,6 @@ import logging
 import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Protocol
 from uuid import uuid4
 
@@ -15,7 +14,6 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 
 from .events import parse_auto_fix_branch, parse_auto_fix_marker, parse_webhooks
-from .policy import load_policy
 from .security import redact
 from .store import SQLiteStore
 from .structured_logging import log_event as _emit_log_event
@@ -101,39 +99,21 @@ def _storage_probe(
     return False, "storage readiness probe returned an unsupported result"
 
 
-def _env_bool(name: str, default: bool = False) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    normalized = value.strip().lower()
-    if normalized not in {"true", "false"}:
-        raise StartupConfigurationError(f"{name} must be true or false")
-    return normalized == "true"
-
-
 def create_app(
     store: SQLiteStore | None = None,
     webhook_secret: str | None = None,
     project_id: str | None = None,
     pipeline_gate: bool | None = None,
-    policy_path: str | Path | None = None,
     live_probe: LiveGitLabProbe | Callable[[str], object] | None = None,
 ) -> FastAPI:
     webhook_secret = _required_config(webhook_secret, "GITLAB_WEBHOOK_SECRET")
     project_id = _required_config(project_id, "REVIEW_AGENT_FLOW_PROJECT_ID").strip()
     store = store or SQLiteStore(os.getenv("REVIEW_AGENT_FLOW_DB", "review-agent-flow.sqlite3"))
     if pipeline_gate is None:
-        configured_policy = policy_path or os.getenv("REVIEW_AGENT_FLOW_POLICY")
-        if configured_policy is None and os.getenv("REVIEW_AGENT_FLOW_REPOSITORY"):
-            configured_policy = ".gitlab/reviewflow.yml"
-        if configured_policy is not None:
-            configured_path = Path(configured_policy)
-            repository = os.getenv("REVIEW_AGENT_FLOW_REPOSITORY")
-            if not configured_path.is_absolute() and repository:
-                configured_path = Path(repository) / configured_path
-            pipeline_gate = load_policy(configured_path).pipeline_gate
-        else:
-            pipeline_gate = _env_bool("REVIEW_AGENT_FLOW_PIPELINE_GATE")
+        # Policy authority belongs to the target branch and is frozen by the
+        # Worker. Waking an exact-SHA pending Run is safe even when its snapshot
+        # ultimately disables the gate.
+        pipeline_gate = True
     register_secret = getattr(store, "add_redaction_secret", None)
     if callable(register_secret):
         register_secret(webhook_secret)

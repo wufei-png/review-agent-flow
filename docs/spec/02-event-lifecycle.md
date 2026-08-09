@@ -7,17 +7,19 @@
    或非法事件不入队。
 3. Store 以 `(project_id, parent_mr_iid, sha)` 幂等创建 Review Run。
 4. Pipeline Gate 启用时，Pipeline Hook 只唤醒已有 pending Run，不创建新类型的 Run。
-5. Review 循环以 claim token/lease 领取 Run，再次校验 MR 仍打开、Ready
-   且 head SHA 精确匹配。
-6. Human 通知请求按 channel 持久化；Notification 循环独立投递。
-7. AI 路径确保 SHA 可用，创建 Trusted Workspace 和受控 Result Path，调用
+5. Review 循环以 claim token/lease 领取 Run，再次校验 MR，并从目标分支精确
+   commit 读取 Policy v4；Policy Snapshot 与 Requested Outputs 每个 Run 只冻结一次。
+6. MR eligibility 和 Operator 授权解析后，Effective Run Decision 与逐 channel/Note
+   Output Expectations 在任何用户可见副作用前原子冻结。
+7. Human 通知请求按 Operator-owned channel 持久化；Notification 循环独立投递。
+8. AI 路径确保 SHA 可用，创建 Trusted Workspace 和受控 Result Path，调用
    Operator 授权的 Backend/Profile。
-8. Agent 成功后，ReviewFlow 分别验证 Note 结果和可选 Auto-fix
+9. Agent 成功后，ReviewFlow 分别验证 Note 结果和可选 Auto-fix
    提议；两种效果互不回滚。
-9. 首次发布前如 head 已变更，旧 SHA 的未发布效果终止为
+10. 首次发布前如 head 已变更，旧 SHA 的未发布效果终止为
    `superseded`，新 SHA 使用新 ReviewKey。
-10. Worktree cleanup 是独立资源任务，失败不会重跑 Agent。
-11. Worker lease 在 Note Request 已冻结后过期时，重试直接完成并发布该持久化
+11. Worktree cleanup 是独立资源任务，失败不会重跑 Agent。
+12. Worker lease 在 Note Request 已冻结后过期时，重试直接完成并发布该持久化
     Note，不再次调用非确定性 Agent；若 Auto-fix Plan 尚未持久化，则对应 Intent
     和 receipt fail closed 为 `blocked`，不从遗留 worktree 推断候选。
 

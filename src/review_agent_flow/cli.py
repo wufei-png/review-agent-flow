@@ -15,9 +15,15 @@ from uuid import uuid4
 from . import __version__
 from .autofix_recovery import AutoFixRecoveryService, OperatorContext
 from .gitlab_client import PythonGitLabClient
-from .notifications import notifiers_from_policy
-from .operator_config import OperatorConfigError, load_operator_config, resolve_backend
-from .policy import load_policy, policy_template
+from .notifications import notifiers_from_operator
+from .operator_config import (
+    OperatorConfigError,
+    load_operator_config,
+    resolve_backend,
+    resolve_notification_channels,
+)
+from .policy import ReviewPolicy, policy_from_json, policy_template
+from .policy_resolver import GitLabTargetBranchPolicyResolver
 from .repository import GitShaEnsurer
 from .store import SQLiteStore
 from .worker import ReviewWorker
@@ -46,10 +52,9 @@ def _run_worker(args: argparse.Namespace) -> int:
     gitlab_token = _required(args.gitlab_token, "GITLAB_TOKEN")
     project_id = _required(args.project_id, "REVIEW_AGENT_FLOW_PROJECT_ID")
     repository = Path(_required(args.repository, "REVIEW_AGENT_FLOW_REPOSITORY")).expanduser().resolve()
-    policy_path = Path(args.policy or os.getenv("REVIEW_AGENT_FLOW_POLICY", ".gitlab/reviewflow.yml"))
-    if not policy_path.is_absolute():
-        policy_path = repository / policy_path
-    policy = load_policy(policy_path)
+    policy_path = args.policy or os.getenv(
+        "REVIEW_AGENT_FLOW_POLICY", ".gitlab/reviewflow.yml"
+    )
     operator_path = Path(
         _required(args.operator_config, "REVIEW_AGENT_FLOW_OPERATOR_CONFIG")
     ).expanduser().resolve()
@@ -57,32 +62,34 @@ def _run_worker(args: argparse.Namespace) -> int:
         raise SystemExit("Operator configuration must be outside the reviewed repository")
     try:
         operator_config = load_operator_config(operator_path)
-        agent_backend = resolve_backend(
-            operator_config,
-            policy.ai,
-            project_id,
-            forbidden_environment=(
-                str(channel["webhook_env"])
-                for channel in policy.notifications.channels
-            ),
+        notification_channel_ids = tuple(
+            channel_id
+            for channel_id, channel in operator_config.notification_channels.items()
+            if project_id in channel.allowed_projects
+        )
+        resolved_notifications = resolve_notification_channels(
+            operator_config, notification_channel_ids, project_id
         )
     except OperatorConfigError as exc:
         raise SystemExit(f"invalid Operator configuration: {exc}") from exc
     review_bot_username = _required(None, "GITLAB_REVIEW_BOT_USERNAME")
-    if policy.ai.auto_fix and (
-        not operator_config.autofix_publication.enabled
-        or project_id not in operator_config.autofix_publication.allowed_projects
-    ):
-        raise SystemExit("Auto-fix is not authorized for this Project by the Operator")
     store = SQLiteStore(args.db or os.getenv("REVIEW_AGENT_FLOW_DB", "review-agent-flow.sqlite3"))
+    gitlab = PythonGitLabClient(gitlab_url, gitlab_token, review_bot_username)
+    allowed_timeouts = [
+        profile.timeout_seconds
+        for backend in operator_config.backends.values()
+        if backend.enabled and project_id in backend.allowed_projects
+        for profile in backend.profiles.values()
+    ]
+    max_agent_timeout = max(allowed_timeouts, default=1800)
     worker = ReviewWorker(
         store=store,
-        gitlab=PythonGitLabClient(gitlab_url, gitlab_token, review_bot_username),
+        gitlab=gitlab,
         worktrees=GitWorktreeManager(
             repository=repository,
             root=Path(args.worktrees or os.getenv("REVIEW_AGENT_FLOW_WORKTREES", "/tmp/review-agent-flow")),
         ),
-        policy=policy,
+        policy=ReviewPolicy(),
         repository=repository,
         gitlab_url=gitlab_url,
         gitlab_token=gitlab_token,
@@ -90,12 +97,15 @@ def _run_worker(args: argparse.Namespace) -> int:
         sha_ensurer=GitShaEnsurer(
             repository, fetch_timeout_seconds=getattr(args, "fetch_timeout", 30.0)
         ),
-        notifier=notifiers_from_policy(policy.notifications.channels),
-        agent_timeout_seconds=agent_backend.timeout_seconds if agent_backend else 1800,
-        lease_seconds=(agent_backend.timeout_seconds if agent_backend else 1800) + 60,
+        notifier=notifiers_from_operator(resolved_notifications),
+        agent_timeout_seconds=max_agent_timeout,
+        lease_seconds=max_agent_timeout + 60,
         retry_delay_seconds=args.poll_interval,
-        agent_backend=agent_backend,
         autofix_publication=operator_config.autofix_publication,
+        policy_resolver=GitLabTargetBranchPolicyResolver(gitlab, policy_path),
+        backend_resolver=lambda policy: resolve_backend(
+            operator_config, policy.ai, project_id
+        ),
     )
     if args.once:
         result = worker.process_one()
@@ -188,10 +198,33 @@ def _run_recover_auto_fix_relation(args: argparse.Namespace) -> int:
 def _run_resend_auto_fix_notification(args: argparse.Namespace) -> int:
     service = _recovery_service(args)
     project_id = _required(args.project_id, "REVIEW_AGENT_FLOW_PROJECT_ID")
-    policy = load_policy(Path(args.policy).expanduser().resolve())
+    operator_path = Path(
+        _required(args.operator_config, "REVIEW_AGENT_FLOW_OPERATOR_CONFIG")
+    ).expanduser().resolve()
+    try:
+        operator_config = load_operator_config(operator_path)
+        relation = service.store.get_program_auto_fix_relation_by_child(
+            project_id, args.child_mr_iid
+        )
+        snapshot = (
+            service.store.get_policy_snapshot(relation.run_id)
+            if relation is not None
+            else None
+        )
+        channel_ids = (
+            policy_from_json(snapshot.policy_json).notifications.channels
+            if snapshot is not None
+            else tuple(
+                channel_id
+                for channel_id, channel in operator_config.notification_channels.items()
+                if project_id in channel.allowed_projects
+            )
+        )
+        resolved = resolve_notification_channels(operator_config, channel_ids, project_id)
+    except OperatorConfigError as exc:
+        raise SystemExit(f"invalid Operator configuration: {exc}") from exc
     channels = tuple(
-        (str(channel["id"]), str(channel["type"]))
-        for channel in policy.notifications.channels
+        (channel.channel_id, channel.channel_type) for channel in resolved
     )
     context = _operator_context(args)
     try:
@@ -264,7 +297,7 @@ def main(argv: list[str] | None = None) -> int:
     resend.add_argument("--gitlab-token")
     resend.add_argument("--project-id")
     resend.add_argument("--child-mr-iid", type=int, required=True)
-    resend.add_argument("--policy", required=True)
+    resend.add_argument("--operator-config")
     resend.add_argument("--reason", required=True)
     resend.add_argument("--recovery-id")
     resend.add_argument("--db")

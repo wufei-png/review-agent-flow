@@ -52,6 +52,177 @@ def test_review_run_schema_and_status_have_no_kind_discriminator(tmp_path) -> No
     assert "kind" not in store.get_project_bound_review_run_status("42", run.run_id)
 
 
+def test_policy_snapshot_is_exact_and_immutable_per_run(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "review.db")
+    run = store.enqueue("42", 1, SHA)
+    claimed = store.claim_next()
+    assert claimed is not None
+
+    snapshot = store.freeze_policy_snapshot(
+        run.run_id,
+        claimed.claim_token,
+        target_branch="main",
+        target_sha=OLD_SHA,
+        policy_version=4,
+        policy_json='{"version":4}',
+    )
+
+    assert snapshot is not None
+    assert snapshot.target_sha == OLD_SHA
+    assert store.freeze_policy_snapshot(
+        run.run_id,
+        claimed.claim_token,
+        target_branch="main",
+        target_sha=OLD_SHA,
+        policy_version=4,
+        policy_json='{"version":4}',
+    ) == snapshot
+    with pytest.raises(ValueError, match="immutable"):
+        store.freeze_policy_snapshot(
+            run.run_id,
+            claimed.claim_token,
+            target_branch="main",
+            target_sha=NEW_SHA,
+            policy_version=4,
+            policy_json='{"version":4}',
+        )
+
+
+def test_review_outcome_tracks_durable_notification_delivery(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "review.db")
+    run = store.enqueue("42", 1, SHA)
+    claimed = store.claim_next()
+    assert claimed is not None
+    assert store.freeze_requested_outputs(
+        run.run_id,
+        claimed.claim_token,
+        human_review=True,
+        ai_review=False,
+        auto_fix=False,
+        notification_channels=("reviewers",),
+    )
+    assert store.freeze_effective_run_decision(
+        run.run_id,
+        claimed.claim_token,
+        decision="execute",
+        human_review=True,
+        ai_review=False,
+        auto_fix=False,
+        suppressed=False,
+        recipients=("alice",),
+        notification_channels=("reviewers",),
+        expectations=(("notification", "reviewers"),),
+    )
+    assert store.finish(run.run_id, "succeeded", claim_token=claimed.claim_token)
+    assert store.project_review_outcome(run.run_id) == "undelivered"
+
+    delivery = store.enqueue_notifications(
+        f"review-run:{run.run_id}:human",
+        "Review",
+        "Please review",
+        None,
+        ("alice",),
+        (("reviewers", "feishu"),),
+    )[0]
+    assert store.project_review_outcome(run.run_id) == "pending"
+    claimed_delivery = store.claim_notification(delivery.delivery_id)
+    assert claimed_delivery is not None
+    assert store.finish_notification(
+        delivery.delivery_id,
+        True,
+        claim_token=claimed_delivery.claim_token,
+    )
+    assert store.project_review_outcome(run.run_id) == "delivered"
+
+
+def test_review_outcome_distinguishes_degraded_no_effect_and_indeterminate(
+    tmp_path,
+) -> None:
+    store = SQLiteStore(tmp_path / "review.db")
+
+    degraded = store.enqueue("42", 1, SHA)
+    claimed = store.claim_next()
+    assert claimed is not None
+    assert store.freeze_requested_outputs(
+        degraded.run_id,
+        claimed.claim_token,
+        human_review=True,
+        ai_review=False,
+        auto_fix=False,
+        notification_channels=("one", "two"),
+    )
+    assert store.freeze_effective_run_decision(
+        degraded.run_id,
+        claimed.claim_token,
+        decision="execute",
+        human_review=True,
+        ai_review=False,
+        auto_fix=False,
+        suppressed=False,
+        recipients=("alice",),
+        notification_channels=("one", "two"),
+        expectations=(("notification", "one"), ("notification", "two")),
+    )
+    deliveries = store.enqueue_notifications(
+        f"review-run:{degraded.run_id}:human",
+        "Review",
+        "Please review",
+        None,
+        ("alice",),
+        (("one", "feishu"), ("two", "wecom")),
+    )
+    assert store.finish(degraded.run_id, "succeeded", claim_token=claimed.claim_token)
+    for delivery, delivered in zip(deliveries, (True, False), strict=True):
+        claimed_delivery = store.claim_notification(delivery.delivery_id, max_attempts=1)
+        assert claimed_delivery is not None
+        assert store.finish_notification(
+            delivery.delivery_id,
+            delivered,
+            claim_token=claimed_delivery.claim_token,
+            max_attempts=1,
+        )
+    assert store.project_review_outcome(degraded.run_id) == "degraded"
+
+    no_effect = store.enqueue("42", 2, NEW_SHA)
+    claimed = store.claim_next()
+    assert claimed is not None
+    assert store.freeze_requested_outputs(
+        no_effect.run_id,
+        claimed.claim_token,
+        human_review=False,
+        ai_review=False,
+        auto_fix=False,
+        notification_channels=(),
+    )
+    assert store.freeze_effective_run_decision(
+        no_effect.run_id,
+        claimed.claim_token,
+        decision="execute",
+        human_review=False,
+        ai_review=False,
+        auto_fix=False,
+        suppressed=False,
+        recipients=(),
+        notification_channels=(),
+    )
+    assert store.finish(no_effect.run_id, "succeeded", claim_token=claimed.claim_token)
+    assert store.project_review_outcome(no_effect.run_id) == "no_effect"
+
+    indeterminate = store.enqueue("42", 3, MERGED_SHA)
+    claimed = store.claim_next()
+    assert claimed is not None
+    assert store.freeze_requested_outputs(
+        indeterminate.run_id,
+        claimed.claim_token,
+        human_review=True,
+        ai_review=False,
+        auto_fix=False,
+        notification_channels=("reviewers",),
+    )
+    assert store.finish(indeterminate.run_id, "failed", claim_token=claimed.claim_token)
+    assert store.project_review_outcome(indeterminate.run_id) == "indeterminate"
+
+
 def test_fresh_schema_has_no_agent_owned_autofix_tables(tmp_path) -> None:
     database = tmp_path / "review.db"
     SQLiteStore(database)

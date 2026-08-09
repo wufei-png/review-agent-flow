@@ -23,7 +23,8 @@ from review_agent_flow.operator_config import (
     VerificationProfile,
 )
 from review_agent_flow.policy import AIPolicy as ProjectAIPolicy
-from review_agent_flow.policy import HumanPolicy, ReviewPolicy
+from review_agent_flow.policy import HumanPolicy, NotificationPolicy, ReviewPolicy
+from review_agent_flow.policy_resolver import ResolvedProjectPolicy
 from review_agent_flow.runner import AgentResult
 from review_agent_flow.store import SQLiteStore
 from review_agent_flow.worker import ReviewWorker as ProductionReviewWorker
@@ -1276,6 +1277,52 @@ def test_worker_requeues_draft_mr_before_human_or_ai_paths(tmp_path: Path) -> No
     result = worker.process_one()
     assert result == result.__class__(run.run_id, "deferred", detail="draft merge request")
     assert notifier.events == []
+
+
+def test_worker_freezes_target_branch_policy_and_effective_outputs(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    sha = _git_repository(repository)
+    mr = MergeRequest(
+        "42", 1, "Policy snapshot", "alice", "feature", "main", sha, "https://mr"
+    )
+    store = SQLiteStore(tmp_path / "review.db")
+    run = store.enqueue("42", 1, sha)
+
+    class Resolver:
+        def resolve(self, project_id: str, target_branch: str) -> ResolvedProjectPolicy:
+            assert (project_id, target_branch) == ("42", "main")
+            return ResolvedProjectPolicy(
+                "main",
+                "b" * 40,
+                ReviewPolicy(
+                    human=HumanPolicy(enabled=False),
+                    notifications=NotificationPolicy(channels=()),
+                ),
+            )
+
+    worker = ReviewWorker(
+        store,
+        FakeGitLab(mr),
+        GitWorktreeManager(repository, tmp_path / "worktrees"),
+        ReviewPolicy(),
+        repository,
+        "https://gitlab",
+        project_id="42",
+        policy_resolver=Resolver(),
+        backend_resolver=lambda policy: None,
+    )
+
+    result = worker.process_one()
+
+    assert result is not None and result.status == "succeeded"
+    snapshot = store.get_policy_snapshot(run.run_id)
+    assert snapshot is not None and snapshot.target_sha == "b" * 40
+    requested = store.get_requested_outputs(run.run_id)
+    assert requested is not None and requested.human_review is False
+    effective = store.get_effective_run_decision(run.run_id)
+    assert effective is not None and effective.decision == "execute"
+    assert store.project_review_outcome(run.run_id) == "no_effect"
 
 
 def test_notification_failure_does_not_fail_review_run_and_is_retried(tmp_path: Path) -> None:

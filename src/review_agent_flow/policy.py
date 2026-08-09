@@ -2,17 +2,45 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import yaml
 
-POLICY_SCHEMA_VERSION = 3
+POLICY_SCHEMA_VERSION = 4
+MAX_POLICY_BYTES = 256 * 1024
 
 
 class PolicyError(ValueError):
     """Raised when a project policy is invalid."""
+
+
+class _UniqueKeySafeLoader(yaml.SafeLoader):
+    """Reject duplicate authority keys instead of accepting last-key-wins YAML."""
+
+
+def _construct_unique_mapping(
+    loader: _UniqueKeySafeLoader, node: yaml.MappingNode, deep: bool = False
+) -> dict[Any, Any]:
+    mapping: dict[Any, Any] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        try:
+            duplicate = key in mapping
+        except TypeError as exc:
+            raise PolicyError("policy mapping keys must be scalar") from exc
+        if duplicate:
+            raise PolicyError(f"policy contains duplicate key: {key}")
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+_UniqueKeySafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_mapping,
+)
 
 
 @dataclass(frozen=True)
@@ -32,7 +60,7 @@ class AIPolicy:
 
 @dataclass(frozen=True)
 class NotificationPolicy:
-    channels: tuple[dict[str, Any], ...] = ()
+    channels: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -74,49 +102,15 @@ def _as_reviewers(value: Any) -> tuple[str, ...]:
     return tuple(value)
 
 
-def _as_channels(value: Any) -> tuple[dict[str, Any], ...]:
-    if not isinstance(value, list):
-        raise PolicyError("notifications.channels must be a list of mappings")
-    channels: list[dict[str, Any]] = []
-    for index, item in enumerate(value):
-        if not isinstance(item, dict):
-            raise PolicyError(f"notifications.channels[{index}] must be a mapping")
-        _reject_unknown(
-            item,
-            {"id", "type", "webhook_env", "user_ids"},
-            f"notifications.channels[{index}]",
-        )
-        channel_id = item.get("id")
-        if not isinstance(channel_id, str) or not channel_id:
-            raise PolicyError(
-                f"notifications.channels[{index}].id must be a non-empty string"
-            )
-        channel_type = item.get("type")
-        if channel_type not in {"feishu", "wecom"}:
-            raise PolicyError(
-                f"notifications.channels[{index}].type must be 'feishu' or 'wecom'"
-            )
-        webhook_env = item.get("webhook_env")
-        if not isinstance(webhook_env, str) or not webhook_env:
-            raise PolicyError(
-                f"notifications.channels[{index}].webhook_env must be a non-empty string"
-            )
-        user_ids = item.get("user_ids", {})
-        if not isinstance(user_ids, dict) or not all(
-            isinstance(key, str)
-            and key
-            and isinstance(user_id, str)
-            and user_id
-            for key, user_id in user_ids.items()
-        ):
-            raise PolicyError(
-                f"notifications.channels[{index}].user_ids must map non-empty strings"
-            )
-        channels.append(item)
-    channel_ids = [str(channel["id"]) for channel in channels]
-    if len(set(channel_ids)) != len(channel_ids):
+def _as_channels(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, list) or not all(
+        isinstance(item, str) and item and item.strip() == item for item in value
+    ):
+        raise PolicyError("notifications.channels must be a list of non-empty channel IDs")
+    channels = tuple(value)
+    if len(set(channels)) != len(channels):
         raise PolicyError("notifications.channels ids must be unique")
-    return tuple(channels)
+    return channels
 
 
 def _as_optional_string(value: Any, field_name: str) -> str | None:
@@ -127,18 +121,25 @@ def _as_optional_string(value: Any, field_name: str) -> str | None:
     return value
 
 
-def load_policy(path: str | Path | None = None) -> ReviewPolicy:
-    """Load an optional Project policy, falling back to safe defaults."""
+def _as_skill_path(value: Any) -> str | None:
+    path = _as_optional_string(value, "ai.skill")
+    if path is None:
+        return None
+    parsed = PurePosixPath(path)
+    if parsed.is_absolute() or ".." in parsed.parts:
+        raise PolicyError("ai.skill must be a repository-relative path without '..'")
+    return path
 
-    policy_path = Path(path) if path is not None else None
-    if policy_path is None:
-        return ReviewPolicy()
-    if not policy_path.exists():
-        return ReviewPolicy()
-    if not policy_path.is_file():
-        raise PolicyError(f"policy path is not a file: {policy_path}")
 
-    loaded = yaml.safe_load(policy_path.read_text(encoding="utf-8"))
+def parse_policy(text: str) -> ReviewPolicy:
+    """Parse untrusted Project policy text using the current strict schema."""
+
+    if len(text.encode("utf-8")) > MAX_POLICY_BYTES:
+        raise PolicyError(f"Project Policy exceeds {MAX_POLICY_BYTES} bytes")
+    try:
+        loaded = yaml.load(text, Loader=_UniqueKeySafeLoader)
+    except yaml.YAMLError as exc:
+        raise PolicyError(f"invalid policy YAML: {exc}") from exc
     raw = {} if loaded is None else loaded
     if not isinstance(raw, dict):
         raise PolicyError("policy root must be a mapping")
@@ -167,7 +168,7 @@ def load_policy(path: str | Path | None = None) -> ReviewPolicy:
         enabled=_as_bool(ai.get("enabled"), "ai.enabled", False),
         backend=_as_optional_string(ai.get("backend"), "ai.backend"),
         profile=_as_optional_string(ai.get("profile"), "ai.profile"),
-        skill_path=_as_optional_string(ai.get("skill"), "ai.skill"),
+        skill_path=_as_skill_path(ai.get("skill")),
         auto_fix=_as_bool(ai.get("auto_fix"), "ai.auto_fix", False),
     )
     if ai_policy.enabled and (ai_policy.backend is None or ai_policy.profile is None):
@@ -185,6 +186,49 @@ def load_policy(path: str | Path | None = None) -> ReviewPolicy:
         ai=ai_policy,
         notifications=NotificationPolicy(channels=channels),
     )
+
+
+def load_policy(path: str | Path | None = None) -> ReviewPolicy:
+    """Load an optional Project policy, falling back to safe defaults."""
+
+    policy_path = Path(path) if path is not None else None
+    if policy_path is None or not policy_path.exists():
+        return ReviewPolicy()
+    if not policy_path.is_file():
+        raise PolicyError(f"policy path is not a file: {policy_path}")
+    return parse_policy(policy_path.read_text(encoding="utf-8"))
+
+
+def policy_json(policy: ReviewPolicy) -> str:
+    """Return the canonical credential-free representation persisted per Run."""
+
+    value = {
+        "version": policy.version,
+        "pipeline_gate": policy.pipeline_gate,
+        "human": {
+            "enabled": policy.human.enabled,
+            "reviewers": list(policy.human.reviewers),
+        },
+        "ai": {
+            "enabled": policy.ai.enabled,
+            "backend": policy.ai.backend,
+            "profile": policy.ai.profile,
+            "skill": policy.ai.skill_path,
+            "auto_fix": policy.ai.auto_fix,
+        },
+        "notifications": {"channels": list(policy.notifications.channels)},
+    }
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def policy_from_json(value: str) -> ReviewPolicy:
+    """Rehydrate a validated immutable Policy Snapshot."""
+
+    try:
+        loaded = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise PolicyError("stored policy snapshot is invalid JSON") from exc
+    return parse_policy(yaml.safe_dump(loaded, sort_keys=False))
 
 
 def policy_template() -> str:
@@ -210,10 +254,6 @@ ai:
 
 notifications:
   channels:
-    - id: feishu-reviewers
-      type: feishu
-      webhook_env: FEISHU_WEBHOOK
-    - id: wecom-reviewers
-      type: wecom
-      webhook_env: WECOM_WEBHOOK
+    - feishu-reviewers
+    - wecom-reviewers
 """

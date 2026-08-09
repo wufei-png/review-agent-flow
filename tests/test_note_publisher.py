@@ -69,6 +69,26 @@ def _request(database: Path, markdown: str = "Actionable review") -> tuple[
     claimed = store.claim_next()
     assert claimed is not None
     marker = canonical_note_marker("42", 1, SHA)
+    assert store.freeze_requested_outputs(
+        run.run_id,
+        claimed.claim_token,
+        human_review=False,
+        ai_review=True,
+        auto_fix=False,
+        notification_channels=(),
+    )
+    assert store.freeze_effective_run_decision(
+        run.run_id,
+        claimed.claim_token,
+        decision="execute",
+        human_review=False,
+        ai_review=True,
+        auto_fix=False,
+        suppressed=False,
+        recipients=(),
+        notification_channels=(),
+        expectations=(("note", marker),),
+    )
     receipt = store.create_effect_receipt(
         run.run_id, "note_expected", marker, state="planned"
     )
@@ -263,6 +283,7 @@ def test_stale_parent_supersedes_note_without_creating_it(tmp_path: Path) -> Non
 
     assert result.status == "superseded"
     assert gitlab.create_calls == 0
+    assert store.project_review_outcome(request.run_id) == "delivered"
 
 
 def test_confirmed_deleted_note_is_marked_removed_and_never_recreated(tmp_path: Path) -> None:
