@@ -13,6 +13,7 @@ from urllib.parse import quote
 from uuid import uuid4
 
 from .gitlab import canonical_note_marker, has_exact_note_marker, is_valid_sha, normalize_sha
+from .publication_plan import PublicationPlanV1
 from .security import redact
 
 DEFAULT_LEASE_SECONDS = 1860
@@ -4302,44 +4303,27 @@ class SQLiteStore:
             raise ValueError("merged recovery requires a valid merge SHA")
         if status != "merged" and merged_sha is not None:
             raise ValueError("only a merged recovery may include a merge SHA")
-        try:
-            payload = json.loads(plan_json)
-        except json.JSONDecodeError as exc:
-            raise ValueError("Operator recovery Plan is not valid JSON") from exc
-        canonical_plan = json.dumps(
-            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        )
-        if canonical_plan != plan_json:
-            raise ValueError("Operator recovery Plan must be canonical JSON")
-        if hashlib.sha256(plan_json.encode("utf-8")).hexdigest() != plan_sha256:
-            raise ValueError("Operator recovery Plan digest does not match its payload")
-        if not isinstance(payload, dict):
-            raise TypeError("Operator recovery Plan must be an object")
-        candidate_sha256 = payload.get("candidate_sha256")
-        verification = payload.get("verification")
-        if not isinstance(candidate_sha256, str) or not isinstance(verification, dict):
-            raise TypeError("Operator recovery Plan evidence is invalid")
-        intent_value = payload.get("intent")
-        if not isinstance(intent_value, dict):
-            raise TypeError("Operator recovery Plan Intent is invalid")
-        generation = intent_value.get("generation")
-        marker_template = payload.get("marker_template")
+        payload = PublicationPlanV1.from_json(plan_json, plan_sha256)
         if (
-            payload.get("review_key")
-            != {"project_id": project_id, "mr_iid": parent_mr_iid, "sha": parent_sha}
-            or type(generation) is not int
-            or generation <= 0
-            or intent_value.get("nonce") != intent_nonce
-            or payload.get("branch") != source_branch
-            or payload.get("target_branch") != target_branch
-            or not isinstance(marker_template, str)
-            or marker_template.count("{plan_sha256}") != 1
-            or marker_template.replace("{plan_sha256}", plan_sha256) != marker
-            or verification.get("candidate_sha256") != candidate_sha256
+            payload.review_key.project_id != project_id
+            or payload.review_key.mr_iid != parent_mr_iid
+            or payload.review_key.sha != parent_sha
+            or payload.intent.nonce != intent_nonce
+            or payload.branch != source_branch
+            or payload.target_branch != target_branch
+            or payload.marker != marker
         ):
             raise ValueError("Operator recovery Plan identity is inconsistent")
+        candidate_sha256 = payload.candidate_sha256
+        generation = payload.intent.generation
         verification_json = json.dumps(
-            verification, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            {
+                "candidate_sha256": payload.verification.candidate_sha256,
+                "command_sha256": payload.verification.command_sha256,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
         )
         now = self._now().isoformat()
         with self._connect() as connection:

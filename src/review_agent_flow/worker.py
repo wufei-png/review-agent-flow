@@ -431,43 +431,16 @@ class ReviewWorker:
         )
 
     def process_one(self) -> WorkerResult | None:
-        auto_fix_publication = self.auto_fix_publisher.process()
-        if auto_fix_publication is not None:
-            return WorkerResult(
-                auto_fix_publication.run_id,
-                auto_fix_publication.status,
-                detail=auto_fix_publication.detail,
-            )
+        publication = self._process_publication_backlog()
+        if publication is not None:
+            return publication
         run = self.store.claim_next(
             lease_seconds=self.lease_seconds,
             max_attempts=self.max_attempts,
             project_id=self.project_id,
         )
         if run is None:
-            note_results = self.note_publisher.process(limit=1)
-            if note_results:
-                note_result = note_results[-1]
-                return WorkerResult(
-                    note_result.run_id,
-                    note_result.status,
-                    detail=note_result.detail,
-                )
-            note_reconciliation = self.note_publisher.reconcile_published()
-            if note_reconciliation is not None:
-                return WorkerResult(
-                    note_reconciliation.run_id,
-                    note_reconciliation.status,
-                    detail=note_reconciliation.detail,
-                )
-            reconciliation = self.reconcile_auto_fixes(limit=1)
-            log_event(
-                LOGGER,
-                logging.INFO,
-                secrets=self._redaction_secrets(),
-                event="worker.poll",
-                status="reconciled" if reconciliation is not None else "idle",
-            )
-            return reconciliation
+            return self._process_idle_backlog()
 
         self._log_run(run, status="running", event="worker.run.claimed")
         receipts: dict[str, EffectReceipt] = {}
@@ -732,31 +705,12 @@ class ReviewWorker:
                         detail = f"{detail}; worktree cleanup pending: {cleanup_detail}".strip("; ")
                         LOGGER.exception("worktree cleanup failed for Run %s", run.run_id)
             if completed_result is not None:
-                if note_request_id is not None:
-                    try:
-                        self.note_publisher.process(request_id=note_request_id)
-                    except Exception as exc:  # noqa: BLE001 - Note state is independently durable
-                        self._log_run(
-                            run,
-                            status="note_publication_deferred",
-                            level=logging.WARNING,
-                            diagnostic=exc,
-                        )
-                if auto_fix_plan_id is not None:
-                    try:
-                        self.auto_fix_publisher.process(plan_id=auto_fix_plan_id)
-                    except Exception as exc:  # noqa: BLE001 - Plan state is independently durable
-                        self._log_run(
-                            run,
-                            status="autofix_publication_deferred",
-                            level=logging.WARNING,
-                            diagnostic=exc,
-                        )
-                return WorkerResult(
-                    completed_result.run_id,
-                    completed_result.status,
-                    completed_result.agent_result,
-                    detail,
+                return self._publish_completed_effects(
+                    run,
+                    completed_result,
+                    note_request_id=note_request_id,
+                    auto_fix_plan_id=auto_fix_plan_id,
+                    detail=detail,
                 )
         except LeaseLostError as exc:
             if receipts and not agent_finished:
@@ -833,6 +787,78 @@ class ReviewWorker:
             if not self._finish_terminal(run, "failed", failure.detail, failure.failure_class):
                 return self._lease_recovery_result(run, failure.detail)
             return WorkerResult(run.run_id, "failed", detail=failure.detail)
+
+    def _process_publication_backlog(self) -> WorkerResult | None:
+        publication = self.auto_fix_publisher.process()
+        if publication is None:
+            return None
+        return WorkerResult(
+            publication.run_id,
+            publication.status,
+            detail=publication.detail,
+        )
+
+    def _process_idle_backlog(self) -> WorkerResult | None:
+        note_results = self.note_publisher.process(limit=1)
+        if note_results:
+            note_result = note_results[-1]
+            return WorkerResult(
+                note_result.run_id,
+                note_result.status,
+                detail=note_result.detail,
+            )
+        note_reconciliation = self.note_publisher.reconcile_published()
+        if note_reconciliation is not None:
+            return WorkerResult(
+                note_reconciliation.run_id,
+                note_reconciliation.status,
+                detail=note_reconciliation.detail,
+            )
+        reconciliation = self.reconcile_auto_fixes(limit=1)
+        log_event(
+            LOGGER,
+            logging.INFO,
+            secrets=self._redaction_secrets(),
+            event="worker.poll",
+            status="reconciled" if reconciliation is not None else "idle",
+        )
+        return reconciliation
+
+    def _publish_completed_effects(
+        self,
+        run: ReviewRun,
+        completed: WorkerResult,
+        *,
+        note_request_id: int | None,
+        auto_fix_plan_id: int | None,
+        detail: str,
+    ) -> WorkerResult:
+        if note_request_id is not None:
+            try:
+                self.note_publisher.process(request_id=note_request_id)
+            except Exception as exc:  # noqa: BLE001 - Note state is independently durable
+                self._log_run(
+                    run,
+                    status="note_publication_deferred",
+                    level=logging.WARNING,
+                    diagnostic=exc,
+                )
+        if auto_fix_plan_id is not None:
+            try:
+                self.auto_fix_publisher.process(plan_id=auto_fix_plan_id)
+            except Exception as exc:  # noqa: BLE001 - Plan state is independently durable
+                self._log_run(
+                    run,
+                    status="autofix_publication_deferred",
+                    level=logging.WARNING,
+                    diagnostic=exc,
+                )
+        return WorkerResult(
+            completed.run_id,
+            completed.status,
+            completed.agent_result,
+            detail,
+        )
 
     def _finish_terminal(
         self,
@@ -1266,15 +1292,4 @@ class ReviewWorker:
                 correlation_id=f"review-run:{run.run_id}:human",
             ),
             self.policy.notifications.channels if self.policy_resolver is not None else None,
-        )
-
-    def _notify_autofix(self, run: ReviewRun, parent_merge_request, auto_fix_merge_request) -> None:
-        self.notification_dispatcher.enqueue(
-            NotificationEvent(
-                title=f"Auto-fix review: !{auto_fix_merge_request.iid} {auto_fix_merge_request.title}",
-                body="An Auto-fix Merge Request is ready for the original MR creator to review.",
-                url=auto_fix_merge_request.web_url,
-                recipients=(parent_merge_request.author_username,),
-                correlation_id=f"review-run:{run.run_id}:autofix",
-            )
         )

@@ -226,9 +226,6 @@ class PythonGitLabClient(GitLabClient):
             return None
         return lookup.exact[0]
 
-    def create_branch(self, project_id: str, branch: str, ref: str) -> None:
-        self._project(project_id).branches.create({"branch": branch, "ref": ref})
-
     def create_repository_commit(
         self,
         project_id: str,

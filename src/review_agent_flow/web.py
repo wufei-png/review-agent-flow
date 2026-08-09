@@ -13,7 +13,7 @@ from uuid import uuid4
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 
-from .events import parse_auto_fix_branch, parse_auto_fix_marker, parse_webhooks
+from .events import WebhookDecision, parse_auto_fix_branch, parse_auto_fix_marker, parse_webhooks
 from .security import redact
 from .store import SQLiteStore
 from .structured_logging import log_event as _emit_log_event
@@ -97,6 +97,102 @@ def _storage_probe(
             redact(diagnostic, max_length=1000, secrets=secrets) if diagnostic else None,
         )
     return False, "storage readiness probe returned an unsupported result"
+
+
+def apply_webhook_decision(
+    store: SQLiteStore,
+    decision: WebhookDecision,
+    *,
+    project_id: str,
+    pipeline_gate: bool,
+) -> dict[str, Any]:
+    """Apply one accepted, project-bound decision without HTTP concerns."""
+
+    if not decision.accepted:
+        return {"accepted": False, "reason": decision.reason}
+    assert decision.project_id is not None
+    assert decision.mr_iid is not None
+    assert decision.sha is not None
+    if decision.project_id != project_id:
+        return {
+            "accepted": False,
+            "reason": "event project is not the configured Project",
+            "project_id": decision.project_id,
+        }
+    if decision.kind == "pipeline":
+        if not pipeline_gate:
+            return {"accepted": False, "reason": "pipeline gate is disabled", "kind": "pipeline"}
+        relation = store.get_program_auto_fix_relation_by_child(
+            decision.project_id, decision.mr_iid
+        )
+        if (
+            relation is not None
+            or parse_auto_fix_branch(decision.source_branch or "") is not None
+            or parse_auto_fix_marker(decision.description) is not None
+        ):
+            return {
+                "accepted": True,
+                "kind": "pipeline",
+                "status": "auto-fix pipeline ignored",
+            }
+        woken = store.wake_run(decision.project_id, decision.mr_iid, decision.sha)
+        return {
+            "accepted": True,
+            "kind": "pipeline",
+            "status": "woken" if woken is not None and woken.status == "pending" else "ignored",
+        }
+
+    relation = store.get_program_auto_fix_relation_by_child(decision.project_id, decision.mr_iid)
+    if decision.kind == "merge":
+        if relation is None:
+            return {"accepted": False, "reason": "untracked Merge Request merge event"}
+        store.observe_program_auto_fix_webhook(
+            decision.project_id,
+            decision.mr_iid,
+            status="merged",
+            merged_sha=decision.sha,
+            source_branch=decision.source_branch,
+            target_branch=decision.target_branch,
+            description=decision.description,
+            source_sha=None,
+        )
+        return {"accepted": True, "kind": "autofix_merged", "merged_sha": decision.sha}
+    if relation is not None:
+        store.observe_program_auto_fix_webhook(
+            decision.project_id,
+            decision.mr_iid,
+            status="closed" if decision.kind == "close" else "opened",
+            merged_sha=None,
+            source_branch=decision.source_branch,
+            target_branch=decision.target_branch,
+            description=decision.description,
+            source_sha=decision.sha,
+        )
+        return {"accepted": True, "kind": "autofix", "status": "review run not created"}
+    if (
+        parse_auto_fix_branch(decision.source_branch or "") is not None
+        or parse_auto_fix_marker(decision.description) is not None
+    ):
+        return {
+            "accepted": False,
+            "kind": "autofix",
+            "reason": "Auto-fix-shaped Merge Request has no local Relation",
+        }
+    if decision.kind == "draft":
+        return {"accepted": False, "kind": "draft", "reason": "draft merge request"}
+    if decision.kind == "close":
+        return {
+            "accepted": False,
+            "kind": "close",
+            "reason": "closed parent Merge Request does not create a Review Run",
+        }
+    run = store.enqueue(decision.project_id, decision.mr_iid, decision.sha)
+    return {
+        "accepted": True,
+        "kind": "normal",
+        "run_id": run.run_id,
+        "status": run.status,
+    }
 
 
 def create_app(
@@ -382,8 +478,14 @@ def create_app(
             raise HTTPException(status_code=403, detail="project is not bound to this deployment")
         responses: list[dict[str, Any]] = []
         for decision in decisions:
+            response = apply_webhook_decision(
+                store,
+                decision,
+                project_id=project_id,
+                pipeline_gate=pipeline_gate,
+            )
+            responses.append(response)
             if not decision.accepted:
-                responses.append({"accepted": False, "reason": decision.reason})
                 log_event(
                     LOGGER,
                     logging.INFO,
@@ -398,71 +500,7 @@ def create_app(
                 continue
             assert decision.project_id is not None
             assert decision.mr_iid is not None
-            assert decision.sha is not None
-            if decision.project_id != project_id:
-                responses.append(
-                    {
-                        "accepted": False,
-                        "reason": "event project is not the configured Project",
-                        "project_id": decision.project_id,
-                    }
-                )
-                continue
-            if decision.kind == "pipeline":
-                if not pipeline_gate:
-                    responses.append(
-                        {"accepted": False, "reason": "pipeline gate is disabled", "kind": "pipeline"}
-                    )
-                    continue
-                relation = store.get_program_auto_fix_relation_by_child(
-                    decision.project_id, decision.mr_iid
-                )
-                if relation is not None or parse_auto_fix_branch(
-                    decision.source_branch or ""
-                ) is not None or parse_auto_fix_marker(decision.description) is not None:
-                    responses.append(
-                        {
-                            "accepted": True,
-                            "kind": "pipeline",
-                            "status": "auto-fix pipeline ignored",
-                        }
-                    )
-                    continue
-                woken = store.wake_run(decision.project_id, decision.mr_iid, decision.sha)
-                responses.append(
-                    {
-                        "accepted": True,
-                        "kind": "pipeline",
-                        "status": "woken" if woken is not None and woken.status == "pending" else "ignored",
-                    }
-                )
-                continue
-            relation = store.get_program_auto_fix_relation_by_child(
-                decision.project_id, decision.mr_iid
-            )
-            if decision.kind == "merge":
-                if relation is None:
-                    responses.append(
-                        {"accepted": False, "reason": "untracked Merge Request merge event"}
-                    )
-                    continue
-                store.observe_program_auto_fix_webhook(
-                    decision.project_id,
-                    decision.mr_iid,
-                    status="merged",
-                    merged_sha=decision.sha,
-                    source_branch=decision.source_branch,
-                    target_branch=decision.target_branch,
-                    description=decision.description,
-                    source_sha=None,
-                )
-                responses.append(
-                    {
-                        "accepted": True,
-                        "kind": "autofix_merged",
-                        "merged_sha": decision.sha,
-                    }
-                )
+            if response.get("kind") == "autofix_merged":
                 log_event(
                     LOGGER,
                     logging.INFO,
@@ -475,72 +513,19 @@ def create_app(
                     kind=decision.kind,
                 )
                 continue
-            if relation is not None:
-                store.observe_program_auto_fix_webhook(
-                    decision.project_id,
-                    decision.mr_iid,
-                    status="closed" if decision.kind == "close" else "opened",
-                    merged_sha=None,
-                    source_branch=decision.source_branch,
-                    target_branch=decision.target_branch,
-                    description=decision.description,
-                    source_sha=decision.sha,
+            if response.get("kind") == "normal":
+                log_event(
+                    LOGGER,
+                    logging.INFO,
+                    event="webhook.decision",
+                    status=str(response["status"]),
+                    correlation_id=correlation_id,
+                    project_id=decision.project_id,
+                    mr_iid=decision.mr_iid,
+                    run_id=int(response["run_id"]),
+                    gitlab_event=x_gitlab_event or "unknown",
+                    kind="normal",
                 )
-                responses.append(
-                    {
-                        "accepted": True,
-                        "kind": "autofix",
-                        "status": "review run not created",
-                    }
-                )
-                continue
-            if (
-                parse_auto_fix_branch(decision.source_branch or "") is not None
-                or parse_auto_fix_marker(decision.description) is not None
-            ):
-                responses.append(
-                    {
-                        "accepted": False,
-                        "kind": "autofix",
-                        "reason": "Auto-fix-shaped Merge Request has no local Relation",
-                    }
-                )
-                continue
-            if decision.kind == "draft":
-                responses.append(
-                    {"accepted": False, "kind": "draft", "reason": "draft merge request"}
-                )
-                continue
-            if decision.kind == "close":
-                responses.append(
-                    {
-                        "accepted": False,
-                        "kind": "close",
-                        "reason": "closed parent Merge Request does not create a Review Run",
-                    }
-                )
-                continue
-            run = store.enqueue(decision.project_id, decision.mr_iid, decision.sha)
-            responses.append(
-                {
-                    "accepted": True,
-                    "kind": "normal",
-                    "run_id": run.run_id,
-                    "status": run.status,
-                }
-            )
-            log_event(
-                LOGGER,
-                logging.INFO,
-                event="webhook.decision",
-                status=run.status,
-                correlation_id=correlation_id,
-                project_id=run.project_id,
-                mr_iid=run.mr_iid,
-                run_id=run.run_id,
-                gitlab_event=x_gitlab_event or "unknown",
-                kind="normal",
-            )
         if len(responses) == 1:
             return responses[0]
         return {"accepted": any(item["accepted"] for item in responses), "decisions": responses}

@@ -142,9 +142,6 @@ class FakeGitLab:
     ) -> Note | None:
         return next((note for note in self.notes if note.note_id == note_id), None)
 
-    def create_branch(self, project_id: str, branch: str, ref: str) -> None:
-        pass
-
     def create_repository_commit(
         self,
         project_id: str,

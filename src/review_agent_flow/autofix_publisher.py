@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 
 from .gitlab import CreatedCommit, CreatedMergeRequest, GitLabClient, is_valid_sha
 from .notifications import FanoutNotifier
 from .operator_config import AutoFixPublicationConfig
 from .policy import policy_from_json
+from .publication_plan import PublicationPlanV1
 from .security import redact
 from .store import (
     DEFAULT_AUTO_FIX_PUBLICATION_LEASE_SECONDS,
@@ -110,16 +110,10 @@ class AutoFixPublisher:
         )
 
     @staticmethod
-    def _payload(plan: AutoFixPublicationPlan) -> dict[str, object]:
+    def _payload(plan: AutoFixPublicationPlan) -> PublicationPlanV1:
         if plan.plan_json is None:
             raise ValueError("frozen Auto-fix Publication Plan payload was purged")
-        try:
-            payload = json.loads(plan.plan_json)
-        except json.JSONDecodeError as exc:
-            raise ValueError("frozen Auto-fix Publication Plan is not valid JSON") from exc
-        if not isinstance(payload, dict):
-            raise TypeError("frozen Auto-fix Publication Plan must be an object")
-        return payload
+        return PublicationPlanV1.from_json(plan.plan_json, plan.plan_sha256)
 
     def process(
         self,
@@ -144,27 +138,17 @@ class AutoFixPublisher:
             )
         try:
             payload = self._payload(plan)
-            review_key = payload["review_key"]
-            if not isinstance(review_key, dict):
-                raise TypeError("frozen Auto-fix ReviewKey is invalid")
-            project_id = str(review_key["project_id"])
-            mr_iid = int(review_key["mr_iid"])
-            sha = str(review_key["sha"])
-            branch = str(payload["branch"])
-            target_branch = str(payload["target_branch"])
-            title = str(payload["title"])
-            commit_message = str(payload["commit_message"])
-            readiness = str(payload["initial_readiness"])
-            actions_value = payload["actions"]
-            if not isinstance(actions_value, list) or not all(
-                isinstance(action, dict) for action in actions_value
-            ):
-                raise ValueError("frozen Auto-fix actions are invalid")
-            actions = tuple(actions_value)
+            project_id = payload.review_key.project_id
+            mr_iid = payload.review_key.mr_iid
+            sha = payload.review_key.sha
+            branch = payload.branch
+            target_branch = payload.target_branch
+            title = payload.title
+            commit_message = payload.commit_message
+            readiness = payload.initial_readiness
+            actions = payload.actions
             if project_id != self.project_id:
                 raise ValueError("frozen Auto-fix Plan belongs to another Project")
-            if readiness not in {"draft", "ready"}:
-                raise ValueError("frozen Auto-fix readiness is invalid")
             snapshot = self.store.get_policy_snapshot(plan.run_id)
             requested_channels = (
                 policy_from_json(snapshot.policy_json).notifications.channels

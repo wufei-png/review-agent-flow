@@ -206,8 +206,6 @@ class GitLabClient(Protocol):
         self, project_id: str, mr_iid: int, note_id: int
     ) -> Note | None: ...
 
-    def create_branch(self, project_id: str, branch: str, ref: str) -> None: ...
-
     def create_repository_commit(
         self,
         project_id: str,

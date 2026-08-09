@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import signal
 import stat
@@ -15,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from .gitlab import is_valid_sha
+from .publication_plan import canonical_json
 from .runner import LeaseLostError
 
 MAX_AUTOFIX_ACTIONS = 100
@@ -73,10 +73,6 @@ class VerificationEvidence:
             "returncode": self.returncode,
             "duration_ms": self.duration_ms,
         }
-
-
-def canonical_json(value: object) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def _git(worktree: Path, *arguments: str) -> bytes:

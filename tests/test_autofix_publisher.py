@@ -1,9 +1,12 @@
+import hashlib
+import json
 import sqlite3
 from pathlib import Path
 
 import pytest
 
 from review_agent_flow.auto_fix_reconciler import AutoFixReconciler
+from review_agent_flow.autofix_planner import canonical_json
 from review_agent_flow.autofix_publisher import AutoFixPublisher
 from review_agent_flow.autofix_recovery import AutoFixPlanOperator, OperatorContext
 from review_agent_flow.gitlab import (
@@ -196,22 +199,26 @@ def _frozen_plan(
         state="planned",
     )
     branch = f"autofix/MR-1/sha-{SHA}/intent-{intent.nonce}"
+    actions = [
+        {
+            "action": "update",
+            "file_path": "README.md",
+            "content": "fixed\n",
+            "execute_filemode": False,
+        }
+    ]
+    candidate_sha256 = hashlib.sha256(
+        canonical_json({"version": 1, "base_sha": SHA, "actions": actions}).encode()
+    ).hexdigest()
     payload = {
         "version": 1,
         "review_key": {"project_id": "42", "mr_iid": 1, "sha": SHA},
         "intent": {"generation": 1, "nonce": intent.nonce},
         "proposal_summary": "Apply fix",
-        "candidate_sha256": "c" * 64,
-        "actions": [
-            {
-                "action": "update",
-                "file_path": "README.md",
-                "content": "fixed\n",
-                "execute_filemode": False,
-            }
-        ],
+        "candidate_sha256": candidate_sha256,
+        "actions": actions,
         "verification": {
-            "candidate_sha256": "c" * 64,
+            "candidate_sha256": candidate_sha256,
             "command_sha256": "d" * 64,
         },
         "branch": branch,
@@ -287,7 +294,7 @@ def test_publisher_uses_exact_commit_contract_and_atomically_requests_notificati
     plan = store.get_auto_fix_publication_plan(run_id)
     assert plan is not None and plan.state == "published"
     assert plan.plan_json is not None
-    assert plan.candidate_sha256 == "c" * 64
+    assert plan.candidate_sha256 == json.loads(plan.plan_json)["candidate_sha256"]
     assert plan.verification_json
     assert plan.branch_commit_sha == "f" * 40
     relation = store.get_program_auto_fix_relation(plan_id)

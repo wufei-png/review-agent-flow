@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -11,6 +10,7 @@ from .failures import classify_exception
 from .gitlab import GitLabClient, MergeRequest, is_valid_sha
 from .notifications import FanoutNotifier
 from .policy import policy_from_json
+from .publication_plan import PublicationPlanV1
 from .security import redact
 from .store import (
     AUTO_FIX_MR_ABSENCE_CONFIRMATION_SECONDS,
@@ -80,13 +80,10 @@ class AutoFixReconciler:
         )
 
     @staticmethod
-    def _payload(plan: AutoFixPublicationPlan) -> dict[str, object]:
+    def _payload(plan: AutoFixPublicationPlan) -> PublicationPlanV1:
         if plan.plan_json is None:
             raise ValueError("uncertain Auto-fix Plan payload was already purged")
-        value = json.loads(plan.plan_json)
-        if not isinstance(value, dict):
-            raise TypeError("uncertain Auto-fix Plan payload is invalid")
-        return value
+        return PublicationPlanV1.from_json(plan.plan_json, plan.plan_sha256)
 
     def _defer_plan(
         self,
@@ -212,22 +209,15 @@ class AutoFixReconciler:
     ) -> AutoFixReconciliationResult:
         try:
             payload = self._payload(plan)
-            review_key = payload["review_key"]
-            if not isinstance(review_key, dict):
-                raise TypeError("uncertain Auto-fix ReviewKey is invalid")
-            project_id = str(review_key["project_id"])
-            mr_iid = int(review_key["mr_iid"])
-            sha = str(review_key["sha"])
-            branch = str(payload["branch"])
-            target_branch = str(payload["target_branch"])
-            title = str(payload["title"])
-            readiness = str(payload["initial_readiness"])
+            project_id = payload.review_key.project_id
+            mr_iid = payload.review_key.mr_iid
+            sha = payload.review_key.sha
+            branch = payload.branch
+            target_branch = payload.target_branch
+            title = payload.title
+            readiness = payload.initial_readiness
             if project_id != self.project_id:
                 raise ValueError("uncertain Auto-fix Plan belongs to another Project")
-            if not is_valid_sha(sha):
-                raise ValueError("uncertain Auto-fix ReviewKey SHA is invalid")
-            if readiness not in {"draft", "ready"}:
-                raise ValueError("uncertain Auto-fix readiness is invalid")
             parent = self.gitlab.get_merge_request(project_id, mr_iid)
             if (
                 parent.project_id != project_id
@@ -334,7 +324,7 @@ class AutoFixReconciler:
                 target_branch=target_branch,
                 parent_author=parent.author_username,
             )
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        except (KeyError, TypeError, ValueError) as exc:
             return self._block_plan(plan, str(exc))
         except Exception as exc:  # noqa: BLE001 - exceptional work remains durable
             failure = classify_exception(exc, secrets=self._secrets())
