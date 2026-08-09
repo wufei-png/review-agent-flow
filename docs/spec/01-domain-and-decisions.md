@@ -2,46 +2,43 @@
 
 ## Product shape
 
-`review-agent-flow` 是面向 GitLab Project 的人类评审与 AI Agent 评审编排器。它接收 GitLab Webhook，按 Project Policy 创建 Review Run，在精确提交版本的独立 worktree 中运行本地 Agent；Agent 自己向 GitLab 写 Review Note，并可以创建独立 Auto-fix Merge Request。
+`review-agent-flow` 是面向单一 GitLab Project 的人类评审与 AI Review 编排器。
+它为父 MR 的精确 SHA 运行 Agent，但由 ReviewFlow 持久化并发布
+Note、Auto-fix MR 和通知。
 
 它不是：
 
-- GitLab Group 级策略中心
+- GitLab Group 级策略中心或多租户 Agent 沙箱
 - AI 模型厂商 SDK 聚合层
-- 直接替用户批准或阻塞合并的 AI Gate
-- 直接修改用户 MR source branch 的机器人
+- 直接替用户批准、阻塞或合并 MR 的 AI Gate
+- 允许 Agent 持有 GitLab token 或直接发布的能力转发器
 
 ## Decisions
 
 | Area | Decision |
 | --- | --- |
-| Project boundary | 只支持 Project 级策略覆盖；不引入 Group 默认策略 |
-| Policy file | 可选 `.gitlab/reviewflow.yml`；`init` 只生成模板，服务不维护文件 |
-| Review mode | v0.1 只有 `Notify-only`；Reviewer 只代表通知对象，不实现 `Enforce`、Approval Requirement 或 GitLab Approval 写入 |
-| Reviewer | 显式配置 GitLab username；首版不自动解析 CODEOWNERS |
-| Human/AI | 人审与 AI 独立开关；AI 和 auto-fix 默认关闭 |
-| Trigger | MR Ready 后触发；启用 Pipeline Gate 时等待最新 Pipeline 成功；同 SHA 幂等，新 SHA 可重跑 |
-| Pipeline Hook | 仅在启用 Gate 时唤醒同一 Project/MR/SHA 的已有 pending Run；不创建独立 Pipeline Run，先到的 Hook 等待 MR Hook |
-| Agent output | Agent 不需要返回 JSON，直接提交 GitLab Note |
-| Agent execution | 支持通用本地 CLI，也为 OpenCode Web/Server/ACP 等入口预留适配 |
-| Model API | 核心只定义 OpenAI-compatible Provider 接口；部署文档推荐 LiteLLM |
-| Worktree | 每个 Review Run 使用精确 SHA 的独立 Git worktree |
-| Auto-fix | 创建独立 MR，目标为原 MR source branch；分支 `autofix/MR-<iid>/run-<run-id>`，标题前缀 `[ReviewFlow Auto-Fix]` |
-| Auto-fix identity | 服务端先持久化 intent；标题和分支是展示/关联字段，不能单独使事件进入 Auto-fix 路径 |
-| Auto-fix review | Auto-fix MR 只跑 CI 和原 MR 创建者的人审，不跑 AI；通知只发给原 MR 创建者 |
-| Auto-fix loop | 服务记录 parent MR 与 Auto-fix MR 关系；合并后只跳过对应 parent SHA，普通用户提交立即恢复 |
-| Identity | 使用独立 Review Bot 身份，不复用 webhook 触发者 |
-| Execution trust | 首版采用 Trusted Execution Environment，核心不裁剪 Agent 工具/网络/凭据能力 |
-| Runtime | API + 独立 Worker + SQLite + 数据库轮询；存储和队列保留扩展接口 |
-| Deployment | 一个 API/Worker 进程只绑定一个 Project；Webhook secret、Project ID 必填，事件 Project ID 必须严格匹配 |
-| License | Apache-2.0 |
+| ReviewKey | `Project + 父 MR IID + 精确 SHA`；不含 `kind` |
+| Policy | Project Policy v3 只表达请求；Operator 配置授权 Backend/Profile 和 Publisher |
+| Review mode | v0.1 只有 Notify-only；不写 GitLab Approval |
+| Human/AI | 独立开关；AI 和 Auto-fix 默认关闭 |
+| Agent result | 受控 Result Path 中的严格 v1 JSON；stdout/stderr 只是诊断 |
+| Agent authority | 无 GitLab 发布凭据；不 commit、push、创建 MR 或 Note |
+| Note | ReviewFlow 持久化请求并发布；marker 由 ReviewKey 和 `effect=note` 组成 |
+| Auto-fix | 不可变 Intent generation/nonce + Diff Envelope + verification + Publication Plan |
+| Auto-fix publication | GitLab Commits API，`start_sha=ReviewKey.sha`，`force=false` |
+| Auto-fix default | `initial_readiness=draft`，`ci_trigger=manual`；`ready/manual` 非法 |
+| Relation | 只能由本地 Intent 与 Publisher 结果建立；Webhook 不能自动接管 |
+| Reconciliation | 处理不确定调用、崩溃、状态变化和显式恢复；非正常 Publisher |
+| Recovery | Store 丢失后只有带理由和审计的本地 Operator CLI |
+| Outcome | Run Lifecycle 稳定；Review Outcome 随用户可见效果与通知变化 |
+| Trust | linked worktree 是 Trusted Workspace，非 sandbox；隔离由 Backend Profile/Operator 负责 |
+| Runtime | 一个受监管 Worker OS 进程，内部三个独立循环，SQLite claim/lease |
 
 ## Explicit non-goals for v0.1
 
-- Group inheritance、CODEOWNERS 自动推导
-- Enforce/Approval Requirement、GitLab Approval 写入和多 Project 进程级隔离
-- 直接 merge、AI approval、AI blocking
-- Provider-specific SDK
-- 统一 Agent JSON 输出协议
-- Redis/Postgres 必选依赖
-- 多租户安全隔离或沙箱能力
+- Group inheritance、CODEOWNERS 自动推导、多 Project 进程
+- Enforce/Approval Requirement、AI approval、AI blocking 或直接 merge
+- Agent 凭据隔离的通用 OS sandbox 实现
+- fork/cross-Project Auto-fix publication
+- 旧 Policy v1/v2、Run-ID marker 或 SQLite schema 迁移
+- 独立 Dispatcher/Reconciler OS 进程、Redis 或 Postgres

@@ -6,20 +6,21 @@
 GitLab Webhook
        |
        v
-FastAPI API ---- SQLite Store ---- Worker poller
-                                      |
-                                      +-- Policy loader
-                                      +-- GitLab adapter
-                                      +-- Git worktree
-                                      +-- Agent CLI
-                                      +-- Notifiers
+FastAPI API -------- SQLite Store
+                           ^
+                           |
+                 supervised Worker process
+                    |       |       |
+                    |       |       +-- Reconciliation/Cleanup loop
+                    |       +---------- Notification loop
+                    +------------------ Review/Publication loop
 ```
 
-The API must acknowledge Webhooks quickly. The Worker owns all potentially slow operations: Pipeline polling, Git operations, Agent execution, GitLab writes and notifications.
+The API acknowledges Webhooks quickly. One supervised Worker OS process runs three independent loops: Review/Publication, Notification and Reconciliation/Cleanup. Each loop isolates per-item errors and uses independent claims/backoff so a stuck notification does not block reviews. Unexpected death of any loop terminates the Worker process; the process supervisor restarts the whole Worker. The Agent remains a child process. Separate Dispatcher/Reconciler OS processes are deferred until operational evidence requires them.
 
-## Review Run state
+## Review Run and effect lifecycle
 
-The first version uses:
+A Review Run is unique by `(project_id, mr_iid, sha)` and has no kind discriminator. Its normal lifecycle is:
 
 ```text
 pending -> running -> succeeded
@@ -28,55 +29,38 @@ pending -> running -> succeeded
        +-- deferred Pipeline Gate or Draft check
 ```
 
-The Store must atomically claim an eligible pending Run so two Workers cannot claim the same Run at once. A Run is unique by `(project_id, mr_iid, sha, kind)`. A deferred Run has a `next_attempt_at` and does not block later eligible Runs. This is at-least-once execution: a stale lease may cause a logical Run to execute again, so external side effects must use stable markers/coordination rather than an exactly-once claim guarantee.
+The Store atomically claims eligible work with an opaque token and lease. Expired work is recovered with bounded attempts; stale tokens cannot heartbeat, finish or mutate a reclaimed item. Transient GitLab, rate-limit and transport failures use capped backoff. Configuration, policy, invalid SHA and Agent contract failures are terminal. A head change cancels or supersedes the old key and enqueues the new exact SHA without publishing old effects.
 
-Each running Run has a lease expiration and opaque claim token. A Worker clears the lease when it finishes or defers the Run. If a Worker dies, the next claim operation recovers an expired Run to `pending`; after three claims without a terminal update, the Store marks it `failed` with a lease-expiry diagnostic. A Worker claims only its configured Project, cancels a Run whose MR is closed/merged, and atomically cancels and requeues the latest SHA when the MR head has advanced. Ordinary Agent non-zero exits are terminal failures and are not automatically retried.
+Note, Auto-fix and notification state is independent from process success. Requested Outputs, the Effective Run Decision and Output Expectations are frozen before effects proceed. User-visible Review Outcome is a projection over those durable expectations and receipts, not a synonym for Agent exit status.
 
-Transient GitLab/API connection failures, HTTP 429/5xx responses, and
-temporary worktree/transport failures have stable failure_class values and
-are requeued with capped exponential backoff. Configuration/policy failures,
-invalid SHA, closed/merged state, and Agent failures are terminal. The
-review_run_failures ledger retains the failure class, retryable flag, claim
-attempt and redacted diagnostic for each recorded failure. A long-running
-Agent uses a synchronous subprocess poll to extend its unexpired lease; this
-heartbeat does not create an uncontrolled background thread, and an old token
-cannot extend or finish a reclaimed Run.
+## Fresh SQLite schema
 
-## Required storage records
+The pre-release implementation performs a hard cutover to a fresh schema; it does not migrate or read legacy ReviewRun kinds, Run-ID markers or Agent-owned publication state. The schema retains at least:
 
-`review_runs` must retain at least:
+- `review_runs`: ReviewKey, status, attempts, lease/token, timestamps and redacted diagnostics;
+- `requested_outputs`, `effective_run_decisions` and `output_expectations`: immutable decisions used by the Outcome projection;
+- `note_publication_requests` and effect receipts: canonical marker, state, attempt, trusted external identity and deletion observation;
+- `auto_fix_intents`: immutable generation and nonce, with at most one active generation per ReviewKey;
+- `auto_fix_publication_plans`: full canonical Plan, digest, verification evidence and publication state;
+- `auto_fix_relations`: parent identity, child identity, observed state, divergence and merge SHA;
+- `notification_requests` and delivery outbox: immutable event identity, rendered fields, channel, attempts, lease and status;
+- `review_run_failures`: failure class, retryability, claim attempt and redacted diagnostic;
+- `worktree_cleanup`: workspace path, Run/SHA, attempts, lease and cleanup status;
+- `operator_recoveries`: recovery ID, exact supplied identities, reason, principal, host, tool version and result.
 
-- numeric run ID;
-- Project ID, MR IID and exact SHA;
-- `kind` (`normal` or future event kinds);
-- status and timestamps;
-- diagnostic/error summary;
-- `next_attempt_at` for deferred work;
-- `lease_until`, `attempts` and `claim_token` for crash recovery and stale-claim protection.
+Auto-fix retries reuse the active Intent generation and nonce. An explicit re-arm closes the prior generation, creates a new immutable generation/nonce and retains history. A child MR webhook can reference only an existing local Intent or Relation.
 
-`auto_fix_intents` must retain the parent MR/SHA/Run, generated source and target branches, generated title and the optional child MR identity before Agent execution. A terminal Run that has been reconciled without a child MR changes the intent to `abandoned`; only `planned` and `created` intents remain attachable. The child MR description must carry the exact `ReviewFlow-Auto-Fix-Run-ID:<run-id> SHA:<parent-sha>` marker before a branch-shaped webhook can attach an intent. `auto_fix_mrs` must retain the parent MR, parent Run, Auto-fix Project/MR, status and `merged_sha`.
-An `auto_fix_merge_events` table retains an Auto-fix merge event that arrives before its relation is written, so the later relation write can apply the merge suppression atomically.
+## Immutable payloads and retention
 
-`notification_outbox` must retain one record per notification/channel with the correlation ID, rendered event fields, channel identity, attempt count, lease, next-attempt time, final status and last error. `pending -> running -> delivered` or `failed` is independent of the Review Run state.
+Before any Auto-fix GitLab write, the Store persists the complete immutable Publication Plan, including base SHA, ordered content/actions and modes, branch, marker template, commit message, title, target, readiness and CI behavior. `plan_sha256` is the digest of canonical UTF-8 JSON for those independent inputs, excluding the derived digest value and final rendered marker. The Store freezes that payload, digest and digest-bearing marker together. A pending or uncertain plan remains recoverable without recapturing an Agent workspace.
 
-`worktree_cleanup` must retain each created worktree path, Run, SHA, cleanup attempts/lease and terminal cleanup status. A cleanup failure is retried independently and must not re-run the Agent.
-
-The reference implementation uses SQLite schema version 2. This version is a fresh pre-release schema; there is no backward-compatible migration of old channel indexes or old records.
-
-effect_receipts is created by SQLite initialization and retains at least
-run_id, effect_kind, deterministic dedupe_key, current attempt, state, safe
-external identity/detail, created_at, updated_at, next_attempt_at, and
-redacted error. Receipts can be planned, running, succeeded, pending,
-observed, not_observed, or failed. Secrets and Agent JSON output are never
-required in this table. Auto-fix reconciliation uses a short receipt lease
-and can remain pending across Worker cycles.
+The Operator may configure retention for sensitive review, diff and notification payloads. After successful publication or explicit abandonment, ReviewFlow may purge content while retaining the digest, stable identities, decision, timestamps and audit record. Purge never changes the meaning of a completed receipt.
 
 ## Deployment defaults
 
-- SQLite is the first storage implementation.
-- One API process and one Worker are the reference deployment.
-- Database polling is the first queue implementation.
-- One API/Worker process is bound to exactly one GitLab Project; the API requires a webhook secret and Project ID.
-- The repository is a persistent writable non-shallow checkout/mirror. The Worker explicitly ensures a requested SHA with a locked, bounded fetch before worktree creation.
-- Postgres and Redis are future implementations behind interfaces, not v0.1 dependencies.
-- Webhook secret, bound Project ID, GitLab token, Review Bot credentials, repository remote access and channel secrets are runtime inputs.
+- SQLite and database polling are the first storage/queue implementation.
+- One API process and one supervised Worker process are the reference deployment.
+- One deployment is bound to exactly one GitLab Project.
+- The repository is a persistent writable non-shallow checkout or mirror. The Worker obtains a requested SHA through a locked, bounded fetch before creating a detached worktree.
+- Agent, verification and publication credentials are distinct Operator-owned inputs; the Agent receives no GitLab publication token.
+- Postgres, Redis and separately deployed Worker loops are future implementations behind interfaces.

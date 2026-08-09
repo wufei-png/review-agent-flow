@@ -1,73 +1,69 @@
 # Event and lifecycle specification
 
-## Normal Review Run
+## Parent Review
 
-1. GitLab 发送 Merge Request Hook。
-2. Webhook 验证必填 token，要求事件 Project ID 等于进程绑定的 Project，并读取 MR IID、action、draft 状态和精确 head SHA；普通评审只接受 `last_commit.id` 或 `last_commit_id`，不把 `merge_commit_sha` 当作普通 head SHA。
-3. Draft MR 不创建运行；如果 Webhook 与 Worker 获取 MR 之间发生状态竞态，Worker 会重新排队而不发送通知或启动 Agent。
-4. 若 Project 启用 Pipeline Gate，Worker 将对应 Run 延后到下一次可检查时间；成功 Pipeline Hook 只唤醒已有 pending Run，不创建独立 Pipeline Run；等待中的 Run 不阻塞后续已就绪 Run。
-5. Store 以 `(project_id, mr_iid, sha, kind=normal)` 去重并创建 `pending` Review Run。
-6. Worker 以租约 claim 一个可执行的 pending Run；AI 路径先执行 `ensure_sha`，在仓库锁内限时 fetch 并再次校验 exact commit，再创建该 SHA 的独立 worktree；租约过期的 Run 最多自动恢复三次。
-7. Worker 按 Policy 将 Human 通知写入按渠道拆分的 outbox，并触发 Human Review 和/或 Agent Review；通知投递失败不改变 Review Run 状态，两条路径互不依赖。
-8. Agent 直接提交 Note；如果 Policy 允许并且 Agent 判断需要修复，则创建 Auto-fix MR。
-9. Worker 记录成功、失败或取消。Worktree 清理有独立记录和重试，不因清理失败重新执行 Agent。
+1. GitLab Merge Request Hook 通过 webhook secret 和单 Project 绑定校验。
+2. 只接受父 MR IID 与 `last_commit.id|last_commit_id` 的精确 head SHA。Draft
+   或非法事件不入队。
+3. Store 以 `(project_id, parent_mr_iid, sha)` 幂等创建 Review Run。
+4. Pipeline Gate 启用时，Pipeline Hook 只唤醒已有 pending Run，不创建新类型的 Run。
+5. Review 循环以 claim token/lease 领取 Run，再次校验 MR 仍打开、Ready
+   且 head SHA 精确匹配。
+6. Human 通知请求按 channel 持久化；Notification 循环独立投递。
+7. AI 路径确保 SHA 可用，创建 Trusted Workspace 和受控 Result Path，调用
+   Operator 授权的 Backend/Profile。
+8. Agent 成功后，ReviewFlow 分别验证 Note 结果和可选 Auto-fix
+   提议；两种效果互不回滚。
+9. 首次发布前如 head 已变更，旧 SHA 的未发布效果终止为
+   `superseded`，新 SHA 使用新 ReviewKey。
+10. Worktree cleanup 是独立资源任务，失败不会重跑 Agent。
 
-```mermaid
-flowchart TD
-    A[Merge Request Hook] --> B{Draft?}
-    B -- yes --> Z[Ignore]
-    B -- no --> C[Webhook validation]
-    C --> D{Pipeline Gate?}
-    D -- yes --> E[Wait for latest pipeline success / Pipeline Hook wakes existing Run]
-    D -- no --> F[Idempotent enqueue]
-    E --> F
-    F --> G[Claim Review Run]
-    G --> H[Create exact-SHA worktree]
-    H --> I[Human notification]
-    H --> J[Agent CLI Review]
-    J --> K[GitLab Note]
-    J --> L{Auto-fix enabled and needed?}
-    L -- no --> M[Finish Run]
-    L -- yes --> N[Create Auto-fix MR]
-    N --> O[Notify original MR creator only]
-    O --> P[Human decides whether to merge]
-    P --> Q{Auto-fix MR merged?}
-    Q -- no --> R[No parent MR mutation]
-    Q -- yes --> S[Skip only resulting parent SHA]
-    S --> T[Next user SHA resumes normal review]
-```
+## Program-owned Note
 
-## Auto-fix identity and loop rule
-
-The service registers an Auto-fix intent before invoking the Agent. The title prefix and branch are required output conventions, but are not trusted identities by themselves. The Agent must include the following Run/SHA marker in the child MR description:
+ReviewFlow 使用以下独立 marker 持久化 Note Publication Request：
 
 ```text
-[ReviewFlow Auto-Fix] <original title>
-ReviewFlow-Auto-Fix-Run-ID:<run-id> SHA:<parent-sha>
+<!-- reviewflow:v1;project=<project-id>;mr=<iid>;sha=<sha>;effect=note -->
 ```
 
-The Store must persist the intent and, once the child MR exists, the relation:
+调用结果不确定时，程序只信任当前 Review Bot 在精确 Project/MR
+中发布的一个精确 marker。零个可重试，多个或内容冲突进入
+`blocked`。已确认 Note 被用户删除后记录为 removed，不自动重建。
+
+## Program-owned Auto-fix
+
+1. Effective Decision 允许 Auto-fix 时，ReviewFlow 在 Agent 前创建一个 active
+   Intent generation 和不可变 nonce。重试复用它；re-arm 创建新 generation。
+2. 只有 Agent Result 显式包含 `autofix_proposal` 且 workspace 有非空合法 diff
+   时才继续。提议/diff 不一致是 Agent contract mismatch，但有效 Note 仍可发布。
+3. Diff Envelope 只允许有界、常规、非二进制文本文件的新增、修改、
+   删除和可执行位变化；拒绝 symlink、gitlink/submodule、路径逃逸和超限。
+4. Operator verification 通过后，程序冻结唯一 Publication Plan 与
+   `plan_sha256`，同时产生 Auto-fix Output Expectation。
+5. Publisher 以 `start_sha=ReviewKey.sha`、`force=false` 和 canonical actions 创建
+   branch commit，再创建父 MR source branch 为 target 的子 MR。
+6. 安全默认是 Draft 且 commit 跳过自动 CI。Operator 可显式配置
+   `draft/automatic` 或 `ready/automatic`，不允许 `ready/manual`。
+7. GitLab 返回子 MR 身份后，Store 持久化 Relation 和幂等 Notification
+   Request，只通知父 MR 创建者。
 
 ```text
-parent_project_id
-parent_mr_iid
-parent_sha
-run_id
-source_branch
-target_branch
-auto_fix_project_id
-auto_fix_mr_iid
-merged_sha
+<!-- reviewflow:v1;project=<project-id>;mr=<iid>;sha=<sha>;effect=autofix;intent=<nonce>;plan_sha256=<digest> -->
+autofix/MR-<iid>/sha-<sha>/intent-<nonce>
 ```
 
-When GitLab reports the parent MR head changed because the related Auto-fix MR merged, the service suppresses only that exact `merged_sha`. A later SHA without a related auto-fix merge is a normal trigger.
+## Reconciliation and recovery
 
-## Auto-fix MR lifecycle
+- Reconciler 只处理不确定 provider 结果、进程崩溃、已知 Relation 状态和
+  Operator 显式恢复。确认缺失时可恢复缺失步骤；精确匹配可继续；
+  冲突或多候选进入 `blocked`。
+- 子 MR Webhook 只能更新或唤醒已有 Intent/Relation，不创建 Review Run，
+  不在没有本地授权时建立 Relation。
+- Relation 建立后，title、description 和 Draft/Ready 变化不改变身份。
+  source/target/tree 漂移只标记状态，程序不 force-push 或覆盖。
+- Store 丢失后，本地 Operator CLI 必须校验唯一 Bot MR、ReviewKey、nonce、
+  plan digest、branch、target、marker 和 remote actions，并记录理由与审计主体。
+  恢复不自动补发通知；补发需要独立审计命令。
 
-- One Auto-fix MR is created per Review Run that produces an auto-fix proposal.
-- Existing Auto-fix MRs are not overwritten by later Runs.
-- The Auto-fix MR runs ordinary CI.
-- The Auto-fix MR does not trigger AI Review or another auto-fix.
-- Only the original parent MR creator receives the human review notification.
-
-An MR with a user-controlled Auto-fix-looking title or branch but no matching server intent and description marker is processed as a normal MR, not as Auto-fix. An intent that reaches a terminal Run without a reconciled child MR is marked `abandoned` and cannot be reused.
+Auto-fix MR 合并后只抑制其实际产生的父 MR SHA；之后的用户 SHA
+按普通 ReviewKey 处理。

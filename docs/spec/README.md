@@ -6,11 +6,11 @@
 
 - [00-history-and-scope.md](./00-history-and-scope.md) — 原项目、替代调研和为什么新建独立 OSS 项目
 - [01-domain-and-decisions.md](./01-domain-and-decisions.md) — 历史决策收敛后的产品边界和默认行为
-- [02-event-lifecycle.md](./02-event-lifecycle.md) — Webhook、Review Run 和 Auto-fix MR 生命周期
-- [03-policy-schema.md](./03-policy-schema.md) — `.gitlab/reviewflow.yml` 规范
-- [04-agent-contract.md](./04-agent-contract.md) — Provider、Agent CLI、Skill 和 worktree 协议
-- [05-integrations.md](./05-integrations.md) — GitLab、飞书、企业微信和 OpenCode/LiteLLM 边界
-- [06-runtime-and-storage.md](./06-runtime-and-storage.md) — API、Worker、SQLite、幂等和状态存储
+- [02-event-lifecycle.md](./02-event-lifecycle.md) — Webhook、Review Run、Note 与 Auto-fix 发布生命周期
+- [03-policy-schema.md](./03-policy-schema.md) — Project Policy 与 Operator 配置规范
+- [04-agent-contract.md](./04-agent-contract.md) — Provider、Agent、RESULT_PATH 和 Trusted Workspace 协议
+- [05-integrations.md](./05-integrations.md) — GitLab 发布、通知、恢复和 Agent 集成边界
+- [06-runtime-and-storage.md](./06-runtime-and-storage.md) — 单 Worker 多循环、SQLite、幂等和恢复状态
 - [07-implementation-status.md](./07-implementation-status.md) — 当前代码映射、剩余实现和验收标准
 
 ## Normative language

@@ -1,71 +1,68 @@
 # Agent and Provider contract
 
-## Separation
+## Separation of authority
 
 `AIProvider` and `AgentBackend` are different abstractions:
 
-- `AIProvider` is a model inference endpoint using the OpenAI-compatible API shape.
-- `AgentBackend` is an executable Agent workflow such as a local CLI or an OpenCode local service.
-- The core does not ship vendor-specific model SDKs.
-- Deployment documentation recommends LiteLLM as the gateway for model routing, auth, budget and observability.
+- `AIProvider` is a model inference endpoint using an OpenAI-compatible API shape.
+- `AgentBackend` is an Operator-authorized executable workflow such as a local CLI or OpenCode service.
+- A Project selects an allowed backend/profile and may supply review instructions; it never supplies executable commands or credentials.
+- The Agent produces review content and an optional workspace diff. ReviewFlow alone publishes Notes, commits, branches and Merge Requests.
 
-## Local CLI input
+The core does not ship vendor-specific model SDKs. LiteLLM may be used as an external model gateway.
 
-The Worker invokes the configured command with `shell=False`, the Review Run worktree as `cwd`, and these environment variables:
+## Invocation
+
+The Worker invokes the selected Operator command with `shell=False` and the exact-SHA Trusted Workspace as `cwd`. It creates `REVIEW_AGENT_FLOW_RESULT_PATH` outside that workspace with restrictive permissions and supplies only these ReviewFlow variables plus the profile's explicit environment allowlist:
 
 | Variable | Meaning |
 | --- | --- |
 | `REVIEW_AGENT_FLOW_PROJECT_ID` | GitLab Project identifier |
-| `REVIEW_AGENT_FLOW_MR_IID` | Merge Request IID |
-| `REVIEW_AGENT_FLOW_RUN_ID` | Numeric Review Run identifier; use it in the Auto-fix branch name |
-| `REVIEW_AGENT_FLOW_SHA` | Exact reviewed commit |
-| `REVIEW_AGENT_FLOW_GITLAB_URL` | GitLab base URL |
-| `REVIEW_AGENT_FLOW_SKILL` | Project Skill path when it exists, otherwise the packaged default Skill |
-| `REVIEW_AGENT_FLOW_AUTO_FIX_ENABLED` | `true` only when Project policy enables auto-fix |
-| `REVIEW_AGENT_FLOW_AUTO_FIX_BRANCH` | Service-registered Auto-fix branch; present when auto-fix is enabled |
-| `REVIEW_AGENT_FLOW_AUTO_FIX_TARGET_BRANCH` | Original MR source branch; the Auto-fix MR must target this branch |
-| `REVIEW_AGENT_FLOW_AUTO_FIX_TITLE` | Service-registered Auto-fix title |
-| `REVIEW_AGENT_FLOW_AUTO_FIX_MARKER` | Stable intent marker that must be included verbatim in the Auto-fix MR description |
-| `REVIEW_AGENT_FLOW_NOTE_MARKER` | Canonical standalone token `<!-- review-run:<run-id>:note -->` that must appear exactly once in the Agent-owned Note body |
-| `GITLAB_TOKEN` | Review Bot token, when injected by runtime |
+| `REVIEW_AGENT_FLOW_MR_IID` | Parent Merge Request IID |
+| `REVIEW_AGENT_FLOW_RUN_ID` | Local trace identifier; not publication identity |
+| `REVIEW_AGENT_FLOW_SHA` | Exact reviewed commit and required unchanged `HEAD` |
+| `REVIEW_AGENT_FLOW_SKILL` | Project Skill path when valid, otherwise the packaged default Skill |
+| `REVIEW_AGENT_FLOW_AUTO_FIX_ENABLED` | `true` only when Project request and Operator authorization both allow a proposal |
+| `REVIEW_AGENT_FLOW_RESULT_PATH` | Controlled path for the single structured result |
 
-The command receives no required JSON output contract. The Agent uses the worktree and GitLab context to submit Notes itself. Before posting, it must search for the exact Note marker and must include it in a newly posted Note. When it creates an Auto-fix MR, it must include the exact Auto-fix marker in the MR description; this is the identity check that prevents a rebuilt SQLite database from adopting an old MR with a reused numeric Run ID. The Worker only needs process status, stdout/stderr for diagnostics, timeout handling and lifecycle state.
+ReviewFlow does not expose the GitLab token, publication marker, branch, title, target branch, commit message or readiness to the Agent. Stdout and stderr are bounded diagnostics only and never carry the authoritative result.
 
-The Worker persists Effect Receipts for Agent execution, the expected
-Agent-owned Note, and (when enabled) the expected Auto-fix MR. These receipts
-are an audit and reconciliation surface, not an Agent response schema. After
-the Agent exits successfully, the Worker asks the optional GitLab Note observer
-to find the Note containing the exact canonical marker. Only a scoped Note
-with exactly one marker line and a strict positive-integer native ID becomes
-`observed` and receives an external identity. A successful
-Agent process does not prove that a Note or Auto-fix MR was observed; a missing
-or unavailable Note remains `not_observed`, and the Review Run status is kept
-independent from that external side effect.
+## Structured result v1
 
-Auto-fix reconciliation queries the deterministic branch across opened,
-closed, and merged Merge Requests. A delayed or temporarily invisible MR
-remains a pending receipt for a later Worker cycle. If the MR is merged, the
-relation stores its resulting merge SHA and suppresses only that exact parent
-SHA. This is at-least-once processing with reconciliation, not exactly-once
-external side effects.
+On success the Agent atomically writes one bounded UTF-8 JSON object to `REVIEW_AGENT_FLOW_RESULT_PATH`:
 
-## Worktree
+```json
+{
+  "version": 1,
+  "review_markdown": "Actionable review text.",
+  "autofix_proposal": {
+    "summary": "What the proposed workspace changes fix."
+  }
+}
+```
 
-The Worker ensures the exact SHA is available locally before creating a detached worktree. The Agent must not modify the parent source branch directly. The Worker registers an Auto-fix intent before Agent execution; a terminal Run that produces no child MR closes that intent as abandoned. Auto-fix output is created on the supplied `autofix/MR-<iid>/run-<run-id>` branch and pushed as a separate MR targeting the supplied parent source branch. An Auto-fix-looking title or branch without a matching intent and marker is not trusted.
+`version` must equal `1`. `review_markdown` is required and must be a non-empty string. `autofix_proposal` is optional; when present, `summary` is required and the workspace must contain a non-empty eligible diff. Unknown fields, malformed JSON, missing files, symlinks, oversized files and unsupported versions are contract failures. A non-zero exit or timeout publishes neither Note nor Auto-fix.
+
+ReviewFlow publishes `review_markdown` as raw GitLab Markdown after adding its own marker. It does not sanitize Markdown. Deployment permissions therefore remain the control for GitLab quick actions and other account-level effects.
+
+## Trusted Workspace and diff envelope
+
+The Agent starts in a detached worktree at the exact ReviewKey SHA. It must not change `HEAD`, create commits, push branches, call GitLab or create an MR. When Auto-fix is disabled or `autofix_proposal` is absent, it must leave the workspace unchanged.
+
+For an Auto-fix proposal, ReviewFlow captures tracked and untracked changes only after confirming `HEAD` still equals the ReviewKey SHA. The accepted envelope is bounded regular, non-binary, UTF-8-compatible text add/modify/delete/chmod actions. Commits, symlinks, gitlinks/submodules, path traversal, binary content and oversized per-file or aggregate output are rejected. An empty diff, or a mismatch between proposal presence and diff presence, blocks Auto-fix publication as a contract error. A valid `review_markdown` remains independently publishable when Auto-fix validation fails.
+
+An Operator verifier runs after capture and before Plan freeze. ReviewFlow records a canonical digest of the captured candidate, runs the verifier against that candidate, then rechecks `HEAD` and recaptures the complete Diff Envelope. The post-verifier candidate must exactly equal the captured digest before the verified actions can be frozen into the Plan. No configured verifier, verifier failure, candidate mutation or unverifiable output prevents Auto-fix publication. The verifier is not controlled by Project content.
+
+The Trusted Workspace is an execution boundary, not a security sandbox. The Operator Backend Profile remains responsible for process, filesystem, host and network isolation.
 
 ## Default Skill responsibilities
 
-The built-in Skill tells an Agent to:
+The packaged Skill tells an Agent to:
 
 1. inspect the exact worktree and MR context;
 2. review correctness, security, reliability and maintainability;
-3. submit an actionable GitLab Note;
-4. never approve or block the parent MR;
-5. create an Auto-fix MR only when enabled and safe;
-6. notify only the parent MR creator for Auto-fix review.
+3. write the strict result JSON at `REVIEW_AGENT_FLOW_RESULT_PATH`;
+4. optionally make only safe proposal edits when Auto-fix is enabled;
+5. leave `HEAD` unchanged and never commit, push, publish, notify, approve or block.
 
-Project `.gitlab/review-agent/SKILL.md` takes precedence over the built-in Skill.
-
-## Trusted execution
-
-The first version assumes a trusted Worker deployment. It does not attempt to sandbox Agent tools, network or credentials. This is a deployment precondition, not an assertion that arbitrary multi-tenant code is safe.
+A valid Project `.gitlab/review-agent/SKILL.md` replaces the packaged review instructions but cannot replace the runtime or publication authority.

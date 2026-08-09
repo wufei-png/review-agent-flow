@@ -2,62 +2,66 @@
 
 ## GitLab ingress
 
-The API accepts GitLab Merge Request Hooks at `POST /webhooks/gitlab` only after `GITLAB_WEBHOOK_SECRET` and `REVIEW_AGENT_FLOW_PROJECT_ID` are configured. It checks `X-Gitlab-Token` on every request; a wrong token returns `401`, and a payload from another Project returns `403` without enqueueing work. The deployment is single-Project: the configured Project ID must match the payload Project ID.
+The API accepts GitLab Merge Request Hooks at `POST /webhooks/gitlab` only after `GITLAB_WEBHOOK_SECRET` and `REVIEW_AGENT_FLOW_PROJECT_ID` are configured. It checks `X-Gitlab-Token` on every request; a wrong token returns `401`, and a payload from another Project returns `403` without enqueueing work. The reference deployment binds one Project per process.
 
-Normal Merge Request review runs use only `object_attributes.last_commit.id` or `object_attributes.last_commit_id`. `merge_commit_sha` is never a normal review fallback; it is reserved for the Auto-fix MR merge event. Every enqueued or suppression SHA must be a 40- or 64-character hexadecimal SHA. Missing or invalid Project/MR identity or SHA is rejected without enqueueing work.
+Parent review intake uses only `object_attributes.last_commit.id` or `object_attributes.last_commit_id`. `merge_commit_sha` is never a parent review fallback. Every ReviewKey SHA must be a 40- or 64-character hexadecimal SHA; invalid or incomplete identity is rejected.
 
-The current endpoint is intentionally small. The remaining GitLab adapter must provide:
+A Pipeline Hook only wakes an existing deferred Review Run for the same ReviewKey. An Auto-fix child MR Hook only updates or wakes an existing local Intent/Relation or reconciliation item. It never creates a Review Run and never establishes a relation without local authority.
 
-- MR fetch and source/target branch details;
-- Pipeline status for Pipeline Gate;
-- Note creation, preserving the public `create_note(project_id, mr_iid, body) -> None` contract;
-- Optional Note observation through a separate `NoteObserver` capability:
-  `find_note_by_marker(project_id, mr_iid, marker) -> Note | None`;
-- reviewer lookup/mention data;
-- branch push and Auto-fix MR creation;
-- parent/Auto-fix MR merge relationship lookup.
+## GitLab adapter and Note publication
 
-Auto-fix classification is based on a server-owned Store intent/relation plus the exact Run/SHA marker in the child MR description. A title or branch that merely looks like an Auto-fix output is not sufficient. The MR lookup used to reconcile an Agent result must include closed and merged MRs, not only open MRs, and must skip candidates without the current intent marker. A terminal intent with no reconciled child MR is marked abandoned. Note-marker deduplication must paginate through all Notes and only trust Notes authored by the configured Review Bot username (`GITLAB_REVIEW_BOT_USERNAME`); if that username is not configured, the safe behavior is to run again rather than trust an unverified marker.
+The adapter uses `python-gitlab` behind narrow domain interfaces for:
 
-When a worktree SHA is absent locally, the Worker calls an explicit `ensure_sha` operation. It checks the local object database, takes a repository lock, performs a bounded fetch and verifies the commit again before invoking `git worktree add`. Fetch credentials and remote access remain deployment inputs.
+- parent MR, Pipeline and branch observation;
+- paginated trusted Review Bot Note lookup and Note creation;
+- repository commit creation through the GitLab Commits API;
+- Auto-fix MR creation and exact source/target/state observation.
 
-The adapter should use `python-gitlab` behind a narrow interface so the domain and Worker do not depend on GitLab SDK objects.
+Before publishing any effect, ReviewFlow confirms the parent MR still has the ReviewKey SHA. A stale ReviewKey becomes `superseded`; no old Note or Auto-fix is published.
 
-The Worker detects the optional observer capability at runtime, so existing
-GitLab clients and fakes that only implement Note creation remain compatible.
-ReviewFlow passes the canonical token
-`<!-- review-run:<run-id>:note -->`. The observer must scope the lookup to the
-Project and MR and return a `Note` only when exactly one Note body contains one
-standalone line equal to that full token and the native Note ID is a strict
-positive integer. Zero matches, duplicate exact matches, prefix/suffix matches,
-and IDs represented by zero, negative numbers, booleans, floats, or strings are
-fail-closed as `None`. The Worker repeats the exact-token validation before
-updating `note_expected` to `observed`; missing observer capability or an
-unverified Note leaves the receipt `not_observed` without changing Agent Run
-success. The Note receipt keeps the historical dedupe key
-`review-run:<run-id>:note`; the canonical HTML token is an observation token,
-not a replacement dedupe key.
+ReviewFlow creates a Note containing exactly one canonical marker:
+
+```text
+<!-- reviewflow:v1;project=<project-id>;mr=<iid>;sha=<sha>;effect=note -->
+```
+
+Lookup is scoped to the Project and parent MR, paginates all Notes and trusts only the configured Review Bot author's exact marker. Zero matches permits creation; one valid match adopts the external identity; duplicates or malformed matches fail closed for reconciliation. A Note confirmed deleted by the user is not recreated.
+
+## Auto-fix publication
+
+AutoFixPublisher consumes a persisted immutable Publication Plan. It creates the source branch and commit atomically with the GitLab Commits API using the Plan's ordered actions, `start_sha=ReviewKey.sha` and `force=false`, then creates a same-Project child MR targeting the parent MR's original source branch. Fork-source Auto-fix is unsupported in v0.1.
+
+The Program owns branch, commit, title, target, creation readiness, CI trigger and description marker:
+
+```text
+autofix/MR-<iid>/sha-<sha>/intent-<nonce>
+<!-- reviewflow:v1;project=<project-id>;mr=<iid>;sha=<sha>;effect=autofix;intent=<nonce>;plan_sha256=<digest> -->
+```
+
+The digest input is the canonical UTF-8 JSON Plan payload with sorted keys and no insignificant whitespace. It contains every publication input and a marker template, but excludes the derived `plan_sha256` value and final rendered marker. ReviewFlow hashes that payload, renders the marker from the digest, and freezes the payload, digest and final marker together. This avoids self-reference while binding every independent publication choice. Retry uses the same frozen Plan and Intent nonce.
+
+After GitLab returns the child identity, ReviewFlow persists the Auto-fix Relation and its idempotent Notification Request in one SQLite transaction. A publishable Relation cannot be committed without that request; reconciliation repairs an older incomplete transaction state before treating publication as complete.
+
+Presentation changes after creation, including title, description text around the marker and Draft/Ready state, do not invalidate a Relation. Source/target/tree drift is observed as divergence; ReviewFlow never force-updates user changes. A Relation records opened, closed and merged states, including the merge SHA used to suppress only that exact parent SHA.
+
+The Reconciler searches only when an external result is uncertain, a process may have crashed, relation state may have changed or an Operator requested recovery. The normal path does not search for Agent-created artifacts because the Agent cannot create them.
 
 ## Human notifications
 
-The first release supports both Feishu and WeCom. A Project may configure both channels. Each configured channel has a stable unique `id`; outbox routing uses that ID rather than list position. Normal human review can notify configured reviewers; Auto-fix MR notifications go only to the original parent MR creator. Channel credentials and identity mappings are runtime secrets/configuration, not committed policy content. Notification payloads include the event title, body and optional URL.
+The first release supports Feishu and WeCom. A Project may configure both. Each channel has a stable unique ID; outbox routing uses that ID rather than list position. Normal human review may notify configured reviewers; an Auto-fix MR notification targets only the original parent MR creator.
 
-The Worker writes one SQLite outbox record per configured channel before attempting delivery. A channel failure does not fail or roll back the Review Run, and does not prevent another channel from being delivered. Failed deliveries retry up to three attempts with exponential delay and remain auditable as `failed` after the final attempt. Delivery is at-least-once across a Worker crash between provider delivery and outbox acknowledgement, so providers may receive a duplicate.
+ReviewFlow persists one immutable Notification Request and one outbox delivery per selected channel before delivery. Channel failure does not roll back the Review Run or another channel. Failed deliveries retry with bounded backoff and remain auditable. Delivery is at-least-once across a crash between provider delivery and acknowledgement, so a provider may receive a duplicate.
 
-The webhook adapter reports delivery success only when the HTTP response is 2xx and the provider business response is successful (`code == 0` for Feishu, `errcode == 0` for WeCom). Empty, malformed or provider-error responses are failed deliveries.
+The webhook adapter succeeds only for HTTP 2xx plus provider business success (`code == 0` for Feishu, `errcode == 0` for WeCom). Provider-specific mention markup stays in the adapter.
 
-Each notifier should implement a small common interface such as:
+## Explicit recovery
 
-```python
-notify(event: NotificationEvent) -> NotificationResult
-```
+Store-loss recovery is never inferred from an Auto-fix-looking branch, title or marker alone. A trusted-host Operator CLI requires an exact Project, parent MR, parent SHA, Intent nonce, Plan digest and child MR identity. It revalidates all available GitLab facts and records reason, principal, hostname, time, tool version and recovery ID.
 
-The event should contain Project/MR identity, recipient identity, title, URL, summary and correlation ID. Provider-specific mention markup stays inside the adapter.
+Recovery does not automatically resend historical notifications because delivery state is indeterminate. A separate audited resend request is required.
 
-## OpenCode and other Agents
+## Agent and model integrations
 
-OpenCode Web is an operator-facing local UI. Automated execution should use a CLI or a programmatic local endpoint such as OpenCode Server/ACP. Other tools (`claude`, `codex`, and future Agents) are supported through the generic configured CLI command before dedicated adapters are justified.
+Automated OpenCode execution uses its CLI or a programmatic local endpoint through an Operator-owned Backend Profile. Other Agents can implement the same backend contract. OpenCode Web remains an Operator-facing UI, not the publication path.
 
-## Model layer
-
-The core only defines an OpenAI-compatible Provider contract. LiteLLM is a deployment recommendation and should be documented as an external gateway, not imported by the core package.
+The core only defines an OpenAI-compatible Provider contract. LiteLLM is a deployment recommendation, not a core dependency.
