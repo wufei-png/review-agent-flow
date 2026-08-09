@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Event, Thread
+from time import monotonic
 
 from .auto_fix_reconciler import AutoFixReconciler
 from .autofix_planner import (
@@ -29,6 +30,7 @@ from .operator_config import AutoFixPublicationConfig, ResolvedBackend
 from .policy import ReviewPolicy, policy_from_json, policy_json
 from .policy_resolver import ProjectPolicyResolver
 from .repository import GitShaEnsurer
+from .retention import RetentionManager, RetentionSweepResult
 from .runner import (
     AgentContext,
     AgentContractError,
@@ -94,6 +96,7 @@ class ReviewWorker:
         autofix_publication: AutoFixPublicationConfig | None = None,
         policy_resolver: ProjectPolicyResolver | None = None,
         backend_resolver: Callable[[ReviewPolicy], ResolvedBackend | None] | None = None,
+        retention_manager: RetentionManager | None = None,
     ) -> None:
         configured_project_id = (
             project_id if project_id is not None else os.getenv("REVIEW_AGENT_FLOW_PROJECT_ID")
@@ -110,6 +113,7 @@ class ReviewWorker:
         self._startup_policy = policy
         self.policy_resolver = policy_resolver
         self.backend_resolver = backend_resolver
+        self.retention_manager = retention_manager
         if policy.ai.enabled and agent_backend is None:
             raise ValueError("AI Review requires an Operator-authorized Agent Backend/Profile")
         self.agent_backend = agent_backend
@@ -1084,35 +1088,49 @@ class ReviewWorker:
             detail=result.detail or "",
         )
 
-    def run_forever(self, poll_interval_seconds: float = 5.0) -> None:
+    def run_forever(
+        self,
+        poll_interval_seconds: float = 5.0,
+        *,
+        stop_event: Event | None = None,
+        retention_interval_seconds: float = 3600.0,
+    ) -> None:
         if poll_interval_seconds <= 0:
             raise ValueError("Worker poll interval must be positive")
-        stop_event = Event()
+        if retention_interval_seconds <= 0:
+            raise ValueError("Worker retention interval must be positive")
+        stop = stop_event or Event()
         failures: Queue[tuple[str, BaseException]] = Queue()
 
         def review_publication_loop() -> None:
-            while not stop_event.is_set():
+            while not stop.is_set():
                 result = self.process_one()
                 if result is None or result.status == "deferred":
-                    stop_event.wait(poll_interval_seconds)
+                    stop.wait(poll_interval_seconds)
 
         def reconciliation_cleanup_loop() -> None:
-            while not stop_event.is_set():
+            next_retention_at = 0.0
+            while not stop.is_set():
                 cleanup_count = self.process_worktree_cleanup(limit=1)
                 reconciliation = self.reconcile_auto_fixes(limit=1)
-                if cleanup_count == 0 and reconciliation is None:
-                    stop_event.wait(poll_interval_seconds)
+                retention_ran = False
+                if self.retention_manager is not None and monotonic() >= next_retention_at:
+                    self.retention_manager.sweep()
+                    next_retention_at = monotonic() + retention_interval_seconds
+                    retention_ran = True
+                if cleanup_count == 0 and reconciliation is None and not retention_ran:
+                    stop.wait(poll_interval_seconds)
 
         def supervise(name: str, target: Callable[[], None]) -> None:
             try:
                 target()
             except BaseException as exc:  # noqa: BLE001 - any loop exit restarts the Worker
                 failures.put((name, exc))
-                stop_event.set()
+                stop.set()
             else:
-                if not stop_event.is_set():
+                if not stop.is_set():
                     failures.put((name, RuntimeError(f"{name} exited unexpectedly")))
-                    stop_event.set()
+                    stop.set()
 
         loops = (
             (
@@ -1123,7 +1141,7 @@ class ReviewWorker:
                 "Notification loop",
                 lambda: self.notification_dispatcher.run_forever(
                     poll_interval_seconds=min(max(poll_interval_seconds, 0.1), 1.0),
-                    stop_event=stop_event,
+                    stop_event=stop,
                 ),
             ),
             (
@@ -1136,7 +1154,7 @@ class ReviewWorker:
                 target=supervise,
                 args=(name, target),
                 name=f"reviewflow-{name.lower().replace('/', '-').replace(' ', '-')}",
-                daemon=True,
+                daemon=False,
             )
             for name, target in loops
         ]
@@ -1147,12 +1165,19 @@ class ReviewWorker:
                 try:
                     name, error = failures.get(timeout=0.5)
                 except Empty:
+                    if stop.is_set():
+                        break
                     continue
                 raise RuntimeError(f"{name} failed; supervised Worker must restart") from error
         finally:
-            stop_event.set()
+            stop.set()
             for thread in threads:
-                thread.join(timeout=1.0)
+                thread.join()
+
+    def process_retention(self) -> RetentionSweepResult | None:
+        if self.retention_manager is None:
+            return None
+        return self.retention_manager.sweep()
 
     def process_worktree_cleanup(self, limit: int = 1) -> int:
         if limit <= 0:

@@ -2,6 +2,7 @@ import sqlite3
 import subprocess
 import sys
 from pathlib import Path
+from threading import Event, Thread
 
 import pytest
 
@@ -793,7 +794,7 @@ def test_worker_publishes_verified_program_owned_auto_fix_plan(tmp_path: Path) -
     plan = store.get_auto_fix_publication_plan(run.run_id)
     assert intent is not None and intent.state == "published"
     assert plan is not None
-    assert plan.plan_json is None
+    assert plan.plan_json is not None
     assert plan.marker.endswith(f"plan_sha256={plan.plan_sha256} -->")
     assert plan.state == "published"
     assert gitlab.created_commits[0]["start_sha"] == sha
@@ -864,6 +865,49 @@ def test_supervised_worker_fails_when_one_independent_loop_exits(
 
     with pytest.raises(RuntimeError, match="Review/Publication loop failed"):
         worker.run_forever(0.01)
+
+
+def test_supervised_worker_stops_gracefully_on_external_event(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    sha = _git_repository(repository)
+    worker = ReviewWorker(
+        SQLiteStore(tmp_path / "review.db"),
+        FakeGitLab(
+            MergeRequest("42", 1, "Parent", "alice", "feature", "main", sha, "https://mr")
+        ),
+        GitWorktreeManager(repository, tmp_path / "worktrees"),
+        ReviewPolicy(),
+        repository,
+        "https://gitlab",
+        project_id="42",
+    )
+    stop = Event()
+    started = Event()
+    errors = []
+
+    def wait_for_stop():
+        started.set()
+        stop.wait(1)
+
+    def run():
+        try:
+            worker.run_forever(0.01, stop_event=stop)
+        except RuntimeError as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    monkeypatch.setattr(worker, "process_one", wait_for_stop)
+    thread = Thread(target=run)
+    thread.start()
+    assert started.wait(1)
+
+    stop.set()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert errors == []
 
 
 def test_workspace_diff_without_proposal_blocks_only_auto_fix(tmp_path: Path) -> None:

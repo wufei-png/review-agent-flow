@@ -1,0 +1,27 @@
+[Unit]
+Description=Review Agent Flow Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=reviewflow-worker
+Group=reviewflow-shared
+UMask=0007
+WorkingDirectory=/var/lib/review-agent-flow-worker/repository
+EnvironmentFile=/etc/review-agent-flow/worker.env
+ExecStart=/opt/review-agent-flow/.venv/bin/review-agent-flow worker --poll-interval 5
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=3700s
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectProc=invisible
+ProcSubset=pid
+ReadWritePaths=/var/lib/review-agent-flow/shared /var/lib/review-agent-flow-worker
+
+[Install]
+WantedBy=multi-user.target

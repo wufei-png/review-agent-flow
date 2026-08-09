@@ -43,7 +43,7 @@ The pre-release implementation performs a hard cutover to a fresh schema; it doe
 - `auto_fix_publication_intents`: immutable generation and nonce, with at most one active generation per ReviewKey;
 - `auto_fix_publication_plans`: full canonical Plan, digest, verification evidence and publication state;
 - `auto_fix_relations`: parent identity, child identity, observed state, divergence and merge SHA;
-- `notification_requests` and delivery outbox: immutable event identity and generation, rendered fields, channel, attempts, lease and status;
+- `notification_requests` and delivery outbox: immutable event identity and generation, rendered fields, channel, non-sensitive payload digest, attempts, lease and status;
 - `review_run_failures`: failure class, retryability, diagnostic claim number and redacted diagnostic;
 - `worktree_cleanup`: workspace path, Run/SHA, attempts, lease and cleanup status;
 - `operator_recoveries`: recovery ID, action, exact supplied identities, reason, principal, host, tool version, result and redacted diagnostic.
@@ -55,15 +55,16 @@ Auto-fix retries reuse the active Intent generation and nonce. Explicit Plan rea
 
 Before any Auto-fix GitLab write, the Store persists the complete immutable Publication Plan, including base SHA, ordered content/actions and modes, branch, marker template, commit message, title, target, readiness and CI behavior. `plan_sha256` is the digest of canonical UTF-8 JSON for those independent inputs, excluding the derived digest value and final rendered marker. The Store freezes that payload, digest and digest-bearing marker together. A pending or uncertain plan remains recoverable without recapturing an Agent workspace.
 
-The Operator may configure retention for sensitive review, diff and notification payloads. After successful publication or explicit abandonment, ReviewFlow may purge content while retaining the digest, stable identities, decision, timestamps and audit record. Purge never changes the meaning of a completed receipt.
+Operator configuration v3 sets sensitive review, diff, notification and diagnostic retention from 1 to 3650 days, defaulting to 30. The supervised Worker sweeps at startup and hourly. It purges only terminal payloads and retains digests, stable identities, decisions, timestamps, expectations, receipts, Relations and audits. A Note receives a stable retention timestamp on its first terminal publication outcome; successful reconciliation cannot postpone expiry. A purged published Note stops exact-content reconciliation because its original body is intentionally unavailable; its last confirmed identity and state remain historical evidence. Notification presentation, recipients and channels retain only a digest after purge, so recovery-ID replay still rejects changed inputs. Purge never changes the meaning of a completed receipt.
 
-A deployment that requires complete Store-loss recovery must retain the canonical Publication Plan as trusted backup evidence before payload purge; the digest or GitLab marker alone is deliberately insufficient authority. The recovery CLI consumes that retained canonical JSON but never writes it back into the active Store after successful reconstruction.
+A Publication Plan remains in the active Store after publication or abandonment until the Worker writes canonical JSON to the configured Operator-owned mode-`0700` backup directory, verifies ownership, exact bytes, digest and mode `0600`, fsyncs the file and directory, and records an immutable backup receipt. With no backup directory, Plan payloads are not purged. The digest or GitLab marker alone is deliberately insufficient authority. The recovery CLI consumes retained canonical JSON but never writes it back into the active Store after successful reconstruction.
 
 ## Deployment defaults
 
 - SQLite and database polling are the first storage/queue implementation.
-- One API process and one supervised Worker process are the reference deployment.
+- One API process and one supervised Worker process with separate Unix identities are the reference deployment. They share only the SQLite directory; repository, worktrees, Plan backups and Worker credentials are Worker-private.
 - One deployment is bound to exactly one GitLab Project.
 - The repository is a persistent writable non-shallow checkout or mirror. The Worker obtains a requested SHA through a locked, bounded fetch before creating a detached worktree.
 - Agent, verification and publication credentials are distinct Operator-owned inputs; the Agent receives no GitLab publication token.
 - Postgres, Redis and separately deployed Worker loops are future implementations behind interfaces.
+- SIGTERM stops new Worker claims and waits for in-flight loops; backend and verifier timeouts are individually capped at 1800 seconds and the reference supervisor applies a 3700-second final stop timeout.

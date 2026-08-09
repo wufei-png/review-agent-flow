@@ -14,7 +14,7 @@ from review_agent_flow.policy import AIPolicy
 def _write_config(path: Path, publication: str = "") -> Path:
     path.write_text(
         f"""
-version: 2
+version: 3
 backends:
   local-agent:
     command: [opencode, run]
@@ -39,6 +39,8 @@ autofix_publication:
 
 def test_operator_config_resolves_only_allowed_backend_profile_and_environment(tmp_path) -> None:
     config = load_operator_config(_write_config(tmp_path / "operator.yml"))
+    assert config.retention.sensitive_payload_days == 30
+    assert config.retention.publication_plan_backup_dir is None
     resolved = resolve_backend(
         config,
         AIPolicy(enabled=True, backend="local-agent", profile="default"),
@@ -85,7 +87,20 @@ def test_operator_config_denies_unknown_project_backend_and_profile(tmp_path) ->
     with pytest.raises(OperatorConfigError, match="backend is not"):
         resolve_backend(config, AIPolicy(enabled=True, backend="missing", profile="default"), "42")
     with pytest.raises(OperatorConfigError, match="profile is not"):
-        resolve_backend(config, AIPolicy(enabled=True, backend="local-agent", profile="missing"), "42")
+        resolve_backend(
+            config, AIPolicy(enabled=True, backend="local-agent", profile="missing"), "42"
+        )
+
+
+def test_operator_config_rejects_backend_timeout_above_shutdown_bound(tmp_path) -> None:
+    path = _write_config(tmp_path / "operator.yml")
+    path.write_text(
+        path.read_text(encoding="utf-8").replace("timeout_seconds: 120", "timeout_seconds: 1801"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(OperatorConfigError, match="between 1 and 1800"):
+        load_operator_config(path)
 
 
 def test_operator_backend_kill_switch_denies_execution(tmp_path) -> None:
@@ -109,8 +124,8 @@ def test_operator_backend_kill_switch_denies_execution(tmp_path) -> None:
     "replacement",
     [
         "version: 3",
-        "version: 2\nunknown: true",
-        "version: 2\nbackends: []",
+        "version: 3\nunknown: true",
+        "version: 3\nbackends: []",
     ],
 )
 def test_operator_config_is_strict(tmp_path, replacement: str) -> None:
@@ -127,6 +142,47 @@ def test_operator_config_rejects_ready_with_manual_ci(tmp_path) -> None:
     )
     path.write_text(text, encoding="utf-8")
     with pytest.raises(OperatorConfigError, match="ready/manual"):
+        load_operator_config(path)
+
+
+def test_operator_retention_parses_absolute_backup_directory(tmp_path) -> None:
+    backup_dir = tmp_path / "plan-backups"
+    path = _write_config(tmp_path / "operator.yml")
+    path.write_text(
+        path.read_text(encoding="utf-8")
+        + f"""
+retention:
+  sensitive_payload_days: 45
+  publication_plan_backup_dir: {backup_dir}
+""",
+        encoding="utf-8",
+    )
+
+    config = load_operator_config(path)
+
+    assert config.retention.sensitive_payload_days == 45
+    assert config.retention.publication_plan_backup_dir == backup_dir.resolve()
+
+
+@pytest.mark.parametrize("days", [0, 3651, '"30"'])
+def test_operator_retention_rejects_invalid_days(tmp_path, days) -> None:
+    path = _write_config(tmp_path / "operator.yml")
+    path.write_text(
+        path.read_text(encoding="utf-8") + f"\nretention:\n  sensitive_payload_days: {days}\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(OperatorConfigError, match="sensitive_payload_days"):
+        load_operator_config(path)
+
+
+def test_operator_retention_rejects_relative_backup_directory(tmp_path) -> None:
+    path = _write_config(tmp_path / "operator.yml")
+    path.write_text(
+        path.read_text(encoding="utf-8")
+        + "\nretention:\n  publication_plan_backup_dir: relative/backups\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(OperatorConfigError, match="must be absolute"):
         load_operator_config(path)
 
 
@@ -168,7 +224,7 @@ def test_operator_yaml_rejects_duplicate_nested_authority_key(tmp_path) -> None:
     path = tmp_path / "operator.yml"
     path.write_text(
         """
-version: 2
+version: 3
 backends:
   local-agent:
     command: [opencode, run]
@@ -184,9 +240,7 @@ backends:
         load_operator_config(path)
 
 
-def test_notification_bindings_are_operator_owned_and_project_scoped(
-    tmp_path, monkeypatch
-) -> None:
+def test_notification_bindings_are_operator_owned_and_project_scoped(tmp_path, monkeypatch) -> None:
     path = _write_config(tmp_path / "operator.yml")
     path.write_text(
         path.read_text(encoding="utf-8")

@@ -1,0 +1,31 @@
+version: 3
+
+backends:
+  local-agent:
+    enabled: true
+    command: [opencode, run]
+    allowed_projects: ["42"]
+    profiles:
+      default:
+        timeout_seconds: 1800
+        environment: [OPENAI_API_KEY]
+        verification:
+          command: [pytest, -q]
+
+autofix_publication:
+  enabled: false
+  allowed_projects: ["42"]
+  initial_readiness: draft
+  ci_trigger: manual
+
+notifications:
+  channels:
+    feishu-reviewers:
+      type: feishu
+      webhook_env: FEISHU_WEBHOOK
+      allowed_projects: ["42"]
+      user_ids: {}
+
+retention:
+  sensitive_payload_days: 30
+  publication_plan_backup_dir: /var/lib/review-agent-flow-worker/plan-backups

@@ -1,0 +1,27 @@
+[Unit]
+Description=Review Agent Flow API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=reviewflow-api
+Group=reviewflow-shared
+UMask=0007
+WorkingDirectory=/var/lib/review-agent-flow/shared
+EnvironmentFile=/etc/review-agent-flow/api.env
+ExecStart=/opt/review-agent-flow/.venv/bin/review-agent-flow api --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectProc=invisible
+ProcSubset=pid
+ReadWritePaths=/var/lib/review-agent-flow/shared
+
+[Install]
+WantedBy=multi-user.target

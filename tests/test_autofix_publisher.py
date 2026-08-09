@@ -286,7 +286,7 @@ def test_publisher_uses_exact_commit_contract_and_atomically_requests_notificati
     assert gitlab.mr_payloads[0]["draft"] is True
     plan = store.get_auto_fix_publication_plan(run_id)
     assert plan is not None and plan.state == "published"
-    assert plan.plan_json is None
+    assert plan.plan_json is not None
     assert plan.candidate_sha256 == "c" * 64
     assert plan.verification_json
     assert plan.branch_commit_sha == "f" * 40
@@ -491,7 +491,7 @@ def test_reconciler_recovers_missing_merge_request_after_confirmed_commit(
     assert len(gitlab.commit_payloads) == 1
     assert len(gitlab.mr_payloads) == 2
     plan = store.get_auto_fix_publication_plan(run_id)
-    assert plan is not None and plan.state == "published" and plan.plan_json is None
+    assert plan is not None and plan.state == "published" and plan.plan_json is not None
     assert store.get_program_auto_fix_relation(plan_id) is not None
     assert store.list_effect_receipts(run_id, "autofix_plan")[0].state == "published"
 

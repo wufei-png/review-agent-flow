@@ -21,7 +21,7 @@ DEFAULT_NOTIFICATION_LEASE_SECONDS = 30
 DEFAULT_NOTIFICATION_MAX_ATTEMPTS = 3
 DEFAULT_WORKTREE_CLEANUP_LEASE_SECONDS = 60
 DEFAULT_WORKTREE_CLEANUP_MAX_ATTEMPTS = 5
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 DEFAULT_EFFECT_LEASE_SECONDS = 60
 DEFAULT_NOTE_PUBLICATION_LEASE_SECONDS = 60
 DEFAULT_NOTE_PUBLICATION_MAX_ATTEMPTS = 5
@@ -276,6 +276,24 @@ class OperatorPlanAction:
 
 
 @dataclass(frozen=True)
+class PublicationPlanBackupCandidate:
+    plan_id: int
+    plan_sha256: str
+    plan_json: str
+
+
+@dataclass(frozen=True)
+class SensitivePayloadPurgeResult:
+    purge_id: int
+    cutoff_at: str
+    plan_payloads: int
+    note_payloads: int
+    notification_payloads: int
+    diagnostic_payloads: int
+    created_at: str
+
+
+@dataclass(frozen=True)
 class NotificationDelivery:
     delivery_id: int
     correlation_id: str
@@ -314,7 +332,7 @@ class WorktreeRecord:
 class SQLiteStore:
     """Small SQLite store.
 
-    Version 13 is intentionally a fresh schema.  There is no production database
+    Version 14 is intentionally a fresh schema.  There is no production database
     migration contract for this pre-release implementation; an older database
     must be recreated rather than guessed into a new notification or Auto-fix
     routing model.
@@ -392,7 +410,10 @@ class SQLiteStore:
                 connection.execute("DROP TABLE reviewflow_readiness_probe")
                 connection.execute("RELEASE SAVEPOINT reviewflow_readiness_probe")
                 if row is None:
-                    return {"status": "not_ready", "diagnostic": "sqlite probe read returned no row"}
+                    return {
+                        "status": "not_ready",
+                        "diagnostic": "sqlite probe read returned no row",
+                    }
         except (OSError, sqlite3.Error) as exc:
             return {"status": "not_ready", "diagnostic": self._redact(exc, max_length=1000)}
         return {"status": "ok", "diagnostic": None}
@@ -401,18 +422,14 @@ class SQLiteStore:
         with self._connect() as connection:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
         if version != SCHEMA_VERSION:
-            raise RuntimeError(
-                f"unsupported SQLite schema version {version}; recreate {self.path}"
-            )
+            raise RuntimeError(f"unsupported SQLite schema version {version}; recreate {self.path}")
 
     def _initialize(self) -> None:
         with self._connect() as connection:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             existing_tables = {
                 row[0]
-                for row in connection.execute(
-                    "SELECT name FROM sqlite_master WHERE type = 'table'"
-                )
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
             }
             if existing_tables and version != SCHEMA_VERSION:
                 raise RuntimeError(
@@ -513,6 +530,7 @@ class SQLiteStore:
                     next_attempt_at TEXT,
                     lease_until TEXT,
                     claim_token TEXT,
+                    payload_purged_at TEXT,
                     last_error TEXT
                 );
                 CREATE TABLE IF NOT EXISTS auto_fix_relations (
@@ -555,6 +573,8 @@ class SQLiteStore:
                     body TEXT NOT NULL,
                     url TEXT,
                     recipients_json TEXT NOT NULL,
+                    payload_sha256 TEXT NOT NULL,
+                    payload_purged_at TEXT,
                     created_at TEXT NOT NULL,
                     UNIQUE(relation_id, generation)
                 );
@@ -644,6 +664,8 @@ class SQLiteStore:
                     reconcile_next_at TEXT,
                     reconcile_lease_until TEXT,
                     reconcile_claim_token TEXT,
+                    payload_retention_at TEXT,
+                    payload_purged_at TEXT,
                     UNIQUE(project_id, mr_iid, sha)
                 );
                 CREATE TABLE IF NOT EXISTS notification_outbox (
@@ -662,6 +684,7 @@ class SQLiteStore:
                     claim_token TEXT,
                     created_at TEXT NOT NULL,
                     delivered_at TEXT,
+                    payload_purged_at TEXT,
                     last_error TEXT,
                     UNIQUE(correlation_id, channel_id)
                 );
@@ -680,7 +703,22 @@ class SQLiteStore:
                     last_error TEXT,
                     UNIQUE(run_id, path)
                 );
-                PRAGMA user_version = 13;
+                CREATE TABLE IF NOT EXISTS publication_plan_backups (
+                    plan_id INTEGER PRIMARY KEY REFERENCES auto_fix_publication_plans(id),
+                    plan_sha256 TEXT NOT NULL UNIQUE,
+                    backup_path TEXT NOT NULL UNIQUE,
+                    backed_up_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS sensitive_payload_purges (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cutoff_at TEXT NOT NULL,
+                    plan_payloads INTEGER NOT NULL,
+                    note_payloads INTEGER NOT NULL,
+                    notification_payloads INTEGER NOT NULL,
+                    diagnostic_payloads INTEGER NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                PRAGMA user_version = 14;
                 """
             )
 
@@ -751,6 +789,27 @@ class SQLiteStore:
             "reconcile_attempts, reconcile_next_at, reconcile_lease_until, "
             "reconcile_claim_token"
         )
+
+    @staticmethod
+    def _notification_payload_sha256(
+        title: str,
+        body: str,
+        url: str | None,
+        recipients: tuple[str, ...],
+        channels: tuple[tuple[str, str], ...],
+    ) -> str:
+        payload = json.dumps(
+            {
+                "body": body,
+                "channels": [list(channel) for channel in sorted(channels)],
+                "recipients": list(recipients),
+                "title": title,
+                "url": url,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     @staticmethod
     def _auto_fix_publication_intent_from_row(
@@ -1024,9 +1083,13 @@ class SQLiteStore:
                 "SELECT * FROM requested_outputs WHERE run_id = ?", (run_id,)
             ).fetchone()
         assert row is not None
-        if tuple(row[key] for key in (
-            "human_review", "ai_review", "auto_fix", "notification_channels_json"
-        )) != expected:
+        if (
+            tuple(
+                row[key]
+                for key in ("human_review", "ai_review", "auto_fix", "notification_channels_json")
+            )
+            != expected
+        ):
             raise ValueError("Requested Outputs are immutable for a Review Run")
         return self._requested_outputs_from_row(row)
 
@@ -1089,8 +1152,7 @@ class SQLiteStore:
         if len(set(expectations)) != len(expectations):
             raise ValueError("Output Expectations must be unique")
         if any(
-            kind not in {"note", "notification", "autofix"} or not key
-            for kind, key in expectations
+            kind not in {"note", "notification", "autofix"} or not key for kind, key in expectations
         ):
             raise ValueError("invalid Output Expectation")
         recipients_json = json.dumps(list(recipients), separators=(",", ":"))
@@ -1133,10 +1195,19 @@ class SQLiteStore:
                 "SELECT * FROM effective_run_decisions WHERE run_id = ?", (run_id,)
             ).fetchone()
             assert row is not None
-            actual = tuple(row[key] for key in (
-                "decision", "human_review", "ai_review", "auto_fix", "suppressed",
-                "recipients_json", "notification_channels_json", "reason"
-            ))
+            actual = tuple(
+                row[key]
+                for key in (
+                    "decision",
+                    "human_review",
+                    "ai_review",
+                    "auto_fix",
+                    "suppressed",
+                    "recipients_json",
+                    "notification_channels_json",
+                    "reason",
+                )
+            )
             if actual != expected:
                 raise ValueError("Effective Run Decision is immutable for a Review Run")
             for output_kind, dedupe_key in expectations:
@@ -1176,16 +1247,22 @@ class SQLiteStore:
         decision = self.get_effective_run_decision(run_id)
         if decision is None:
             with self._connect() as connection:
-                if connection.execute(
-                    "SELECT 1 FROM auto_fix_relations WHERE run_id = ?", (run_id,)
-                ).fetchone() is not None:
+                if (
+                    connection.execute(
+                        "SELECT 1 FROM auto_fix_relations WHERE run_id = ?", (run_id,)
+                    ).fetchone()
+                    is not None
+                ):
                     return "delivered"
             return "indeterminate" if requested is not None else "no_effect"
         expectations = self.list_output_expectations(run_id)
         with self._connect() as connection:
-            optional_delivered = connection.execute(
-                "SELECT 1 FROM auto_fix_relations WHERE run_id = ?", (run_id,)
-            ).fetchone() is not None
+            optional_delivered = (
+                connection.execute(
+                    "SELECT 1 FROM auto_fix_relations WHERE run_id = ?", (run_id,)
+                ).fetchone()
+                is not None
+            )
         if not expectations:
             return "delivered" if optional_delivered else "no_effect"
 
@@ -1202,8 +1279,10 @@ class SQLiteStore:
                     ).fetchone()
                     state = str(row["status"]) if row is not None else "missing"
                     states.append(
-                        "delivered" if state == "delivered"
-                        else "pending" if state in {"pending", "running"}
+                        "delivered"
+                        if state == "delivered"
+                        else "pending"
+                        if state in {"pending", "running"}
                         else "failed"
                     )
                 elif expectation.output_kind == "note":
@@ -1213,8 +1292,10 @@ class SQLiteStore:
                     ).fetchone()
                     state = str(row["state"]) if row is not None else "missing"
                     states.append(
-                        "delivered" if state in {"published", "superseded"}
-                        else "pending" if state in {"pending", "running", "uncertain"}
+                        "delivered"
+                        if state in {"published", "superseded"}
+                        else "pending"
+                        if state in {"pending", "running", "uncertain"}
                         else "failed"
                     )
                 else:
@@ -1227,10 +1308,10 @@ class SQLiteStore:
                     ).fetchone()
                     state = str(row["state"]) if row is not None else "missing"
                     states.append(
-                        "delivered" if state in {"published", "superseded"}
-                        else "pending" if state in {
-                            "frozen", "running", "needs_reconciliation", "reconciling"
-                        }
+                        "delivered"
+                        if state in {"published", "superseded"}
+                        else "pending"
+                        if state in {"frozen", "running", "needs_reconciliation", "reconciling"}
                         else "failed"
                     )
         if "pending" in states:
@@ -1265,9 +1346,7 @@ class SQLiteStore:
                 "attempt": failure.attempt,
                 "failure_class": failure.failure_class,
                 "retryable": failure.retryable,
-                "error": self._redact(failure.error, max_length=2000)
-                if failure.error
-                else None,
+                "error": self._redact(failure.error, max_length=2000) if failure.error else None,
                 "recorded_at": failure.recorded_at,
             }
             for failure in failures[-20:]
@@ -1286,12 +1365,8 @@ class SQLiteStore:
                 "external_identity": self._redact(receipt.external_identity, max_length=1000)
                 if receipt.external_identity
                 else None,
-                "detail": self._redact(receipt.detail, max_length=1000)
-                if receipt.detail
-                else None,
-                "error": self._redact(receipt.error, max_length=2000)
-                if receipt.error
-                else None,
+                "detail": self._redact(receipt.detail, max_length=1000) if receipt.detail else None,
+                "error": self._redact(receipt.error, max_length=2000) if receipt.error else None,
                 "updated_at": receipt.updated_at,
             }
             for receipt in self.list_effect_receipts(run_id)[-50:]
@@ -1671,9 +1746,9 @@ class SQLiteStore:
             exhausted = failure_attempts >= max_attempts
             status = "failed" if exhausted else "pending"
             finished_at = now.isoformat() if exhausted else None
-            next_attempt_at = None if exhausted else (
-                now + timedelta(seconds=delay_seconds)
-            ).isoformat()
+            next_attempt_at = (
+                None if exhausted else (now + timedelta(seconds=delay_seconds)).isoformat()
+            )
             update_query = (
                 "UPDATE review_runs SET status = ?, finished_at = ?, error = ?, "
                 "failure_class = ?, retryable = 1, next_attempt_at = ?, "
@@ -1859,9 +1934,7 @@ class SQLiteStore:
                 str(run["project_id"]), int(run["mr_iid"]), str(run["sha"])
             )
             body = f"{marker}\n{review_markdown}"
-            initial_state = (
-                "pending" if has_exact_note_marker(body, marker) else "blocked"
-            )
+            initial_state = "pending" if has_exact_note_marker(body, marker) else "blocked"
             initial_error = (
                 None
                 if initial_state == "pending"
@@ -1907,11 +1980,7 @@ class SQLiteStore:
             ).fetchone()
             assert row is not None
             request = self._note_publication_from_row(row)
-            if (
-                request.receipt_id != receipt_id
-                or request.marker != marker
-                or request.body != body
-            ):
+            if request.receipt_id != receipt_id or request.marker != marker or request.body != body:
                 raise ValueError("Note Publication Request is immutable")
             connection.execute(
                 """
@@ -1933,9 +2002,7 @@ class SQLiteStore:
             )
         return request
 
-    def get_note_publication_request(
-        self, request_id: int
-    ) -> NotePublicationRequest | None:
+    def get_note_publication_request(self, request_id: int) -> NotePublicationRequest | None:
         with self._connect() as connection:
             row = connection.execute(
                 f"SELECT {self._note_publication_columns()} "
@@ -1944,9 +2011,7 @@ class SQLiteStore:
             ).fetchone()
         return self._note_publication_from_row(row) if row is not None else None
 
-    def get_note_publication_for_run(
-        self, run_id: int
-    ) -> NotePublicationRequest | None:
+    def get_note_publication_for_run(self, run_id: int) -> NotePublicationRequest | None:
         with self._connect() as connection:
             row = connection.execute(
                 f"SELECT {self._note_publication_columns()} "
@@ -2094,9 +2159,7 @@ class SQLiteStore:
             )
         return self._note_publication_from_row(claimed)
 
-    def mark_note_write_uncertain(
-        self, request_id: int, claim_token: str | None
-    ) -> bool:
+    def mark_note_write_uncertain(self, request_id: int, claim_token: str | None) -> bool:
         """Durably record the create boundary before invoking GitLab."""
 
         now = datetime.now(UTC).isoformat()
@@ -2127,9 +2190,7 @@ class SQLiteStore:
         allowed_states = {"pending", "published", "blocked", "superseded"}
         if state not in allowed_states:
             raise ValueError("invalid Note publication completion state")
-        if state == "published" and (
-            type(external_note_id) is not int or external_note_id <= 0
-        ):
+        if state == "published" and (type(external_note_id) is not int or external_note_id <= 0):
             raise ValueError("published Note requires a positive external_note_id")
         now = datetime.now(UTC).isoformat()
         with self._connect() as connection:
@@ -2154,6 +2215,11 @@ class SQLiteStore:
                 UPDATE note_publication_requests
                 SET state = ?, external_note_id = ?, next_attempt_at = ?,
                     lease_until = NULL, claim_token = NULL, updated_at = ?, last_error = ?,
+                    payload_retention_at = CASE
+                        WHEN ? IN ('published', 'blocked', 'superseded')
+                        THEN COALESCE(payload_retention_at, ?)
+                        ELSE payload_retention_at
+                    END,
                     reconcile_attempts = CASE WHEN ? = 'published' THEN 0
                                               ELSE reconcile_attempts END,
                     reconcile_next_at = CASE WHEN ? = 'published' THEN ?
@@ -2167,6 +2233,8 @@ class SQLiteStore:
                     next_attempt_at,
                     now,
                     self._redact(error) if error else None,
+                    state,
+                    now,
                     state,
                     state,
                     reconcile_next_at,
@@ -2230,6 +2298,7 @@ class SQLiteStore:
                 f"""
                 SELECT id FROM note_publication_requests
                 WHERE state = 'published' AND external_note_id IS NOT NULL
+                  AND payload_purged_at IS NULL
                   AND reconcile_claim_token IS NULL
                   AND (reconcile_next_at IS NULL OR reconcile_next_at <= ?)
                   {filters}
@@ -2289,6 +2358,7 @@ class SQLiteStore:
                 """
                 UPDATE note_publication_requests
                 SET state = ?, updated_at = ?, last_error = ?,
+                    payload_retention_at = COALESCE(payload_retention_at, ?),
                     reconcile_attempts = CASE WHEN ? IS NULL THEN 0
                                               ELSE reconcile_attempts END,
                     reconcile_next_at = ?, reconcile_lease_until = NULL,
@@ -2299,14 +2369,13 @@ class SQLiteStore:
                     state,
                     now,
                     self._redact(error) if error else None,
+                    now,
                     error,
                     reconcile_next_at,
                     request_id,
                 ),
             )
-            identity = (
-                f"gitlab:{row['project_id']}!{row['mr_iid']}#note-{row['external_note_id']}"
-            )
+            identity = f"gitlab:{row['project_id']}!{row['mr_iid']}#note-{row['external_note_id']}"
             connection.execute(
                 """
                 UPDATE effect_receipts
@@ -2470,9 +2539,7 @@ class SQLiteStore:
                         *project_parameters,
                     ),
                 )
-            attempt_scope = (
-                " AND effect_receipts.attempt < ?" if max_attempts is not None else ""
-            )
+            attempt_scope = " AND effect_receipts.attempt < ?" if max_attempts is not None else ""
             rows = connection.execute(
                 f"""
                 SELECT effect_receipts.id FROM effect_receipts
@@ -2496,9 +2563,7 @@ class SQLiteStore:
             claimed_rows: list[sqlite3.Row] = []
             for row in rows:
                 token = uuid4().hex
-                claim_attempt_scope = (
-                    " AND attempt < ?" if max_attempts is not None else ""
-                )
+                claim_attempt_scope = " AND attempt < ?" if max_attempts is not None else ""
                 claimed_update = connection.execute(
                     f"""
                     UPDATE effect_receipts
@@ -2567,8 +2632,7 @@ class SQLiteStore:
             )
             if claim_token is not None:
                 update_query += (
-                    " AND claim_token = ?"
-                    " AND lease_until IS NOT NULL AND lease_until > ?"
+                    " AND claim_token = ? AND lease_until IS NOT NULL AND lease_until > ?"
                 )
                 update_parameters += (claim_token, created_at)
             updated = connection.execute(update_query, update_parameters)
@@ -2663,20 +2727,14 @@ class SQLiteStore:
                 raise ValueError("Auto-fix Intent is immutable for its ReviewKey")
         return intent
 
-    def get_auto_fix_publication_intent(
-        self, run_id: int
-    ) -> AutoFixPublicationIntent | None:
+    def get_auto_fix_publication_intent(self, run_id: int) -> AutoFixPublicationIntent | None:
         with self._connect() as connection:
             row = connection.execute(
                 f"SELECT {self._auto_fix_publication_intent_columns()} "
                 "FROM auto_fix_publication_intents WHERE run_id = ?",
                 (run_id,),
             ).fetchone()
-        return (
-            self._auto_fix_publication_intent_from_row(row)
-            if row is not None
-            else None
-        )
+        return self._auto_fix_publication_intent_from_row(row) if row is not None else None
 
     def block_incomplete_auto_fix_after_frozen_note(
         self,
@@ -2809,9 +2867,7 @@ class SQLiteStore:
 
         if not run_claim_token or "plan_sha256" in payload:
             raise ValueError("Publication Plan inputs must exclude derived identity")
-        plan_json = json.dumps(
-            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        )
+        plan_json = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         plan_sha256 = hashlib.sha256(plan_json.encode("utf-8")).hexdigest()
         template = payload.get("marker_template")
         candidate_sha256 = payload.get("candidate_sha256")
@@ -2852,9 +2908,7 @@ class SQLiteStore:
                 f"sha={intent.sha};effect=autofix;intent={intent.nonce};"
                 "plan_sha256={plan_sha256} -->"
             )
-            expected_branch = (
-                f"autofix/MR-{intent.mr_iid}/sha-{intent.sha}/intent-{intent.nonce}"
-            )
+            expected_branch = f"autofix/MR-{intent.mr_iid}/sha-{intent.sha}/intent-{intent.nonce}"
             command_sha256 = verification.get("command_sha256")
             if (
                 payload.get("review_key") != expected_review_key
@@ -2958,18 +3012,14 @@ class SQLiteStore:
                 raise ValueError("Auto-fix Publication Plan is immutable")
         return plan
 
-    def get_auto_fix_publication_plan(
-        self, run_id: int
-    ) -> AutoFixPublicationPlan | None:
+    def get_auto_fix_publication_plan(self, run_id: int) -> AutoFixPublicationPlan | None:
         with self._connect() as connection:
             row = connection.execute(
                 f"SELECT {self._auto_fix_publication_plan_columns()} "
                 "FROM auto_fix_publication_plans WHERE run_id = ?",
                 (run_id,),
             ).fetchone()
-        return (
-            self._auto_fix_publication_plan_from_row(row) if row is not None else None
-        )
+        return self._auto_fix_publication_plan_from_row(row) if row is not None else None
 
     def claim_auto_fix_publication_plan(
         self,
@@ -3568,6 +3618,7 @@ class SQLiteStore:
             return None
         if len({channel_id for channel_id, _channel in channels}) != len(channels):
             raise ValueError("notification channel IDs must be unique")
+        payload_sha256 = self._notification_payload_sha256(title, body, url, recipients, channels)
         now = self._now().isoformat()
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -3648,8 +3699,8 @@ class SQLiteStore:
                 """
                 INSERT INTO notification_requests(
                     relation_id, generation, request_kind, correlation_id, title, body, url,
-                    recipients_json, created_at
-                ) VALUES (?, 1, 'publication', ?, ?, ?, ?, ?, ?)
+                    recipients_json, payload_sha256, created_at
+                ) VALUES (?, 1, 'publication', ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(relation_id, generation) DO NOTHING
                 """,
                 (
@@ -3659,6 +3710,7 @@ class SQLiteStore:
                     body,
                     url,
                     recipients_json,
+                    payload_sha256,
                     now,
                 ),
             )
@@ -3666,17 +3718,16 @@ class SQLiteStore:
                 """
                 SELECT id AS request_id, relation_id, generation, request_kind,
                        correlation_id, title,
-                       body, url, recipients_json, created_at
+                       body, url, recipients_json, payload_sha256, created_at
                 FROM notification_requests WHERE relation_id = ? AND generation = 1
                 """,
                 (relation.relation_id,),
             ).fetchone()
             assert request_row is not None
             request_values = dict(request_row)
+            saved_payload_sha256 = str(request_values.pop("payload_sha256"))
             request_recipients = tuple(json.loads(request_values.pop("recipients_json")))
-            request = NotificationRequest(
-                **request_values, recipients=request_recipients
-            )
+            request = NotificationRequest(**request_values, recipients=request_recipients)
             if (
                 request.generation != 1
                 or request.request_kind != "publication"
@@ -3685,6 +3736,7 @@ class SQLiteStore:
                 or request.body != body
                 or request.url != url
                 or request.recipients != recipients
+                or saved_payload_sha256 != payload_sha256
             ):
                 raise ValueError("Auto-fix Notification Request is immutable")
             for channel_id, channel in channels:
@@ -3713,7 +3765,7 @@ class SQLiteStore:
                 SET state = 'published', external_mr_iid = ?, write_uncertain = 0,
                     write_phase = 'published',
                     updated_at = ?, lease_until = NULL, claim_token = NULL,
-                    last_error = NULL, plan_json = NULL
+                    last_error = NULL
                 WHERE id = ?
                 """,
                 (auto_fix_mr_iid, now, plan_id),
@@ -3746,9 +3798,7 @@ class SQLiteStore:
             )
         return relation, request
 
-    def get_program_auto_fix_relation(
-        self, plan_id: int
-    ) -> ProgramAutoFixRelation | None:
+    def get_program_auto_fix_relation(self, plan_id: int) -> ProgramAutoFixRelation | None:
         with self._connect() as connection:
             row = connection.execute(
                 f"""
@@ -3819,11 +3869,7 @@ class SQLiteStore:
             if row is None:
                 return None
             divergence = str(row["divergence"]) if row["divergence"] else None
-            if (
-                source_branch is not None
-                and target_branch is not None
-                and description is not None
-            ):
+            if source_branch is not None and target_branch is not None and description is not None:
                 divergence = self._program_relation_divergence(
                     row, source_branch, target_branch, description, source_sha
                 )
@@ -4519,6 +4565,7 @@ class SQLiteStore:
             raise ValueError("notification channel IDs must be unique")
         if not channels:
             raise ValueError("notification resend requires at least one channel")
+        payload_sha256 = self._notification_payload_sha256(title, body, url, recipients, channels)
         now = self._now().isoformat()
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -4562,8 +4609,7 @@ class SQLiteStore:
                     or existing_audit["parent_mr_iid"] != relation["parent_mr_iid"]
                     or existing_audit["parent_sha"] != relation["parent_sha"]
                     or existing_audit["plan_sha256"] != relation["plan_sha256"]
-                    or existing_audit["child_project_id"]
-                    != relation["auto_fix_project_id"]
+                    or existing_audit["child_project_id"] != relation["auto_fix_project_id"]
                     or existing_audit["child_mr_iid"] != relation["auto_fix_mr_iid"]
                     or existing_audit["reason"] != reason
                     or existing_audit["principal"] != principal
@@ -4573,45 +4619,39 @@ class SQLiteStore:
                     raise ValueError("Operator recovery ID is already bound to another result")
                 request_row = connection.execute(
                     "SELECT id AS request_id, relation_id, generation, request_kind, "
-                    "correlation_id, title, body, url, recipients_json, created_at "
+                    "correlation_id, title, body, url, recipients_json, created_at, "
+                    "payload_sha256, payload_purged_at "
                     "FROM notification_requests WHERE correlation_id = ?",
                     (correlation_id,),
                 ).fetchone()
                 assert request_row is not None
                 values = dict(request_row)
-                saved_recipients = tuple(json.loads(values.pop("recipients_json")))
-                request = NotificationRequest(**values, recipients=saved_recipients)
-                channel_rows = connection.execute(
-                    "SELECT channel_id, channel FROM notification_outbox "
-                    "WHERE correlation_id = ? ORDER BY channel_id",
-                    (correlation_id,),
-                ).fetchall()
-                saved_channels = tuple(
-                    (str(row["channel_id"]), str(row["channel"])) for row in channel_rows
-                )
-                if (
-                    request.title != title
-                    or request.body != body
-                    or request.url != url
-                    or request.recipients != recipients
-                    or saved_channels != tuple(sorted(channels))
-                ):
+                payload_purged = values.pop("payload_purged_at") is not None
+                saved_payload_sha256 = str(values.pop("payload_sha256"))
+                if saved_payload_sha256 != payload_sha256:
                     raise ValueError("Operator notification resend is immutable")
-                return request
-            generation = int(
-                connection.execute(
-                    "SELECT COALESCE(MAX(generation), 0) FROM notification_requests "
-                    "WHERE relation_id = ?",
-                    (relation_id,),
-                ).fetchone()[0]
-            ) + 1
+                saved_recipients = tuple(json.loads(values.pop("recipients_json")))
+                if payload_purged:
+                    values.update(title=title, body=body, url=url)
+                    saved_recipients = recipients
+                return NotificationRequest(**values, recipients=saved_recipients)
+            generation = (
+                int(
+                    connection.execute(
+                        "SELECT COALESCE(MAX(generation), 0) FROM notification_requests "
+                        "WHERE relation_id = ?",
+                        (relation_id,),
+                    ).fetchone()[0]
+                )
+                + 1
+            )
             recipients_json = json.dumps(recipients, separators=(",", ":"))
             connection.execute(
                 """
                 INSERT INTO notification_requests(
                     relation_id, generation, request_kind, correlation_id,
-                    title, body, url, recipients_json, created_at
-                ) VALUES (?, ?, 'operator_resend', ?, ?, ?, ?, ?, ?)
+                    title, body, url, recipients_json, payload_sha256, created_at
+                ) VALUES (?, ?, 'operator_resend', ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     relation_id,
@@ -4621,6 +4661,7 @@ class SQLiteStore:
                     body,
                     url,
                     recipients_json,
+                    payload_sha256,
                     now,
                 ),
             )
@@ -4690,8 +4731,7 @@ class SQLiteStore:
     def list_operator_recoveries(self) -> tuple[OperatorRecovery, ...]:
         with self._connect() as connection:
             rows = connection.execute(
-                f"SELECT {self._operator_recovery_columns()} "
-                "FROM operator_recoveries ORDER BY id"
+                f"SELECT {self._operator_recovery_columns()} FROM operator_recoveries ORDER BY id"
             ).fetchall()
         return tuple(self._operator_recovery_from_row(row) for row in rows)
 
@@ -4765,14 +4805,14 @@ class SQLiteStore:
                 else from_state in {"frozen", "blocked", "needs_reconciliation"}
             )
             if action == "rearm":
-                to_state = (
-                    "frozen" if write_phase == "preflight" else "needs_reconciliation"
-                )
+                to_state = "frozen" if write_phase == "preflight" else "needs_reconciliation"
             else:
                 to_state = "abandoned"
             result = "succeeded" if allowed else "rejected"
-            diagnostic = None if allowed else self._redact(
-                f"cannot {action} Auto-fix Plan from state {from_state}"
+            diagnostic = (
+                None
+                if allowed
+                else self._redact(f"cannot {action} Auto-fix Plan from state {from_state}")
             )
             if allowed:
                 connection.execute(
@@ -4869,6 +4909,228 @@ class SQLiteStore:
                 "FROM operator_plan_actions ORDER BY id"
             ).fetchall()
         return tuple(self._operator_plan_action_from_row(row) for row in rows)
+
+    def list_publication_plan_backup_candidates(
+        self,
+        cutoff: datetime,
+        *,
+        limit: int = 100,
+    ) -> tuple[PublicationPlanBackupCandidate, ...]:
+        if cutoff.tzinfo is None or limit <= 0:
+            raise ValueError("retention cutoff must be timezone-aware and limit positive")
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT p.id AS plan_id, p.plan_sha256, p.plan_json
+                FROM auto_fix_publication_plans p
+                LEFT JOIN publication_plan_backups b ON b.plan_id = p.id
+                WHERE p.state IN ('published', 'abandoned')
+                  AND p.updated_at <= ? AND p.plan_json IS NOT NULL
+                  AND b.plan_id IS NULL
+                ORDER BY p.id LIMIT ?
+                """,
+                (cutoff.isoformat(), limit),
+            ).fetchall()
+        return tuple(PublicationPlanBackupCandidate(**dict(row)) for row in rows)
+
+    def record_publication_plan_backup(
+        self,
+        candidate: PublicationPlanBackupCandidate,
+        backup_path: str,
+    ) -> None:
+        if not backup_path.strip():
+            raise ValueError("Publication Plan backup path cannot be empty")
+        if not Path(backup_path).is_absolute():
+            raise ValueError("Publication Plan backup path must be absolute")
+        if hashlib.sha256(candidate.plan_json.encode("utf-8")).hexdigest() != (
+            candidate.plan_sha256
+        ):
+            raise ValueError("Publication Plan backup candidate digest is invalid")
+        now = self._now().isoformat()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT plan_sha256, plan_json FROM auto_fix_publication_plans
+                WHERE id = ? AND state IN ('published', 'abandoned')
+                """,
+                (candidate.plan_id,),
+            ).fetchone()
+            if (
+                row is None
+                or row["plan_sha256"] != candidate.plan_sha256
+                or row["plan_json"] != candidate.plan_json
+            ):
+                raise ValueError("Publication Plan changed before backup acknowledgement")
+            connection.execute(
+                """
+                INSERT INTO publication_plan_backups(
+                    plan_id, plan_sha256, backup_path, backed_up_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(plan_id) DO NOTHING
+                """,
+                (
+                    candidate.plan_id,
+                    candidate.plan_sha256,
+                    backup_path,
+                    now,
+                ),
+            )
+            saved = connection.execute(
+                """
+                SELECT plan_sha256, backup_path FROM publication_plan_backups
+                WHERE plan_id = ?
+                """,
+                (candidate.plan_id,),
+            ).fetchone()
+            assert saved is not None
+            if saved["plan_sha256"] != candidate.plan_sha256 or saved["backup_path"] != backup_path:
+                raise ValueError("Publication Plan backup receipt is immutable")
+
+    def purge_sensitive_payloads(
+        self,
+        cutoff: datetime,
+    ) -> SensitivePayloadPurgeResult:
+        """Purge expired content while preserving identities, states and audits."""
+
+        if cutoff.tzinfo is None:
+            raise ValueError("retention cutoff must be timezone-aware")
+        cutoff_at = cutoff.isoformat()
+        now = self._now().isoformat()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            plans = connection.execute(
+                """
+                UPDATE auto_fix_publication_plans
+                SET plan_json = NULL, payload_purged_at = ?, last_error = NULL
+                WHERE state IN ('published', 'abandoned')
+                  AND updated_at <= ? AND plan_json IS NOT NULL
+                  AND EXISTS (
+                      SELECT 1 FROM publication_plan_backups b
+                      WHERE b.plan_id = auto_fix_publication_plans.id
+                        AND b.plan_sha256 = auto_fix_publication_plans.plan_sha256
+                  )
+                """,
+                (now, cutoff_at),
+            ).rowcount
+            notes = connection.execute(
+                """
+                UPDATE note_publication_requests
+                SET body = marker, last_error = NULL, reconcile_next_at = NULL,
+                    reconcile_lease_until = NULL, reconcile_claim_token = NULL,
+                    payload_purged_at = ?
+                WHERE state IN ('published', 'superseded', 'blocked', 'removed')
+                  AND payload_retention_at IS NOT NULL
+                  AND payload_retention_at <= ? AND payload_purged_at IS NULL
+                  AND reconcile_claim_token IS NULL
+                """,
+                (now, cutoff_at),
+            ).rowcount
+            outbox = connection.execute(
+                """
+                UPDATE notification_outbox
+                SET title = '', body = '', url = NULL, recipients_json = '[]',
+                    last_error = NULL, payload_purged_at = ?
+                WHERE status IN ('delivered', 'failed') AND created_at <= ?
+                  AND payload_purged_at IS NULL AND claim_token IS NULL
+                """,
+                (now, cutoff_at),
+            ).rowcount
+            requests = connection.execute(
+                """
+                UPDATE notification_requests
+                SET title = '', body = '', url = NULL, recipients_json = '[]',
+                    payload_purged_at = ?
+                WHERE created_at <= ? AND payload_purged_at IS NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM notification_outbox o
+                      WHERE o.correlation_id = notification_requests.correlation_id
+                        AND o.status NOT IN ('delivered', 'failed')
+                  )
+                """,
+                (now, cutoff_at),
+            ).rowcount
+            diagnostics = 0
+            for query, parameters in (
+                (
+                    (
+                        "UPDATE review_runs SET error = NULL WHERE error IS NOT NULL "
+                        "AND status NOT IN ('pending', 'running') "
+                        "AND COALESCE(finished_at, created_at) <= ?"
+                    ),
+                    (cutoff_at,),
+                ),
+                (
+                    (
+                        "UPDATE review_run_failures SET error = NULL WHERE error IS NOT NULL "
+                        "AND recorded_at <= ?"
+                    ),
+                    (cutoff_at,),
+                ),
+                (
+                    (
+                        "UPDATE effect_receipts SET detail = NULL, error = NULL "
+                        "WHERE (detail IS NOT NULL OR error IS NOT NULL) AND updated_at <= ? "
+                        "AND state NOT IN ('pending', 'running', 'planned', 'plan_frozen', "
+                        "'needs_reconciliation', 'reconciling')"
+                    ),
+                    (cutoff_at,),
+                ),
+                (
+                    (
+                        "UPDATE auto_fix_publication_intents SET last_error = NULL "
+                        "WHERE last_error IS NOT NULL AND updated_at <= ? "
+                        "AND state IN ('published', 'abandoned', 'superseded')"
+                    ),
+                    (cutoff_at,),
+                ),
+                (
+                    (
+                        "UPDATE auto_fix_relations SET last_error = NULL "
+                        "WHERE last_error IS NOT NULL AND updated_at <= ? "
+                        "AND status IN ('closed', 'merged')"
+                    ),
+                    (cutoff_at,),
+                ),
+                (
+                    (
+                        "UPDATE worktree_cleanup SET last_error = NULL "
+                        "WHERE last_error IS NOT NULL AND status IN ('cleaned', 'failed') "
+                        "AND COALESCE(cleaned_at, created_at) <= ?"
+                    ),
+                    (cutoff_at,),
+                ),
+            ):
+                diagnostics += connection.execute(query, parameters).rowcount
+            connection.execute(
+                """
+                INSERT INTO sensitive_payload_purges(
+                    cutoff_at, plan_payloads, note_payloads,
+                    notification_payloads, diagnostic_payloads, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (cutoff_at, plans, notes, outbox + requests, diagnostics, now),
+            )
+            row = connection.execute(
+                """
+                SELECT id AS purge_id, cutoff_at, plan_payloads, note_payloads,
+                       notification_payloads, diagnostic_payloads, created_at
+                FROM sensitive_payload_purges WHERE id = last_insert_rowid()
+                """
+            ).fetchone()
+        assert row is not None
+        return SensitivePayloadPurgeResult(**dict(row))
+
+    def list_sensitive_payload_purges(self) -> tuple[SensitivePayloadPurgeResult, ...]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id AS purge_id, cutoff_at, plan_payloads, note_payloads,
+                       notification_payloads, diagnostic_payloads, created_at
+                FROM sensitive_payload_purges ORDER BY id
+                """
+            ).fetchall()
+        return tuple(SensitivePayloadPurgeResult(**dict(row)) for row in rows)
 
     def is_suppressed_parent_sha(self, project_id: str, mr_iid: int, sha: str) -> bool:
         with self._connect() as connection:
@@ -5132,9 +5394,7 @@ class SQLiteStore:
             query = "SELECT attempts FROM notification_outbox WHERE id = ? AND status = 'running'"
             parameters: tuple[object, ...] = (delivery_id,)
             if claim_token is not None:
-                query += (
-                    " AND claim_token = ? AND lease_until IS NOT NULL AND lease_until > ?"
-                )
+                query += " AND claim_token = ? AND lease_until IS NOT NULL AND lease_until > ?"
                 parameters += (claim_token, now_text)
             row = connection.execute(query, parameters).fetchone()
             if row is None:
@@ -5339,9 +5599,7 @@ class SQLiteStore:
             query = "SELECT attempts FROM worktree_cleanup WHERE id = ? AND status = 'running'"
             parameters: tuple[object, ...] = (cleanup_id,)
             if claim_token is not None:
-                query += (
-                    " AND claim_token = ? AND lease_until IS NOT NULL AND lease_until > ?"
-                )
+                query += " AND claim_token = ? AND lease_until IS NOT NULL AND lease_until > ?"
                 parameters += (claim_token, now_text)
             row = connection.execute(query, parameters).fetchone()
             if row is None:
@@ -5363,9 +5621,7 @@ class SQLiteStore:
                     self._now() + timedelta(seconds=retry_delay_seconds * (2 ** (attempts - 1)))
                 ).isoformat()
                 cleaned_at = None
-                last_error = (
-                    self._redact(detail) if detail else "worktree cleanup failed; retrying"
-                )
+                last_error = self._redact(detail) if detail else "worktree cleanup failed; retrying"
             query = (
                 "UPDATE worktree_cleanup SET status = ?, next_attempt_at = ?, "
                 "lease_until = NULL, claim_token = NULL, cleaned_at = ?, last_error = ? "

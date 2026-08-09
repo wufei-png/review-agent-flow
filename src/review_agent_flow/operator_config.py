@@ -14,7 +14,8 @@ import yaml
 
 from .policy import AIPolicy
 
-OPERATOR_CONFIG_VERSION = 2
+OPERATOR_CONFIG_VERSION = 3
+MAX_BACKEND_TIMEOUT_SECONDS = 1800
 _ENVIRONMENT_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _FORBIDDEN_AGENT_ENVIRONMENT = {
     "GITLAB_TOKEN",
@@ -92,6 +93,12 @@ class NotificationChannelConfig:
 
 
 @dataclass(frozen=True)
+class RetentionConfig:
+    sensitive_payload_days: int = 30
+    publication_plan_backup_dir: Path | None = None
+
+
+@dataclass(frozen=True)
 class ResolvedNotificationChannel:
     channel_id: str
     channel_type: str
@@ -105,6 +112,7 @@ class OperatorConfig:
     backends: Mapping[str, AgentBackend]
     autofix_publication: AutoFixPublicationConfig
     notification_channels: Mapping[str, NotificationChannelConfig]
+    retention: RetentionConfig
 
 
 @dataclass(frozen=True)
@@ -180,7 +188,7 @@ def load_operator_config(path: str | Path) -> OperatorConfig:
     root = _mapping(loaded, "operator config")
     _reject_unknown(
         root,
-        {"version", "backends", "autofix_publication", "notifications"},
+        {"version", "backends", "autofix_publication", "notifications", "retention"},
         "operator config",
     )
     version = root.get("version")
@@ -211,8 +219,11 @@ def load_operator_config(path: str | Path) -> OperatorConfig:
                 f"profiles.{profile_name}",
             )
             timeout = profile.get("timeout_seconds", 1800)
-            if type(timeout) is not int or timeout <= 0:
-                raise OperatorConfigError(f"profiles.{profile_name}.timeout_seconds must be positive")
+            if type(timeout) is not int or timeout <= 0 or timeout > MAX_BACKEND_TIMEOUT_SECONDS:
+                raise OperatorConfigError(
+                    f"profiles.{profile_name}.timeout_seconds must be between 1 and "
+                    f"{MAX_BACKEND_TIMEOUT_SECONDS}"
+                )
             environment_value = profile.get("environment", [])
             if not isinstance(environment_value, list):
                 raise OperatorConfigError(f"profiles.{profile_name}.environment must be a list")
@@ -224,7 +235,9 @@ def load_operator_config(path: str | Path) -> OperatorConfig:
             if verification_value is not None:
                 verification_map = _mapping(verification_value, "verification")
                 _reject_unknown(verification_map, {"command"}, "verification")
-                verification = VerificationProfile(_command(verification_map.get("command"), "verification.command"))
+                verification = VerificationProfile(
+                    _command(verification_map.get("command"), "verification.command")
+                )
             profiles[profile_name] = BackendProfile(timeout, environment, verification)
         if not profiles:
             raise OperatorConfigError(f"backends.{backend_name}.profiles cannot be empty")
@@ -254,9 +267,7 @@ def load_operator_config(path: str | Path) -> OperatorConfig:
         raise OperatorConfigError("ready/manual Auto-fix publication is not supported")
     notification_root = _mapping(root.get("notifications", {}), "notifications")
     _reject_unknown(notification_root, {"channels"}, "notifications")
-    notification_values = _mapping(
-        notification_root.get("channels", {}), "notifications.channels"
-    )
+    notification_values = _mapping(notification_root.get("channels", {}), "notifications.channels")
     notification_channels: dict[str, NotificationChannelConfig] = {}
     for channel_id, channel_value in notification_values.items():
         channel_id = _name(channel_id, "notification channel ID")
@@ -281,8 +292,9 @@ def load_operator_config(path: str | Path) -> OperatorConfig:
             f"notifications.channels.{channel_id}.user_ids",
         )
         user_ids = {
-            _name(username, f"notifications.channels.{channel_id}.user_ids key"):
-            _name(user_id, f"notifications.channels.{channel_id}.user_ids value")
+            _name(username, f"notifications.channels.{channel_id}.user_ids key"): _name(
+                user_id, f"notifications.channels.{channel_id}.user_ids value"
+            )
             for username, user_id in user_ids_value.items()
         }
         notification_channels[channel_id] = NotificationChannelConfig(
@@ -292,9 +304,7 @@ def load_operator_config(path: str | Path) -> OperatorConfig:
             MappingProxyType(user_ids),
         )
 
-    notification_credentials = {
-        channel.webhook_env for channel in notification_channels.values()
-    }
+    notification_credentials = {channel.webhook_env for channel in notification_channels.values()}
     for backend_name, backend in backends.items():
         for profile_name, profile in backend.profiles.items():
             exposed = sorted(set(profile.environment) & notification_credentials)
@@ -304,16 +314,40 @@ def load_operator_config(path: str | Path) -> OperatorConfig:
                     f"for {backend_name}/{profile_name}: {', '.join(exposed)}"
                 )
 
+    retention_value = _mapping(root.get("retention", {}), "retention")
+    _reject_unknown(
+        retention_value,
+        {"sensitive_payload_days", "publication_plan_backup_dir"},
+        "retention",
+    )
+    sensitive_payload_days = retention_value.get("sensitive_payload_days", 30)
+    if (
+        type(sensitive_payload_days) is not int
+        or sensitive_payload_days <= 0
+        or sensitive_payload_days > 3650
+    ):
+        raise OperatorConfigError("retention.sensitive_payload_days must be between 1 and 3650")
+    backup_value = retention_value.get("publication_plan_backup_dir")
+    backup_dir = None
+    if backup_value is not None:
+        backup_path = Path(_name(backup_value, "publication_plan_backup_dir"))
+        if not backup_path.is_absolute():
+            raise OperatorConfigError("retention.publication_plan_backup_dir must be absolute")
+        backup_dir = backup_path.resolve()
+
     return OperatorConfig(
         version,
         MappingProxyType(backends),
         AutoFixPublicationConfig(
             enabled,
-            _projects(publication.get("allowed_projects", []), "autofix_publication.allowed_projects"),
+            _projects(
+                publication.get("allowed_projects", []), "autofix_publication.allowed_projects"
+            ),
             readiness,
             ci_trigger,
         ),
         MappingProxyType(notification_channels),
+        RetentionConfig(sensitive_payload_days, backup_dir),
     )
 
 
@@ -387,8 +421,7 @@ def resolve_backend(
     exposed = sorted(set(profile.environment) & forbidden)
     if exposed:
         raise OperatorConfigError(
-            "Agent environment overlaps configured publication credentials: "
-            + ", ".join(exposed)
+            "Agent environment overlaps configured publication credentials: " + ", ".join(exposed)
         )
     source = os.environ if environ is None else environ
     allowed_values = {name: source[name] for name in profile.environment if name in source}

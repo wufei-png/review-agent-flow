@@ -6,10 +6,12 @@ import argparse
 import getpass
 import json
 import os
+import signal
 import socket
 import sys
 from dataclasses import asdict
 from pathlib import Path
+from threading import Event
 from uuid import uuid4
 
 from . import __version__
@@ -25,6 +27,7 @@ from .operator_config import (
 from .policy import ReviewPolicy, policy_from_json, policy_template
 from .policy_resolver import GitLabTargetBranchPolicyResolver
 from .repository import GitShaEnsurer
+from .retention import RetentionManager
 from .store import SQLiteStore
 from .worker import ReviewWorker
 from .worktree import GitWorktreeManager
@@ -73,6 +76,13 @@ def _run_worker(args: argparse.Namespace) -> int:
     except OperatorConfigError as exc:
         raise SystemExit(f"invalid Operator configuration: {exc}") from exc
     review_bot_username = _required(None, "GITLAB_REVIEW_BOT_USERNAME")
+    backup_dir = operator_config.retention.publication_plan_backup_dir
+    if backup_dir is not None and (
+        backup_dir == repository or repository in backup_dir.parents
+    ):
+        raise SystemExit(
+            "Publication Plan backup directory must be outside the reviewed repository"
+        )
     store = SQLiteStore(args.db or os.getenv("REVIEW_AGENT_FLOW_DB", "review-agent-flow.sqlite3"))
     gitlab = PythonGitLabClient(gitlab_url, gitlab_token, review_bot_username)
     allowed_timeouts = [
@@ -106,6 +116,7 @@ def _run_worker(args: argparse.Namespace) -> int:
         backend_resolver=lambda policy: resolve_backend(
             operator_config, policy.ai, project_id
         ),
+        retention_manager=RetentionManager(store, operator_config.retention),
     )
     if args.once:
         result = worker.process_one()
@@ -113,12 +124,40 @@ def _run_worker(args: argparse.Namespace) -> int:
             result = worker.reconcile_auto_fixes(limit=1)
         worker.process_worktree_cleanup(limit=1)
         worker.notification_dispatcher.process_channel_batch()
+        worker.process_retention()
         if result is None:
             print(json.dumps({"status": "idle"}))
             return 0
         print(json.dumps(asdict(result), default=str))
         return 0 if result.status in {"succeeded", "deferred"} else 1
-    worker.run_forever(args.poll_interval)
+    stop_event = Event()
+
+    def request_shutdown(_signum: int, _frame: object) -> None:
+        stop_event.set()
+
+    previous_handlers = {
+        signum: signal.signal(signum, request_shutdown)
+        for signum in (signal.SIGTERM, signal.SIGINT)
+    }
+    try:
+        worker.run_forever(args.poll_interval, stop_event=stop_event)
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+    return 0
+
+
+def _run_api(args: argparse.Namespace) -> int:
+    import uvicorn
+
+    uvicorn.run(
+        "review_agent_flow.web:create_app",
+        factory=True,
+        host=args.host,
+        port=args.port,
+        log_level=args.log_level,
+        proxy_headers=False,
+    )
     return 0
 
 
@@ -299,6 +338,14 @@ def main(argv: list[str] | None = None) -> int:
     worker.add_argument("--fetch-timeout", type=int, default=60)
     worker.add_argument("--poll-interval", type=float, default=5.0)
     worker.add_argument("--once", action="store_true")
+    api = subparsers.add_parser("api", help="run the webhook/status API process")
+    api.add_argument("--host", default="127.0.0.1")
+    api.add_argument("--port", type=int, default=8000)
+    api.add_argument(
+        "--log-level",
+        choices=("critical", "error", "warning", "info", "debug", "trace"),
+        default="info",
+    )
     status = subparsers.add_parser("status", help="query one project-bound Review Run")
     status.add_argument("--run-id", type=int, required=True)
     status.add_argument("--project-id")
@@ -345,6 +392,8 @@ def main(argv: list[str] | None = None) -> int:
         return _init_policy(Path(args.path), args.force)
     if args.command == "worker":
         return _run_worker(args)
+    if args.command == "api":
+        return _run_api(args)
     if args.command == "status":
         return _run_status(args)
     if args.command == "recover-autofix-relation":

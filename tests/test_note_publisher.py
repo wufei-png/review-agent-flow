@@ -184,6 +184,12 @@ def test_published_note_reconciliation_claim_is_token_fenced(tmp_path: Path) -> 
     gitlab = NoteGitLab()
     publisher = NotePublisher(store, gitlab, "42", reconciliation_interval_seconds=0)
     assert publisher.process(request_id=request.request_id)[0].status == "published"
+    with store._connect() as connection:
+        retention_at = connection.execute(
+            "SELECT payload_retention_at FROM note_publication_requests WHERE id = ?",
+            (request.request_id,),
+        ).fetchone()[0]
+    assert retention_at is not None
 
     claimed = store.claim_published_note_reconciliation(request_id=request.request_id)
     assert claimed is not None
@@ -200,6 +206,12 @@ def test_published_note_reconciliation_claim_is_token_fenced(tmp_path: Path) -> 
         state="published",
         detail="still present",
     )
+    with store._connect() as connection:
+        reconciled_retention_at = connection.execute(
+            "SELECT payload_retention_at FROM note_publication_requests WHERE id = ?",
+            (request.request_id,),
+        ).fetchone()[0]
+    assert reconciled_retention_at == retention_at
 
 
 def test_note_publisher_adopts_exact_existing_note_after_uncertain_create(

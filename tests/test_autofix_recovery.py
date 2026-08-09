@@ -1,6 +1,7 @@
 import hashlib
 import sqlite3
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -34,9 +35,7 @@ def _plan() -> tuple[str, str, str, str, tuple[dict[str, object], ...]]:
             "execute_filemode": False,
         },
     )
-    candidate = canonical_json(
-        {"version": 1, "base_sha": PARENT_SHA, "actions": list(actions)}
-    )
+    candidate = canonical_json({"version": 1, "base_sha": PARENT_SHA, "actions": list(actions)})
     candidate_sha256 = hashlib.sha256(candidate.encode()).hexdigest()
     branch = f"autofix/MR-1/sha-{PARENT_SHA}/intent-{NONCE}"
     marker_template = (
@@ -278,6 +277,45 @@ def test_notification_resend_is_separate_immutable_generation_and_idempotent(
     ]
 
 
+def test_notification_resend_replay_identity_survives_payload_purge(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteStore(tmp_path / "review.db")
+    gitlab = FakeRecoveryGitLab()
+    _recover(store, gitlab)
+    service = AutoFixRecoveryService(store, gitlab, "review-bot")
+    context = _context("resend-after-purge")
+    original = service.resend_notification(
+        context=context,
+        project_id="42",
+        child_mr_iid=9,
+        channels=(("alerts", "feishu"),),
+    )
+    with store._connect() as connection:
+        connection.execute(
+            "UPDATE notification_outbox SET status = 'delivered', delivered_at = ?",
+            ("2026-08-10T00:00:00+00:00",),
+        )
+    store.purge_sensitive_payloads(datetime(2030, 1, 1, tzinfo=UTC))
+
+    repeated = service.resend_notification(
+        context=context,
+        project_id="42",
+        child_mr_iid=9,
+        channels=(("alerts", "feishu"),),
+    )
+    assert repeated == original
+
+    gitlab.child = replace(gitlab.child, title="changed presentation")
+    with pytest.raises(ValueError, match="immutable"):
+        service.resend_notification(
+            context=context,
+            project_id="42",
+            child_mr_iid=9,
+            channels=(("alerts", "feishu"),),
+        )
+
+
 def test_recovery_id_cannot_be_rebound_to_different_operator_context(tmp_path: Path) -> None:
     store = SQLiteStore(tmp_path / "review.db")
     gitlab = FakeRecoveryGitLab()
@@ -286,9 +324,7 @@ def test_recovery_id_cannot_be_rebound_to_different_operator_context(tmp_path: P
 
     with pytest.raises(ValueError, match="already bound"):
         AutoFixRecoveryService(store, gitlab, "review-bot").recover_relation(
-            context=OperatorContext(
-                "recover-1", "different reason", "operator", "host", "0.1.0"
-            ),
+            context=OperatorContext("recover-1", "different reason", "operator", "host", "0.1.0"),
             project_id="42",
             parent_mr_iid=1,
             parent_sha=PARENT_SHA,

@@ -54,7 +54,7 @@ Unknown fields, malformed known fields and Policy v1-v3 fail loading. The Worker
 `REVIEW_AGENT_FLOW_OPERATOR_CONFIG` must name a readable file outside the reviewed repository. The service loads and validates it strictly at startup; changing the file does not hot-reload a running process.
 
 ```yaml
-version: 2
+version: 3
 
 backends:
   local-agent:
@@ -81,9 +81,13 @@ notifications:
       allowed_projects: ["42"]
       user_ids:
         gitlab-username: ou_provider_user_id
+
+retention:
+  sensitive_payload_days: 30
+  publication_plan_backup_dir: /var/lib/review-agent-flow-worker/plan-backups
 ```
 
-The Operator file is trusted deployment input. The selected backend/profile and every requested notification channel must exist and allow the bound Project. Provider type, webhook environment name and user-ID mapping are Operator-owned and never read from Project Policy. Environment entries are an allowlist copied from the Worker environment; ReviewFlow additionally supplies the Worker-owned `PATH` (or the platform default) so bare Operator commands and their shebang interpreters resolve without inheriting the rest of the Worker environment. `PATH` is not treated as a secret. ReviewFlow does not inject GitLab publication credentials into the Agent. Auto-fix is allowed only when both Project Policy and Operator configuration enable it for that Project.
+The Operator file is trusted deployment input. Version 3 adds Operator-owned retention with a 30-day default and an optional absolute Publication Plan backup directory. Backend and verification timeouts are each bounded to 1–1800 seconds so the reference supervisor can enforce a finite graceful-stop envelope. The selected backend/profile and every requested notification channel must exist and allow the bound Project. Provider type, webhook environment name and user-ID mapping are Operator-owned and never read from Project Policy. Environment entries are an allowlist copied from the Worker environment; ReviewFlow additionally supplies the Worker-owned `PATH` (or the platform default) so bare Operator commands and their shebang interpreters resolve without inheriting the rest of the Worker environment. `PATH` is not treated as a secret. ReviewFlow does not inject GitLab publication credentials into the Agent. Auto-fix is allowed only when both Project Policy and Operator configuration enable it for that Project.
 
 `initial_readiness` is `draft` or `ready`. `ci_trigger` is `manual` or `automatic`. The supported combinations are `draft/manual`, `draft/automatic` and `ready/automatic`; `ready/manual` is rejected because a ready MR must not silently skip CI. Manual CI adds `[skip ci]` to the Program-owned commit. These values describe creation only and are frozen into the immutable Publication Plan; later user Draft/Ready changes do not invalidate a Relation.
 

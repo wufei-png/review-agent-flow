@@ -37,6 +37,9 @@ def test_worker_configures_target_branch_policy_resolver(monkeypatch, tmp_path: 
         def process_worktree_cleanup(self, limit):
             return 0
 
+        def process_retention(self):
+            return None
+
         def run_forever(self, poll_interval):
             raise AssertionError("test must use --once")
 
@@ -59,6 +62,10 @@ def test_worker_configures_target_branch_policy_resolver(monkeypatch, tmp_path: 
             autofix_publication=SimpleNamespace(enabled=False, allowed_projects=frozenset()),
             notification_channels={},
             backends={},
+            retention=SimpleNamespace(
+                publication_plan_backup_dir=None,
+                sensitive_payload_days=30,
+            ),
         ),
     )
     monkeypatch.setattr(cli, "resolve_backend", lambda *args, **kwargs: None)
@@ -101,6 +108,9 @@ def test_worker_once_emits_json_run_status(monkeypatch, tmp_path: Path, capsys) 
         def process_worktree_cleanup(self, limit):
             return 0
 
+        def process_retention(self):
+            return None
+
         def run_forever(self, poll_interval):
             raise AssertionError("test must use --once")
 
@@ -119,6 +129,10 @@ def test_worker_once_emits_json_run_status(monkeypatch, tmp_path: Path, capsys) 
             autofix_publication=SimpleNamespace(enabled=False, allowed_projects=frozenset()),
             notification_channels={},
             backends={},
+            retention=SimpleNamespace(
+                publication_plan_backup_dir=None,
+                sensitive_payload_days=30,
+            ),
         ),
     )
     monkeypatch.setattr(cli, "resolve_backend", lambda *args, **kwargs: None)
@@ -280,3 +294,18 @@ def test_cli_routes_operator_plan_transitions(monkeypatch) -> None:
         (7, "evidence checked", "rearm"),
         (8, "pilot cancelled", "abandon"),
     ]
+
+
+def test_cli_routes_api_process(monkeypatch) -> None:
+    captured = {}
+
+    def run(args):
+        captured.update(host=args.host, port=args.port, log_level=args.log_level)
+        return 6
+
+    monkeypatch.setattr(cli, "_run_api", run)
+
+    assert cli.main(
+        ["api", "--host", "127.0.0.2", "--port", "9000", "--log-level", "warning"]
+    ) == 6
+    assert captured == {"host": "127.0.0.2", "port": 9000, "log_level": "warning"}

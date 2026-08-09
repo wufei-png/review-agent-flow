@@ -28,7 +28,8 @@ GitLab Note、Auto-fix MR 和通知。
 - Store 丢失后只能由本地 Operator CLI 显式、完整校验并审计地恢复。
 - Run Lifecycle 与 Review Outcome 分离；进程成功不代表用户已看到结果。
 - v0.1 使用一个受 supervisor 管理的 Worker OS 进程，内含独立
-  Review/Publication、Notification 和 Reconciliation/Cleanup 循环。
+  Review/Publication、Notification、Reconciliation/Cleanup 和 Retention
+  循环；Webhook API 是独立 OS 进程。
 
 完整规格见 [docs/spec/README.md](docs/spec/README.md)，领域语言见
 [CONTEXT.md](CONTEXT.md)，当前代码与目标的差距见
@@ -50,6 +51,9 @@ ruff check .
 兼容契约；项目尚在无生产数据的
 开发阶段，schema 变化时直接重建数据库，请以当前测试和
 implementation-status 为准。
+
+Linux + systemd 的 API/Worker 分进程、最小凭据、优雅停机和 30 天默认保留
+参考部署见 [docs/deployment-linux-systemd.md](docs/deployment-linux-systemd.md)。
 
 Store 丢失后的 Auto-fix Relation 只能通过显式 Operator 命令恢复。命令还需
 提供发布前保存的规范 Publication Plan JSON，以便重新核对远端 commit 的父
