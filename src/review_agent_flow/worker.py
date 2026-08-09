@@ -7,17 +7,22 @@ import os
 import tempfile
 import time
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event, Thread
 
 from .auto_fix_reconciler import AutoFixReconciler
+from .autofix_planner import (
+    DiffEnvelopeError,
+    build_publication_plan_payload,
+    capture_diff_envelope,
+    run_verifier,
+)
 from .failures import FailureInfo, classify_exception
 from .gitlab import GitLabClient, canonical_note_marker, is_valid_sha
 from .note_publisher import NotePublisher
 from .notification_dispatcher import NotificationDispatcher
 from .notifications import FanoutNotifier, NotificationEvent
-from .operator_config import ResolvedBackend
+from .operator_config import AutoFixPublicationConfig, ResolvedBackend
 from .policy import ReviewPolicy
 from .repository import GitShaEnsurer
 from .runner import (
@@ -35,10 +40,10 @@ from .store import (
     DEFAULT_NOTIFICATION_MAX_ATTEMPTS,
     DEFAULT_WORKTREE_CLEANUP_LEASE_SECONDS,
     DEFAULT_WORKTREE_CLEANUP_MAX_ATTEMPTS,
+    AutoFixPublicationIntent,
     EffectReceipt,
     ReviewRun,
     SQLiteStore,
-    auto_fix_intent_marker,
 )
 from .structured_logging import log_event
 from .worktree import GitWorktreeManager, WorktreeError
@@ -82,6 +87,7 @@ class ReviewWorker:
         max_retry_delay_seconds: float = 300.0,
         reconciliation_max_attempts: int = DEFAULT_RECONCILIATION_MAX_ATTEMPTS,
         agent_backend: ResolvedBackend | None = None,
+        autofix_publication: AutoFixPublicationConfig | None = None,
     ) -> None:
         configured_project_id = (
             project_id if project_id is not None else os.getenv("REVIEW_AGENT_FLOW_PROJECT_ID")
@@ -126,6 +132,16 @@ class ReviewWorker:
         self.max_retry_delay_seconds = max_retry_delay_seconds
         self.reconciliation_max_attempts = reconciliation_max_attempts
         self.project_id = configured_project_id.strip()
+        self.autofix_publication = autofix_publication or AutoFixPublicationConfig()
+        self.auto_fix_enabled = bool(
+            policy.ai.auto_fix
+            and self.autofix_publication.enabled
+            and self.project_id in self.autofix_publication.allowed_projects
+        )
+        if policy.ai.auto_fix and not self.auto_fix_enabled:
+            raise ValueError(
+                "Auto-fix requires Operator-owned publication authorization for this Project"
+            )
         self.note_publisher = NotePublisher(
             store,
             gitlab,
@@ -268,8 +284,7 @@ class ReviewWorker:
         agent_finished = False
         note_request_id: int | None = None
 
-        auto_fix_intent = None
-        agent_started = False
+        auto_fix_intent: AutoFixPublicationIntent | None = None
         try:
             if run.project_id != self.project_id:
                 raise ValueError("Review Run belongs to a different configured Project")
@@ -370,16 +385,14 @@ class ReviewWorker:
                 return WorkerResult(run.run_id, "succeeded", detail="human path only")
 
             self.sha_ensurer.ensure_sha(run.sha)
-            if self.policy.ai.auto_fix:
-                auto_fix_intent = self.store.create_auto_fix_intent(
-                    parent_project_id=run.project_id,
-                    parent_mr_iid=run.mr_iid,
-                    parent_sha=run.sha,
-                    run_id=run.run_id,
-                    source_branch=f"autofix/MR-{merge_request.iid}/run-{run.run_id}",
-                    target_branch=merge_request.source_branch,
-                    title=f"[ReviewFlow Auto-Fix] {merge_request.title}",
+            if self.auto_fix_enabled:
+                auto_fix_intent = self.store.create_auto_fix_publication_intent(
+                    run.run_id, run.claim_token
                 )
+                if auto_fix_intent is None:
+                    raise LeaseLostError(
+                        "Review Run lease was lost before creating the Auto-fix Intent"
+                    )
 
             worktree_id = str(run.run_id) if run.attempts <= 1 else f"{run.run_id}-attempt-{run.attempts}"
             worktree = self.worktrees.path_for(worktree_id)
@@ -387,8 +400,6 @@ class ReviewWorker:
                 raise WorktreeError(f"worktree path already exists: {worktree}")
             cleanup_record = self.store.register_worktree(run.run_id, worktree, run.sha)
             detail = ""
-            auto_fix_created = False
-            reconcile_after_agent = False
             worktree_created = False
             completed_result: WorkerResult | None = None
             try:
@@ -398,65 +409,14 @@ class ReviewWorker:
                     self.store.mark_worktree_not_created(cleanup_record.cleanup_id, str(exc))
                     raise
                 worktree_created = True
-                receipts = self._prepare_agent_effects(run, merge_request)
-                if self.policy.ai.auto_fix:
-                    branch = f"autofix/MR-{merge_request.iid}/run-{run.run_id}"
-                    try:
-                        existing_auto_fix = self.gitlab.find_merge_request_by_source_branch(
-                            run.project_id,
-                            branch,
-                            merge_request.source_branch,
-                            auto_fix_intent_marker(run.run_id, run.sha),
-                        )
-                    except Exception as exc:  # noqa: BLE001 - reconciliation is retryable
-                        failure = FailureInfo(
-                            failure_class="gitlab_reconciliation",
-                            retryable=True,
-                            detail=self._redact(exc),
-                        )
-                        self._cleanup_agent_effects(run, receipts, failure.detail)
-                        requeued = self._retry_or_fail(run, failure)
-                        return WorkerResult(
-                            run.run_id,
-                            "deferred" if requeued else "failed",
-                            detail=failure.detail,
-                        )
-                    if existing_auto_fix is not None:
-                        identity_error = self.auto_fix_reconciler.validate_identity(
-                            run,
-                            merge_request,
-                            existing_auto_fix,
-                            parent_mr_iid=run.mr_iid,
-                            expected_branch=branch,
-                        )
-                        if identity_error is not None:
-                            self._update_run_effect_receipt(
-                                run,
-                                receipts["autofix_reconciliation"],
-                                state="failed",
-                                detail="Auto-fix identity validation failed",
-                                error=identity_error,
-                            )
-                            return self._reject_autofix_run(run, identity_error)
-                        self.auto_fix_reconciler.record_observed(
-                            run,
-                            existing_auto_fix,
-                            receipts["autofix_reconciliation"],
-                            run_claim_token=run.claim_token,
-                        )
-                        auto_fix_created = True
-
-                if self.policy.ai.auto_fix and not auto_fix_created:
-                    if callable(getattr(self.gitlab, "has_note_marker", None)):
-                        reconcile_after_agent = True
-                    else:
-                        self.auto_fix_reconciler.schedule(
-                            receipts["autofix_reconciliation"],
-                            "Auto-fix MR was not observed yet",
-                            run=run,
-                        )
-                agent_started = True
-                result = self._run_agent(run, worktree)
+                receipts = self._prepare_agent_effects(run, auto_fix_intent)
+                if (
+                    auto_fix_intent is not None
+                    and merge_request.source_project_id != run.project_id
+                ):
+                    result = self._run_agent(run, worktree, auto_fix_enabled=False)
+                else:
+                    result = self._run_agent(run, worktree)
                 agent_finished = True
                 agent_receipt = receipts["agent_execution"]
                 if result.timed_out:
@@ -534,41 +494,17 @@ class ReviewWorker:
                         "Review Run lease was lost before freezing the Note publication request"
                     )
                 note_request_id = note_request.request_id
-                identity_error = (
-                    self.auto_fix_reconciler.record_if_created(run, merge_request, receipts)
-                    if reconcile_after_agent
-                    else None
-                )
-                if identity_error is not None:
-                    if not self._finish_terminal(
-                        run, "failed", identity_error, "autofix_identity"
-                    ):
-                        return self._lease_recovery_result(
-                            run, "Review Run lease lost before Auto-fix identity failure completion"
-                        )
-                    return WorkerResult(run.run_id, "failed", result, identity_error)
-                if self.policy.ai.auto_fix:
-                    auto_fix_created = self.store.resolve_auto_fix_match(
-                        run.project_id,
-                        run.mr_iid,
-                        merge_request.source_branch,
-                        merge_request.target_branch,
-                        merge_request.description,
-                    ) is not None
-                reconciliation_pending = any(
-                    receipt.state in {"planned", "pending", "running"}
-                    for receipt in self.store.list_effect_receipts(
-                        run.run_id, "autofix_reconciliation"
+                if auto_fix_intent is not None:
+                    self._freeze_auto_fix_plan(
+                        run,
+                        merge_request,
+                        worktree,
+                        result,
+                        auto_fix_intent,
+                        receipts["autofix_plan"],
                     )
-                )
                 if not self.store.finish(run.run_id, "succeeded", claim_token=run.claim_token):
                     raise LeaseLostError("Review Run lease lost before Agent result completion")
-                if (
-                    auto_fix_intent is not None
-                    and not auto_fix_created
-                    and not reconciliation_pending
-                ):
-                    self.store.abandon_auto_fix_intent(run.run_id)
                 self._log_run(run, status="succeeded", diagnostic="Agent process exited successfully")
                 completed_result = WorkerResult(run.run_id, "succeeded", result)
             finally:
@@ -667,10 +603,6 @@ class ReviewWorker:
             failure = classify_exception(exc, secrets=self._redaction_secrets())
             if failure.retryable:
                 requeued = self._retry_or_fail(run, failure)
-                if not requeued and auto_fix_intent is not None and not agent_started:
-                    current = self.store.get_review_run(run.run_id)
-                    if current is not None and current.status in {"failed", "cancelled"}:
-                        self.store.abandon_auto_fix_intent(run.run_id)
                 return WorkerResult(
                     run.run_id,
                     "deferred" if requeued else "failed",
@@ -678,8 +610,6 @@ class ReviewWorker:
                 )
             if not self._finish_terminal(run, "failed", failure.detail, failure.failure_class):
                 return self._lease_recovery_result(run, failure.detail)
-            if auto_fix_intent is not None and not agent_started:
-                self.store.abandon_auto_fix_intent(run.run_id)
             return WorkerResult(run.run_id, "failed", detail=failure.detail)
 
     def _finish_terminal(
@@ -733,8 +663,125 @@ class ReviewWorker:
         base = max(0.0, self.retry_delay_seconds)
         return min(base * (2 ** max(attempt - 1, 0)), self.max_retry_delay_seconds)
 
+    def _resolve_auto_fix_plan(
+        self,
+        run: ReviewRun,
+        receipt: EffectReceipt,
+        state: str,
+        detail: str,
+        *,
+        error: str | None = None,
+    ) -> None:
+        if not self.store.resolve_auto_fix_publication_intent(
+            run.run_id,
+            receipt.receipt_id,
+            state,
+            detail,
+            run.claim_token,
+            error=error,
+        ):
+            raise LeaseLostError(
+                "Review Run lease was lost before resolving the Auto-fix Intent"
+            )
+
+    def _freeze_auto_fix_plan(
+        self,
+        run: ReviewRun,
+        merge_request,
+        worktree: Path,
+        result: AgentResult,
+        intent: AutoFixPublicationIntent,
+        receipt: EffectReceipt,
+    ) -> None:
+        assert result.output is not None
+        proposal = result.output.autofix_proposal
+        if merge_request.source_project_id != run.project_id:
+            self._resolve_auto_fix_plan(
+                run,
+                receipt,
+                "blocked",
+                "Auto-fix is unsupported for a fork-source Merge Request",
+                error="parent Merge Request source Project differs from the bound Project",
+            )
+            return
+        try:
+            before = capture_diff_envelope(worktree, run.sha)
+            if proposal is None:
+                if before.actions:
+                    raise DiffEnvelopeError(
+                        "Agent changed the workspace without declaring an Auto-fix proposal"
+                    )
+                self._resolve_auto_fix_plan(
+                    run,
+                    receipt,
+                    "no_proposal",
+                    "Agent returned no Auto-fix proposal and left no workspace diff",
+                )
+                return
+            if not before.actions:
+                raise DiffEnvelopeError(
+                    "Agent declared an Auto-fix proposal without a workspace diff"
+                )
+            verification = self.agent_backend.verification if self.agent_backend else None
+            if verification is None:
+                raise DiffEnvelopeError(
+                    "Auto-fix publication requires an Operator-owned verifier"
+                )
+            evidence = run_verifier(
+                verification.command,
+                worktree,
+                self.agent_backend.environment,
+                before.candidate_sha256,
+                timeout_seconds=self.agent_timeout_seconds,
+                heartbeat=lambda: self._heartbeat(run),
+                heartbeat_interval_seconds=max(
+                    0.1, min(30.0, self.lease_seconds / 3)
+                ),
+            )
+            after = capture_diff_envelope(worktree, run.sha)
+            if after != before:
+                raise DiffEnvelopeError(
+                    "Operator verifier mutated the Auto-fix candidate"
+                )
+        except DiffEnvelopeError as exc:
+            self._resolve_auto_fix_plan(
+                run,
+                receipt,
+                "blocked",
+                "Auto-fix proposal was blocked before publication planning",
+                error=str(exc),
+            )
+            return
+
+        payload = build_publication_plan_payload(
+            project_id=run.project_id,
+            mr_iid=run.mr_iid,
+            sha=run.sha,
+            generation=intent.generation,
+            nonce=intent.nonce,
+            proposal_summary=proposal.summary,
+            envelope=after,
+            verification=evidence,
+            target_branch=merge_request.source_branch,
+            parent_title=merge_request.title,
+            initial_readiness=self.autofix_publication.initial_readiness,
+            ci_trigger=self.autofix_publication.ci_trigger,
+        )
+        plan = self.store.freeze_auto_fix_publication_plan(
+            run.run_id,
+            receipt.receipt_id,
+            payload,
+            run.claim_token,
+        )
+        if plan is None:
+            raise LeaseLostError(
+                "Review Run lease was lost before freezing the Auto-fix Publication Plan"
+            )
+
     def _prepare_agent_effects(
-        self, run: ReviewRun, merge_request
+        self,
+        run: ReviewRun,
+        auto_fix_intent: AutoFixPublicationIntent | None,
     ) -> dict[str, EffectReceipt]:
         attempt = max(run.attempts, 1)
         receipts: dict[str, EffectReceipt] = {}
@@ -755,26 +802,14 @@ class ReviewWorker:
                 state="planned",
                 detail="Program-owned GitLab Note awaits a valid Agent result",
             )
-            if self.policy.ai.auto_fix:
-                branch = f"autofix/MR-{merge_request.iid}/run-{run.run_id}"
-                receipts["autofix_expected"] = self.store.create_effect_receipt(
+            if auto_fix_intent is not None:
+                receipts["autofix_plan"] = self.store.create_effect_receipt(
                     run.run_id,
-                    "autofix_expected",
-                    branch,
+                    "autofix_plan",
+                    f"autofix-intent:{auto_fix_intent.nonce}",
                     attempt=attempt,
                     state="planned",
-                    detail="Agent-owned Auto-fix MR; reconciliation observes the platform state",
-                )
-                receipts["autofix_reconciliation"] = self.store.create_effect_receipt(
-                    run.run_id,
-                    "autofix_reconciliation",
-                    branch,
-                    attempt=1,
-                    state="pending",
-                    detail=(
-                        "Reconcile Agent-owned Auto-fix MR across opened, closed and merged states"
-                    ),
-                    next_attempt_at=datetime.now(UTC).isoformat(),
+                    detail="Program-owned Auto-fix Intent awaits a verified workspace diff",
                 )
         except Exception as exc:
             if receipts:
@@ -787,8 +822,6 @@ class ReviewWorker:
     ) -> None:
         safe_error = self._redact(error)
         for kind, receipt in receipts.items():
-            if kind == "autofix_reconciliation":
-                continue
             self.store.update_effect_receipt(
                 receipt.receipt_id,
                 state="failed" if kind == "agent_execution" else "not_observed",
@@ -806,7 +839,7 @@ class ReviewWorker:
         self, run: ReviewRun, receipts: dict[str, EffectReceipt], error: str
     ) -> None:
         for kind, receipt in receipts.items():
-            if kind in {"agent_execution", "autofix_reconciliation"}:
+            if kind in {"agent_execution", "autofix_plan"}:
                 continue
             self._update_run_effect_receipt(
                 run,
@@ -894,6 +927,8 @@ class ReviewWorker:
         self,
         run: ReviewRun,
         worktree: Path,
+        *,
+        auto_fix_enabled: bool | None = None,
     ) -> AgentResult:
         if self.agent_backend is None:
             raise ValueError("AI Review has no Operator-authorized Agent Backend/Profile")
@@ -920,7 +955,11 @@ class ReviewWorker:
                     worktree=worktree,
                     result_path=Path(directory) / "result.json",
                     skill_path=skill_path,
-                    auto_fix_enabled=self.policy.ai.auto_fix,
+                    auto_fix_enabled=(
+                        self.auto_fix_enabled
+                        if auto_fix_enabled is None
+                        else auto_fix_enabled
+                    ),
                 ),
                 heartbeat=lambda: self._heartbeat(run),
                 heartbeat_interval_seconds=max(

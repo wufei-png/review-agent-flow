@@ -4,7 +4,7 @@
 
 The normative specifications and ADRs describe the accepted Program-owned publication target. Migration is in progress, and the implementation must not be described as target-complete until every acceptance criterion below is implemented and verified.
 
-Policy v3, kind-free ReviewKey storage, strict external Operator Backend/Profile authorization, minimal Agent environment, RESULT_PATH v1 parsing and durable Program-owned Note publication are implemented. The current code still contains the old Agent-owned Auto-fix MR preparation path and a reconciler that searches for Agent-created MRs. Those remaining paths are intentionally replaced in later implementation stages. There is no migration or compatibility requirement for old database rows, policies or markers.
+Policy v3, kind-free ReviewKey storage, strict external Operator Backend/Profile authorization, minimal Agent environment, RESULT_PATH v1 parsing, durable Program-owned Note publication, immutable Auto-fix Intent creation, bounded Diff Envelope capture, Operator verification and Publication Plan freeze are implemented. The active Review Worker no longer searches for an Agent-created Auto-fix MR. Legacy reconciliation/storage scaffolding remains temporarily for the later Publisher/recovery cutover and is not part of the normal Auto-fix path. There is no migration or compatibility requirement for old database rows, policies or markers.
 
 Implemented foundations that remain useful include exact-SHA worktrees, bound-Project webhook validation, SQLite claims/leases, notification outbox primitives, GitLab event normalization, Pipeline Gate, provider protocols and Feishu/WeCom adapters. Their contracts may still change while adopting the target model.
 

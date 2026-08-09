@@ -2,6 +2,7 @@ import sqlite3
 
 import pytest
 
+from review_agent_flow.autofix_planner import canonical_json
 from review_agent_flow.store import SQLiteStore, auto_fix_intent_marker
 
 SHA = "a" * 40
@@ -394,6 +395,86 @@ def test_auto_fix_intent_attaches_child_before_worker_reconciliation(tmp_path) -
     assert match is not None
     assert match.parent_mr_iid == 1
     assert match.auto_fix_mr_iid == 9
+
+
+def test_program_auto_fix_intent_is_immutable_and_lease_fenced(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "review.db")
+    run = store.enqueue("42", 1, SHA)
+    assert store.create_auto_fix_publication_intent(run.run_id, None) is None
+    claimed = store.claim_next(project_id="42")
+    assert claimed is not None
+
+    first = store.create_auto_fix_publication_intent(
+        claimed.run_id, claimed.claim_token
+    )
+    second = store.create_auto_fix_publication_intent(
+        claimed.run_id, claimed.claim_token
+    )
+
+    assert first is not None
+    assert second == first
+    assert first.generation == 1
+    assert len(first.nonce) == 32
+    assert first.state == "pending"
+
+
+def test_program_auto_fix_plan_freezes_canonical_inputs_and_marker(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "review.db")
+    store.enqueue("42", 1, SHA)
+    claimed = store.claim_next(project_id="42")
+    assert claimed is not None
+    intent = store.create_auto_fix_publication_intent(
+        claimed.run_id, claimed.claim_token
+    )
+    assert intent is not None
+    receipt = store.create_effect_receipt(
+        claimed.run_id,
+        "autofix_plan",
+        f"autofix-intent:{intent.nonce}",
+        attempt=1,
+        state="planned",
+    )
+    payload = {
+        "version": 1,
+        "review_key": {"project_id": "42", "mr_iid": 1, "sha": SHA},
+        "intent": {"generation": 1, "nonce": intent.nonce},
+        "candidate_sha256": "c" * 64,
+        "verification": {
+            "candidate_sha256": "c" * 64,
+            "command_sha256": "d" * 64,
+        },
+        "marker_template": (
+            f"<!-- reviewflow:v1;project=42;mr=1;sha={SHA};effect=autofix;"
+            f"intent={intent.nonce};plan_sha256={{plan_sha256}} -->"
+        ),
+        "branch": f"autofix/MR-1/sha-{SHA}/intent-{intent.nonce}",
+    }
+
+    plan = store.freeze_auto_fix_publication_plan(
+        claimed.run_id, receipt.receipt_id, payload, claimed.claim_token
+    )
+
+    assert plan is not None
+    assert plan.plan_json == canonical_json(payload)
+    assert plan.marker.endswith(f"plan_sha256={plan.plan_sha256} -->")
+    assert store.get_auto_fix_publication_intent(claimed.run_id).state == "plan_frozen"
+    assert store.get_auto_fix_publication_plan(claimed.run_id) == plan
+    assert (
+        store.freeze_auto_fix_publication_plan(
+            claimed.run_id, receipt.receipt_id, payload, claimed.claim_token
+        )
+        == plan
+    )
+    changed = dict(payload)
+    changed["candidate_sha256"] = "e" * 64
+    changed["verification"] = {
+        "candidate_sha256": "e" * 64,
+        "command_sha256": "d" * 64,
+    }
+    with pytest.raises(ValueError, match="immutable"):
+        store.freeze_auto_fix_publication_plan(
+            claimed.run_id, receipt.receipt_id, changed, claimed.claim_token
+        )
 
 
 def test_auto_fix_intent_rejects_reused_run_id_without_current_marker(tmp_path) -> None:

@@ -89,6 +89,7 @@ def _run_worker(args: argparse.Namespace) -> int:
         lease_seconds=(agent_backend.timeout_seconds if agent_backend else 1800) + 60,
         retry_delay_seconds=args.poll_interval,
         agent_backend=agent_backend,
+        autofix_publication=operator_config.autofix_publication,
     )
     if args.once:
         result = worker.process_one()

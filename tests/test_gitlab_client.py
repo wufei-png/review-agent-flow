@@ -86,6 +86,32 @@ def _client(value: FakeNotes | SimpleNamespace, username: str | None = "review-b
     return client
 
 
+def test_merge_request_preserves_source_project_identity() -> None:
+    resource = SimpleNamespace(
+        title="Fork contribution",
+        author={"username": "alice"},
+        source_branch="feature",
+        target_branch="main",
+        source_project_id=99,
+        diff_refs={"head_sha": SHA},
+        web_url="https://mr",
+        draft=False,
+        work_in_progress=False,
+        description="",
+        state="opened",
+        merged_at=None,
+        merge_commit_sha=None,
+        merged_commit_sha=None,
+    )
+    project = SimpleNamespace(
+        mergerequests=SimpleNamespace(get=lambda _iid: resource)
+    )
+
+    merge_request = _client(project).get_merge_request("42", 1)
+
+    assert merge_request.source_project_id == "99"
+
+
 def test_note_marker_paginates_and_requires_review_bot_author() -> None:
     marker = canonical_note_marker("42", 1, SHA)
     notes = FakeNotes(

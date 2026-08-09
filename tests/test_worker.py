@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import subprocess
 import sys
@@ -15,7 +16,11 @@ from review_agent_flow.gitlab import (
     has_exact_note_marker,
 )
 from review_agent_flow.notifications import FanoutNotifier, NotificationEvent, NotificationResult
-from review_agent_flow.operator_config import ResolvedBackend
+from review_agent_flow.operator_config import (
+    AutoFixPublicationConfig,
+    ResolvedBackend,
+    VerificationProfile,
+)
 from review_agent_flow.policy import AIPolicy as ProjectAIPolicy
 from review_agent_flow.policy import HumanPolicy, ReviewPolicy
 from review_agent_flow.runner import AgentResult
@@ -55,7 +60,21 @@ def ReviewWorker(*args, **kwargs):
             )
             command = (command[0], command[1], result_prefix + command[2], *command[3:])
         kwargs["agent_backend"] = ResolvedBackend(
-            "test-agent", "default", command, 1800, {}, None
+            "test-agent",
+            "default",
+            command,
+            1800,
+            {},
+            VerificationProfile((sys.executable, "-c", "pass"))
+            if policy.ai.auto_fix
+            else None,
+        )
+    if policy.ai.auto_fix and "autofix_publication" not in kwargs:
+        kwargs["autofix_publication"] = AutoFixPublicationConfig(
+            enabled=True,
+            allowed_projects=frozenset({str(kwargs.get("project_id", "42"))}),
+            initial_readiness="draft",
+            ci_trigger="manual",
         )
     return ProductionReviewWorker(*args, **kwargs)
 
@@ -549,7 +568,7 @@ def test_worker_rejects_note_from_wrong_project_or_mr(
     assert note_receipt.external_identity is None
 
 
-def test_worker_keeps_auto_fix_intent_while_child_mr_reconciliation_is_pending(
+def test_worker_resolves_program_auto_fix_intent_when_agent_has_no_proposal(
     tmp_path: Path,
 ) -> None:
     repository = tmp_path / "repo"
@@ -577,11 +596,143 @@ def test_worker_keeps_auto_fix_intent_while_child_mr_reconciliation_is_pending(
     result = worker.process_one()
 
     assert result is not None and result.status == "succeeded"
-    intent = store.get_auto_fix_intent(run.run_id)
-    assert intent is not None and intent.status == "planned"
+    intent = store.get_auto_fix_publication_intent(run.run_id)
+    assert intent is not None and intent.state == "no_proposal"
+    assert store.get_auto_fix_publication_plan(run.run_id) is None
 
 
-def test_worker_retries_agent_for_auto_fix_when_only_note_exists(tmp_path: Path) -> None:
+def test_worker_freezes_verified_program_owned_auto_fix_plan(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    sha = _git_repository(repository)
+    mr = MergeRequest("42", 1, "Improve validation", "alice", "feature", "main", sha, "https://mr")
+    store = SQLiteStore(tmp_path / "review.db")
+    run = store.enqueue("42", 1, sha)
+    command = (
+        sys.executable,
+        "-c",
+        (
+            "import json, os; from pathlib import Path; "
+            "Path('README.md').write_text('fixed\\n'); "
+            "Path(os.environ['REVIEW_AGENT_FLOW_RESULT_PATH']).write_text(json.dumps("
+            "{'version': 1, 'review_markdown': 'reviewed', "
+            "'autofix_proposal': {'summary': 'Apply fix'}}))"
+        ),
+    )
+    worker = ReviewWorker(
+        store,
+        FakeGitLab(mr),
+        GitWorktreeManager(repository, tmp_path / "worktrees"),
+        ReviewPolicy(ai=AIPolicy(enabled=True, auto_fix=True, command=command)),
+        repository,
+        "https://gitlab",
+        project_id="42",
+    )
+
+    result = worker.process_one()
+
+    assert result is not None and result.status == "succeeded"
+    intent = store.get_auto_fix_publication_intent(run.run_id)
+    plan = store.get_auto_fix_publication_plan(run.run_id)
+    assert intent is not None and intent.state == "plan_frozen"
+    assert plan is not None
+    payload = json.loads(plan.plan_json)
+    assert payload["branch"] == f"autofix/MR-1/sha-{sha}/intent-{intent.nonce}"
+    assert payload["initial_readiness"] == "draft"
+    assert payload["ci_trigger"] == "manual"
+    assert plan.marker.endswith(f"plan_sha256={plan.plan_sha256} -->")
+    receipt = store.list_effect_receipts(run.run_id, "autofix_plan")[0]
+    assert receipt.state == "plan_frozen"
+
+
+def test_workspace_diff_without_proposal_blocks_only_auto_fix(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    sha = _git_repository(repository)
+    mr = MergeRequest("42", 1, "Improve validation", "alice", "feature", "main", sha, "https://mr")
+    store = SQLiteStore(tmp_path / "review.db")
+    run = store.enqueue("42", 1, sha)
+    worker = ReviewWorker(
+        store,
+        FakeGitLab(mr),
+        GitWorktreeManager(repository, tmp_path / "worktrees"),
+        ReviewPolicy(
+            ai=AIPolicy(
+                enabled=True,
+                auto_fix=True,
+                command=(
+                    sys.executable,
+                    "-c",
+                    "from pathlib import Path; Path('README.md').write_text('undeclared\\n')",
+                ),
+            )
+        ),
+        repository,
+        "https://gitlab",
+        project_id="42",
+    )
+
+    result = worker.process_one()
+
+    assert result is not None and result.status == "succeeded"
+    assert store.get_note_publication_for_run(run.run_id) is not None
+    intent = store.get_auto_fix_publication_intent(run.run_id)
+    assert intent is not None and intent.state == "blocked"
+    assert store.get_auto_fix_publication_plan(run.run_id) is None
+    receipt = store.list_effect_receipts(run.run_id, "autofix_plan")[0]
+    assert receipt.state == "blocked"
+
+
+def test_fork_source_blocks_only_auto_fix_before_plan_freeze(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    sha = _git_repository(repository)
+    mr = MergeRequest(
+        "42",
+        1,
+        "Fork contribution",
+        "alice",
+        "feature",
+        "main",
+        sha,
+        "https://mr",
+        source_project_id="99",
+    )
+    store = SQLiteStore(tmp_path / "review.db")
+    run = store.enqueue("42", 1, sha)
+    worker = ReviewWorker(
+        store,
+        FakeGitLab(mr),
+        GitWorktreeManager(repository, tmp_path / "worktrees"),
+        ReviewPolicy(
+            ai=AIPolicy(
+                enabled=True,
+                auto_fix=True,
+                command=(
+                    sys.executable,
+                    "-c",
+                    (
+                        "import os; assert os.environ["
+                        "'REVIEW_AGENT_FLOW_AUTO_FIX_ENABLED'] == 'false'"
+                    ),
+                ),
+            )
+        ),
+        repository,
+        "https://gitlab",
+        project_id="42",
+    )
+
+    result = worker.process_one()
+
+    assert result is not None and result.status == "succeeded"
+    assert store.get_note_publication_for_run(run.run_id) is not None
+    intent = store.get_auto_fix_publication_intent(run.run_id)
+    assert intent is not None and intent.state == "blocked"
+    assert store.get_auto_fix_publication_plan(run.run_id) is None
+
+
+def test_worker_does_not_search_for_agent_owned_auto_fix_merge_request(tmp_path: Path) -> None:
     repository = tmp_path / "repo"
     repository.mkdir()
     sha = _git_repository(repository)
@@ -643,11 +794,12 @@ def test_worker_retries_agent_for_auto_fix_when_only_note_exists(tmp_path: Path)
     assert result.agent_result.stdout.strip() == "recovered"
     marker = canonical_note_marker(run.project_id, run.mr_iid, run.sha)
     assert gitlab.created_note_bodies == [f"{marker}\nreviewed"]
-    intent = store.get_auto_fix_intent(run.run_id)
-    assert intent is not None and intent.status == "created"
+    assert gitlab.lookups == 0
+    intent = store.get_auto_fix_publication_intent(run.run_id)
+    assert intent is not None and intent.state == "no_proposal"
 
 
-def test_auto_fix_lookup_failure_requeues_without_running_agent(tmp_path: Path) -> None:
+def test_auto_fix_lookup_is_not_part_of_the_normal_worker_path(tmp_path: Path) -> None:
     repository = tmp_path / "repo"
     repository.mkdir()
     sha = _git_repository(repository)
@@ -673,7 +825,7 @@ def test_auto_fix_lookup_failure_requeues_without_running_agent(tmp_path: Path) 
             ai=AIPolicy(
                 enabled=True,
                 auto_fix=True,
-                command=(sys.executable, "-c", "raise SystemExit('Agent must not run')"),
+                command=(sys.executable, "-c", "print('Agent ran')"),
             )
         ),
         repository,
@@ -684,10 +836,10 @@ def test_auto_fix_lookup_failure_requeues_without_running_agent(tmp_path: Path) 
 
     result = worker.process_one()
 
-    assert result is not None and result.status == "deferred"
-    assert result.agent_result is None
-    assert store.get_auto_fix_intent(run.run_id).status == "planned"
-    assert store.claim_next().run_id == run.run_id
+    assert result is not None and result.status == "succeeded"
+    assert result.agent_result is not None
+    assert result.agent_result.stdout.strip() == "Agent ran"
+    assert store.get_auto_fix_publication_intent(run.run_id).state == "no_proposal"
 
 
 def test_worker_requires_project_binding(tmp_path: Path) -> None:
@@ -745,7 +897,7 @@ def test_worktree_registration_failure_does_not_create_an_untracked_worktree(tmp
     assert result is not None and result.status == "failed"
     assert worktrees.removed == []
     assert not worktrees.path_for("1").exists()
-    assert store.get_auto_fix_intent(run.run_id).status == "abandoned"
+    assert store.get_auto_fix_publication_intent(run.run_id).state == "pending"
 
 
 def test_preexisting_worktree_is_not_deleted_on_path_conflict(tmp_path: Path) -> None:
@@ -778,7 +930,7 @@ def test_preexisting_worktree_is_not_deleted_on_path_conflict(tmp_path: Path) ->
     assert result is not None and result.status == "failed"
     assert existing.exists()
     assert store.get_worktree_record(1) is None
-    assert store.get_auto_fix_intent(1).status == "abandoned"
+    assert store.get_auto_fix_publication_intent(1).state == "pending"
 
 
 def test_retryable_pre_agent_failure_keeps_auto_fix_intent(tmp_path: Path) -> None:
@@ -813,8 +965,8 @@ def test_retryable_pre_agent_failure_keeps_auto_fix_intent(tmp_path: Path) -> No
     result = worker.process_one()
 
     assert result is not None and result.status == "deferred"
-    intent = store.get_auto_fix_intent(run.run_id)
-    assert intent is not None and intent.status == "planned"
+    intent = store.get_auto_fix_publication_intent(run.run_id)
+    assert intent is not None and intent.state == "pending"
     saved = store.get_review_run(run.run_id)
     assert saved is not None and saved.status == "pending"
 
@@ -1380,69 +1532,6 @@ def test_malformed_agent_result_is_terminal_agent_contract_failure(tmp_path: Pat
     assert receipt.state == "failed"
 
 
-def test_failed_agent_keeps_autofix_reconciliation_for_eventual_merge(
-    tmp_path: Path,
-) -> None:
-    repository = tmp_path / "repo"
-    repository.mkdir()
-    sha = _git_repository(repository)
-    mr = MergeRequest("42", 1, "Auto-fix after failure", "alice", "feature", "main", sha, "https://mr")
-    gitlab = EventualAutoFixGitLab(mr)
-    store = SQLiteStore(tmp_path / "review.db")
-    run = store.enqueue("42", 1, sha)
-    worker = ReviewWorker(
-        store,
-        gitlab,
-        GitWorktreeManager(repository, tmp_path / "worktrees"),
-        ReviewPolicy(
-            ai=AIPolicy(
-                enabled=True,
-                auto_fix=True,
-                command=(
-                    sys.executable,
-                    "-c",
-                    "import sys; sys.stderr.write('agent crashed'); sys.exit(7)",
-                ),
-            )
-        ),
-        repository,
-        "https://gitlab",
-        project_id="42",
-        retry_delay_seconds=0,
-    )
-
-    failed = worker.process_one()
-    assert failed is not None and failed.status == "failed"
-    receipts = store.list_effect_receipts(run.run_id)
-    reconciliation = next(
-        receipt for receipt in receipts if receipt.effect_kind == "autofix_reconciliation"
-    )
-    expected = next(receipt for receipt in receipts if receipt.effect_kind == "autofix_expected")
-    assert reconciliation.state == "pending"
-    assert reconciliation.dedupe_key == "autofix/MR-1/run-1"
-    assert expected.state == "not_observed"
-
-    merged_sha = "f" * 40
-    gitlab.auto_fix = CreatedMergeRequest(
-        "42",
-        9,
-        "[ReviewFlow Auto-Fix] Recovered",
-        "autofix/MR-1/run-1",
-        "feature",
-        "https://gitlab/merge_requests/9",
-        state="merged",
-        merged_sha=merged_sha,
-    )
-    reconciled = worker.process_one()
-
-    assert reconciled is not None and reconciled.status == "succeeded"
-    assert store.is_suppressed_parent_sha("42", 1, merged_sha) is True
-    saved_reconciliation = store.list_effect_receipts(
-        run.run_id, "autofix_reconciliation"
-    )[0]
-    assert saved_reconciliation.state == "observed"
-
-
 def test_agent_success_does_not_write_after_lease_expires(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1483,7 +1572,7 @@ def test_agent_success_does_not_write_after_lease_expires(
     assert saved.status == "pending"
     assert saved.failure_class == "lease_lost"
     assert saved.status != "succeeded"
-    assert store.list_effect_receipts(run.run_id, "autofix_reconciliation")[0].state == "pending"
+    assert store.list_effect_receipts(run.run_id, "autofix_plan")[0].state == "planned"
     assert store.list_effect_receipts(run.run_id, "agent_execution")[0].state == "not_observed"
     with sqlite3.connect(database) as connection:
         relation_count = connection.execute("SELECT COUNT(*) FROM auto_fix_mrs").fetchone()[0]
@@ -1525,7 +1614,7 @@ def test_agent_start_failure_closes_running_and_expected_receipts(tmp_path: Path
     }
     assert receipts["agent_execution"].state == "failed"
     assert receipts["note_expected"].state == "not_observed"
-    assert receipts["autofix_expected"].state == "not_observed"
+    assert receipts["autofix_plan"].state == "not_observed"
 
 
 def test_partial_agent_effect_preparation_closes_created_receipts(
@@ -1569,179 +1658,6 @@ def test_partial_agent_effect_preparation_closes_created_receipts(
     assert receipts[0].state == "failed"
 
 
-def test_agent_receipts_and_eventual_merged_autofix_reconciliation(tmp_path: Path) -> None:
-    repository = tmp_path / "repo"
-    repository.mkdir()
-    sha = _git_repository(repository)
-    mr = MergeRequest("42", 1, "Auto-fix", "alice", "feature", "main", sha, "https://mr")
-    gitlab = EventualAutoFixGitLab(mr)
-    store = SQLiteStore(tmp_path / "review.db")
-    run = store.enqueue("42", 1, sha)
-    worker = ReviewWorker(
-        store,
-        gitlab,
-        GitWorktreeManager(repository, tmp_path / "worktrees"),
-        ReviewPolicy(
-            ai=AIPolicy(
-                enabled=True,
-                auto_fix=True,
-                command=(sys.executable, "-c", "print('reviewed')"),
-            )
-        ),
-        repository,
-        "https://gitlab",
-        gitlab_token="super-secret-token",
-        project_id="42",
-        retry_delay_seconds=0,
-    )
-
-    first = worker.process_one()
-    assert first is not None and first.status == "succeeded"
-    receipts = store.list_effect_receipts(run.run_id)
-    assert {receipt.effect_kind for receipt in receipts} == {
-        "agent_execution",
-        "note_expected",
-        "autofix_expected",
-        "autofix_reconciliation",
-    }
-    assert next(receipt for receipt in receipts if receipt.effect_kind == "agent_execution").state == "succeeded"
-    assert next(receipt for receipt in receipts if receipt.effect_kind == "autofix_reconciliation").state == "pending"
-    intent = store.get_auto_fix_intent(run.run_id)
-    assert intent is not None and intent.status == "planned"
-
-    gitlab.auto_fix = CreatedMergeRequest(
-        "42",
-        9,
-        "[ReviewFlow Auto-Fix] Auto-fix",
-        "autofix/MR-1/run-1",
-        "feature",
-        "https://gitlab/merge_requests/9?access_token=super-secret-token",
-        state="merged",
-        merged_sha="f" * 40,
-    )
-    reconciled = worker.process_one()
-    assert reconciled is not None and reconciled.status == "succeeded"
-    relation = store.record_auto_fix(
-        "42", 1, sha, run.run_id, "42", 9, status="merged", merged_sha="f" * 40
-    )
-    assert relation.status == "merged"
-    assert store.is_suppressed_parent_sha("42", 1, "f" * 40) is True
-    reconciliation = store.list_effect_receipts(run.run_id, "autofix_reconciliation")
-    assert reconciliation[0].state == "observed"
-    assert "super-secret-token" not in (reconciliation[0].detail or "")
-
-
-def test_autofix_reconciliation_stops_after_bounded_not_observed_attempts(
-    tmp_path: Path,
-) -> None:
-    repository = tmp_path / "repo"
-    repository.mkdir()
-    sha = _git_repository(repository)
-    mr = MergeRequest("42", 1, "Auto-fix bounded", "alice", "feature", "main", sha, "https://mr")
-    gitlab = EventualAutoFixGitLab(mr)
-    store = SQLiteStore(tmp_path / "review.db")
-    run = store.enqueue("42", 1, sha)
-    worker = ReviewWorker(
-        store,
-        gitlab,
-        GitWorktreeManager(repository, tmp_path / "worktrees"),
-        ReviewPolicy(
-            ai=AIPolicy(
-                enabled=True,
-                auto_fix=True,
-                command=(sys.executable, "-c", "print('reviewed')"),
-            )
-        ),
-        repository,
-        "https://gitlab",
-        project_id="42",
-        retry_delay_seconds=0,
-        reconciliation_max_attempts=2,
-    )
-
-    first = worker.process_one()
-    assert first is not None and first.status == "succeeded"
-    assert gitlab.find_calls == 1
-    pending = store.list_effect_receipts(run.run_id, "autofix_reconciliation")[0]
-    assert pending.state == "pending"
-
-    exhausted = worker.process_one()
-    assert exhausted is not None and exhausted.status == "succeeded"
-    terminal = store.list_effect_receipts(run.run_id, "autofix_reconciliation")[0]
-    assert terminal.state == "not_observed"
-    assert terminal.attempt == 2
-    assert terminal.next_attempt_at is None
-    intent = store.get_auto_fix_intent(run.run_id)
-    assert intent is not None and intent.status == "abandoned"
-    assert gitlab.find_calls == 2
-
-    assert worker.process_one() is None
-    assert gitlab.find_calls == 2
-
-
-@pytest.mark.parametrize(
-    ("mismatch", "project_id", "source_branch", "target_branch"),
-    [
-        ("project", "99", "autofix/MR-1/run-1", "feature"),
-        ("run", "42", "autofix/MR-1/run-999", "feature"),
-        ("source", "42", "autofix/MR-2/run-1", "feature"),
-        ("target", "42", "autofix/MR-1/run-1", "main"),
-    ],
-)
-def test_reconciliation_rejects_mismatched_autofix_identity(
-    mismatch: str,
-    project_id: str,
-    source_branch: str,
-    target_branch: str,
-    tmp_path: Path,
-) -> None:
-    repository = tmp_path / "repo"
-    repository.mkdir()
-    sha = _git_repository(repository)
-    parent = MergeRequest("42", 1, "Auto-fix identity", "alice", "feature", "main", sha, "https://mr")
-    gitlab = EventualAutoFixGitLab(parent)
-    store = SQLiteStore(tmp_path / "review.db")
-    run = store.enqueue("42", 1, sha)
-    worker = ReviewWorker(
-        store,
-        gitlab,
-        GitWorktreeManager(repository, tmp_path / "worktrees"),
-        ReviewPolicy(
-            ai=AIPolicy(
-                enabled=True,
-                auto_fix=True,
-                command=(sys.executable, "-c", "print('reviewed')"),
-            )
-        ),
-        repository,
-        "https://gitlab",
-        project_id="42",
-        retry_delay_seconds=0,
-    )
-
-    first = worker.process_one()
-    assert first is not None and first.status == "succeeded"
-    gitlab.auto_fix = CreatedMergeRequest(
-        project_id,
-        9,
-        f"[ReviewFlow Auto-Fix] {mismatch}",
-        source_branch,
-        target_branch,
-        "https://gitlab/merge_requests/9",
-    )
-
-    rejected = worker.process_one()
-
-    assert rejected is not None and rejected.status == "failed"
-    reconciliation = store.list_effect_receipts(run.run_id, "autofix_reconciliation")[0]
-    assert reconciliation.state == "failed"
-    assert mismatch in rejected.detail or "Auto-fix" in rejected.detail
-    assert store.is_suppressed_parent_sha("42", 1, "f" * 40) is False
-    with sqlite3.connect(tmp_path / "review.db") as connection:
-        relation_count = connection.execute("SELECT COUNT(*) FROM auto_fix_mrs").fetchone()[0]
-    assert relation_count == 0
-
-
 def test_known_autofix_child_pending_run_is_cancelled_before_effects(tmp_path: Path) -> None:
     repository = tmp_path / "repo"
     repository.mkdir()
@@ -1782,52 +1698,3 @@ def test_known_autofix_child_pending_run_is_cancelled_before_effects(tmp_path: P
     assert store.list_effect_receipts(child_run.run_id) == ()
     with sqlite3.connect(tmp_path / "review.db") as connection:
         assert connection.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0] == 0
-
-
-def test_closed_autofix_is_reconciled_without_parent_sha_suppression(tmp_path: Path) -> None:
-    repository = tmp_path / "repo"
-    repository.mkdir()
-    sha = _git_repository(repository)
-    mr = MergeRequest("42", 1, "Closed Auto-fix", "alice", "feature", "main", sha, "https://mr")
-    gitlab = EventualAutoFixGitLab(mr)
-    store = SQLiteStore(tmp_path / "review.db")
-    run = store.enqueue("42", 1, sha)
-    worker = ReviewWorker(
-        store,
-        gitlab,
-        GitWorktreeManager(repository, tmp_path / "worktrees"),
-        ReviewPolicy(
-            ai=AIPolicy(enabled=True, auto_fix=True, command=(sys.executable, "-c", "print('ok')"))
-        ),
-        repository,
-        "https://gitlab",
-        project_id="42",
-        retry_delay_seconds=0,
-    )
-    assert worker.process_one() is not None
-    gitlab.auto_fix = CreatedMergeRequest(
-        "42",
-        10,
-        "[ReviewFlow Auto-Fix] Closed",
-        "autofix/MR-1/run-1",
-        "feature",
-        "https://gitlab/merge_requests/10",
-        state="closed",
-        merged_sha="f" * 40,
-    )
-    result = worker.process_one()
-    assert result is not None and result.status == "succeeded"
-    relation = store.record_auto_fix(
-        "42",
-        1,
-        sha,
-        run.run_id,
-        "42",
-        10,
-        status="closed",
-        merged_sha="f" * 40,
-    )
-    assert relation.status == "closed"
-    assert relation.merged_sha is None
-    assert store.is_suppressed_parent_sha("42", 1, sha) is False
-    assert store.is_suppressed_parent_sha("42", 1, "f" * 40) is False

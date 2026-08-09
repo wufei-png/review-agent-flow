@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from collections.abc import Iterable
@@ -20,7 +21,7 @@ DEFAULT_NOTIFICATION_LEASE_SECONDS = 30
 DEFAULT_NOTIFICATION_MAX_ATTEMPTS = 3
 DEFAULT_WORKTREE_CLEANUP_LEASE_SECONDS = 60
 DEFAULT_WORKTREE_CLEANUP_MAX_ATTEMPTS = 5
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 DEFAULT_EFFECT_LEASE_SECONDS = 60
 DEFAULT_NOTE_PUBLICATION_LEASE_SECONDS = 60
 DEFAULT_NOTE_PUBLICATION_MAX_ATTEMPTS = 5
@@ -122,6 +123,35 @@ class AutoFixIntent:
 
 
 @dataclass(frozen=True)
+class AutoFixPublicationIntent:
+    intent_id: int
+    run_id: int
+    project_id: str
+    mr_iid: int
+    sha: str
+    generation: int
+    nonce: str
+    state: str
+    created_at: str
+    updated_at: str
+    last_error: str | None
+
+
+@dataclass(frozen=True)
+class AutoFixPublicationPlan:
+    plan_id: int
+    intent_id: int
+    run_id: int
+    plan_json: str
+    plan_sha256: str
+    marker: str
+    candidate_sha256: str
+    verification_json: str
+    state: str
+    created_at: str
+
+
+@dataclass(frozen=True)
 class AutoFixRelation:
     relation_id: int
     parent_project_id: str
@@ -184,7 +214,7 @@ class WorktreeRecord:
 class SQLiteStore:
     """Small SQLite store.
 
-    Version 4 is intentionally a fresh schema.  There is no production database
+    Version 5 is intentionally a fresh schema.  There is no production database
     migration contract for this pre-release implementation; an older database
     must be recreated rather than guessed into a new notification or Auto-fix
     routing model.
@@ -323,6 +353,33 @@ class SQLiteStore:
                     updated_at TEXT NOT NULL,
                     UNIQUE(run_id)
                 );
+                CREATE TABLE IF NOT EXISTS auto_fix_publication_intents (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id INTEGER NOT NULL UNIQUE REFERENCES review_runs(id),
+                    project_id TEXT NOT NULL,
+                    mr_iid INTEGER NOT NULL,
+                    sha TEXT NOT NULL,
+                    generation INTEGER NOT NULL,
+                    nonce TEXT NOT NULL UNIQUE,
+                    state TEXT NOT NULL DEFAULT 'pending',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_error TEXT,
+                    UNIQUE(project_id, mr_iid, sha, generation)
+                );
+                CREATE TABLE IF NOT EXISTS auto_fix_publication_plans (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    intent_id INTEGER NOT NULL UNIQUE
+                        REFERENCES auto_fix_publication_intents(id),
+                    run_id INTEGER NOT NULL UNIQUE REFERENCES review_runs(id),
+                    plan_json TEXT NOT NULL,
+                    plan_sha256 TEXT NOT NULL UNIQUE,
+                    marker TEXT NOT NULL UNIQUE,
+                    candidate_sha256 TEXT NOT NULL,
+                    verification_json TEXT NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'frozen',
+                    created_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS review_run_failures (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     run_id INTEGER NOT NULL REFERENCES review_runs(id),
@@ -427,7 +484,7 @@ class SQLiteStore:
                     last_error TEXT,
                     UNIQUE(run_id, path)
                 );
-                PRAGMA user_version = 4;
+                PRAGMA user_version = 5;
                 """
             )
 
@@ -496,6 +553,32 @@ class SQLiteStore:
             "lease_until, claim_token, created_at, updated_at, last_error, "
             "reconcile_attempts, reconcile_next_at, reconcile_lease_until, "
             "reconcile_claim_token"
+        )
+
+    @staticmethod
+    def _auto_fix_publication_intent_from_row(
+        row: sqlite3.Row,
+    ) -> AutoFixPublicationIntent:
+        return AutoFixPublicationIntent(**dict(row))
+
+    @staticmethod
+    def _auto_fix_publication_intent_columns() -> str:
+        return (
+            "id AS intent_id, run_id, project_id, mr_iid, sha, generation, nonce, "
+            "state, created_at, updated_at, last_error"
+        )
+
+    @staticmethod
+    def _auto_fix_publication_plan_from_row(
+        row: sqlite3.Row,
+    ) -> AutoFixPublicationPlan:
+        return AutoFixPublicationPlan(**dict(row))
+
+    @staticmethod
+    def _auto_fix_publication_plan_columns() -> str:
+        return (
+            "id AS plan_id, intent_id, run_id, plan_json, plan_sha256, marker, "
+            "candidate_sha256, verification_json, state, created_at"
         )
 
     def enqueue(self, project_id: str, mr_iid: int, sha: str) -> ReviewRun:
@@ -1862,6 +1945,306 @@ class SQLiteStore:
             ).fetchone()
         assert row is not None
         return self._review_run_from_row(row)
+
+    def create_auto_fix_publication_intent(
+        self,
+        run_id: int,
+        run_claim_token: str | None,
+    ) -> AutoFixPublicationIntent | None:
+        """Create the immutable authorization instance before Agent execution."""
+
+        if not run_claim_token:
+            return None
+        now = self._now().isoformat()
+        with self._connect() as connection:
+            run = connection.execute(
+                """
+                SELECT project_id, mr_iid, sha FROM review_runs
+                WHERE id = ? AND status = 'running' AND claim_token = ?
+                  AND lease_until IS NOT NULL AND lease_until > ?
+                """,
+                (run_id, run_claim_token, now),
+            ).fetchone()
+            if run is None:
+                return None
+            existing = connection.execute(
+                f"SELECT {self._auto_fix_publication_intent_columns()} "
+                "FROM auto_fix_publication_intents WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    """
+                    INSERT INTO auto_fix_publication_intents(
+                        run_id, project_id, mr_iid, sha, generation, nonce,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, 1, ?, ?, ?)
+                    """,
+                    (
+                        run_id,
+                        run["project_id"],
+                        run["mr_iid"],
+                        run["sha"],
+                        uuid4().hex,
+                        now,
+                        now,
+                    ),
+                )
+                existing = connection.execute(
+                    f"SELECT {self._auto_fix_publication_intent_columns()} "
+                    "FROM auto_fix_publication_intents WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()
+            assert existing is not None
+            intent = self._auto_fix_publication_intent_from_row(existing)
+            if (
+                intent.project_id != str(run["project_id"])
+                or intent.mr_iid != int(run["mr_iid"])
+                or intent.sha != str(run["sha"])
+                or intent.generation != 1
+            ):
+                raise ValueError("Auto-fix Intent is immutable for its ReviewKey")
+        return intent
+
+    def get_auto_fix_publication_intent(
+        self, run_id: int
+    ) -> AutoFixPublicationIntent | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                f"SELECT {self._auto_fix_publication_intent_columns()} "
+                "FROM auto_fix_publication_intents WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        return (
+            self._auto_fix_publication_intent_from_row(row)
+            if row is not None
+            else None
+        )
+
+    def resolve_auto_fix_publication_intent(
+        self,
+        run_id: int,
+        receipt_id: int,
+        state: str,
+        detail: str,
+        run_claim_token: str | None,
+        *,
+        error: str | None = None,
+    ) -> bool:
+        """Resolve a non-publishable proposal without failing the Review Run."""
+
+        if state not in {"no_proposal", "blocked"} or not run_claim_token:
+            raise ValueError("invalid Auto-fix Intent terminal state")
+        now = self._now().isoformat()
+        safe_error = self._redact(error) if error else None
+        with self._connect() as connection:
+            intent = connection.execute(
+                """
+                SELECT nonce FROM auto_fix_publication_intents
+                WHERE run_id = ? AND state = 'pending'
+                """,
+                (run_id,),
+            ).fetchone()
+            if intent is None:
+                current = self.get_auto_fix_publication_intent(run_id)
+                return current is not None and current.state == state
+            receipt = connection.execute(
+                """
+                SELECT id FROM effect_receipts
+                WHERE id = ? AND run_id = ? AND effect_kind = 'autofix_plan'
+                  AND dedupe_key = ? AND state = 'planned'
+                """,
+                (receipt_id, run_id, f"autofix-intent:{intent['nonce']}"),
+            ).fetchone()
+            if receipt is None:
+                raise ValueError("Auto-fix effect receipt does not match the Intent")
+            cursor = connection.execute(
+                """
+                UPDATE auto_fix_publication_intents
+                SET state = ?, updated_at = ?, last_error = ?
+                WHERE run_id = ? AND state = 'pending'
+                  AND EXISTS (
+                    SELECT 1 FROM review_runs
+                    WHERE id = ? AND status = 'running' AND claim_token = ?
+                      AND lease_until IS NOT NULL AND lease_until > ?
+                  )
+                """,
+                (state, now, safe_error, run_id, run_id, run_claim_token, now),
+            )
+            if cursor.rowcount != 1:
+                return False
+            connection.execute(
+                """
+                UPDATE effect_receipts
+                SET state = ?, detail = ?, error = ?, updated_at = ?
+                WHERE id = ? AND state = 'planned'
+                """,
+                (state, detail, safe_error, now, receipt_id),
+            )
+        return True
+
+    def freeze_auto_fix_publication_plan(
+        self,
+        run_id: int,
+        receipt_id: int,
+        payload: dict[str, object],
+        run_claim_token: str | None,
+    ) -> AutoFixPublicationPlan | None:
+        """Atomically freeze canonical independent inputs and their derived identity."""
+
+        if not run_claim_token or "plan_sha256" in payload:
+            raise ValueError("Publication Plan inputs must exclude derived identity")
+        plan_json = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        plan_sha256 = hashlib.sha256(plan_json.encode("utf-8")).hexdigest()
+        template = payload.get("marker_template")
+        candidate_sha256 = payload.get("candidate_sha256")
+        verification = payload.get("verification")
+        if (
+            not isinstance(template, str)
+            or template.count("{plan_sha256}") != 1
+            or not isinstance(candidate_sha256, str)
+            or not isinstance(verification, dict)
+            or verification.get("candidate_sha256") != candidate_sha256
+        ):
+            raise ValueError("Publication Plan inputs are inconsistent")
+        marker = template.replace("{plan_sha256}", plan_sha256)
+        verification_json = json.dumps(
+            verification, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        now = self._now().isoformat()
+        with self._connect() as connection:
+            intent_row = connection.execute(
+                f"SELECT {self._auto_fix_publication_intent_columns()} "
+                "FROM auto_fix_publication_intents WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if intent_row is None:
+                raise ValueError("Auto-fix Intent does not exist")
+            intent = self._auto_fix_publication_intent_from_row(intent_row)
+            expected_review_key = {
+                "project_id": intent.project_id,
+                "mr_iid": intent.mr_iid,
+                "sha": intent.sha,
+            }
+            expected_intent = {
+                "generation": intent.generation,
+                "nonce": intent.nonce,
+            }
+            expected_template = (
+                f"<!-- reviewflow:v1;project={intent.project_id};mr={intent.mr_iid};"
+                f"sha={intent.sha};effect=autofix;intent={intent.nonce};"
+                "plan_sha256={plan_sha256} -->"
+            )
+            expected_branch = (
+                f"autofix/MR-{intent.mr_iid}/sha-{intent.sha}/intent-{intent.nonce}"
+            )
+            command_sha256 = verification.get("command_sha256")
+            if (
+                payload.get("review_key") != expected_review_key
+                or payload.get("intent") != expected_intent
+                or template != expected_template
+                or payload.get("branch") != expected_branch
+                or len(candidate_sha256) != 64
+                or any(character not in "0123456789abcdef" for character in candidate_sha256)
+                or not isinstance(command_sha256, str)
+                or len(command_sha256) != 64
+                or any(character not in "0123456789abcdef" for character in command_sha256)
+            ):
+                raise ValueError("Publication Plan identity does not match the immutable Intent")
+            receipt = connection.execute(
+                """
+                SELECT id, state FROM effect_receipts
+                WHERE id = ? AND run_id = ? AND effect_kind = 'autofix_plan'
+                  AND dedupe_key = ?
+                """,
+                (receipt_id, run_id, f"autofix-intent:{intent.nonce}"),
+            ).fetchone()
+            if receipt is None:
+                raise ValueError("Auto-fix effect receipt does not match the Intent")
+            existing = connection.execute(
+                f"SELECT {self._auto_fix_publication_plan_columns()} "
+                "FROM auto_fix_publication_plans WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if existing is None:
+                if receipt["state"] != "planned":
+                    raise ValueError("Auto-fix effect receipt is not ready for Plan freeze")
+                active = connection.execute(
+                    """
+                    SELECT 1 FROM review_runs
+                    WHERE id = ? AND status = 'running' AND claim_token = ?
+                      AND lease_until IS NOT NULL AND lease_until > ?
+                    """,
+                    (run_id, run_claim_token, now),
+                ).fetchone()
+                if active is None or intent.state != "pending":
+                    return None
+                connection.execute(
+                    """
+                    INSERT INTO auto_fix_publication_plans(
+                        intent_id, run_id, plan_json, plan_sha256, marker,
+                        candidate_sha256, verification_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        intent.intent_id,
+                        run_id,
+                        plan_json,
+                        plan_sha256,
+                        marker,
+                        candidate_sha256,
+                        verification_json,
+                        now,
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE auto_fix_publication_intents
+                    SET state = 'plan_frozen', updated_at = ?, last_error = NULL
+                    WHERE id = ? AND state = 'pending'
+                    """,
+                    (now, intent.intent_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE effect_receipts
+                    SET state = 'plan_frozen',
+                        detail = 'Verified immutable Auto-fix Publication Plan frozen',
+                        error = NULL, updated_at = ?
+                    WHERE id = ? AND state = 'planned'
+                    """,
+                    (now, receipt_id),
+                )
+                existing = connection.execute(
+                    f"SELECT {self._auto_fix_publication_plan_columns()} "
+                    "FROM auto_fix_publication_plans WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()
+            assert existing is not None
+            plan = self._auto_fix_publication_plan_from_row(existing)
+            if (
+                plan.intent_id != intent.intent_id
+                or plan.plan_json != plan_json
+                or plan.plan_sha256 != plan_sha256
+                or plan.marker != marker
+            ):
+                raise ValueError("Auto-fix Publication Plan is immutable")
+        return plan
+
+    def get_auto_fix_publication_plan(
+        self, run_id: int
+    ) -> AutoFixPublicationPlan | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                f"SELECT {self._auto_fix_publication_plan_columns()} "
+                "FROM auto_fix_publication_plans WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        return (
+            self._auto_fix_publication_plan_from_row(row) if row is not None else None
+        )
 
     def create_auto_fix_intent(
         self,

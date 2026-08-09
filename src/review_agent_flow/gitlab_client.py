@@ -62,6 +62,7 @@ class PythonGitLabClient(GitLabClient):
             description=str(getattr(mr, "description", "") or ""),
             state=state,
             merged_sha=str(merged_sha) if merged_sha else None,
+            source_project_id=str(getattr(mr, "source_project_id", "") or ""),
         )
 
     def get_latest_pipeline(self, project_id: str, sha: str) -> Pipeline | None:
