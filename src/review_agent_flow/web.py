@@ -14,7 +14,7 @@ from uuid import uuid4
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 
-from .events import parse_webhooks
+from .events import parse_auto_fix_branch, parse_auto_fix_marker, parse_webhooks
 from .policy import load_policy
 from .security import redact
 from .store import SQLiteStore
@@ -434,14 +434,12 @@ def create_app(
                         {"accepted": False, "reason": "pipeline gate is disabled", "kind": "pipeline"}
                     )
                     continue
-                match = store.resolve_auto_fix_match(
-                    decision.project_id,
-                    decision.mr_iid,
-                    decision.source_branch,
-                    decision.target_branch,
-                    decision.description,
+                relation = store.get_program_auto_fix_relation_by_child(
+                    decision.project_id, decision.mr_iid
                 )
-                if match is not None:
+                if relation is not None or parse_auto_fix_branch(
+                    decision.source_branch or ""
+                ) is not None or parse_auto_fix_marker(decision.description) is not None:
                     responses.append(
                         {
                             "accepted": True,
@@ -459,20 +457,25 @@ def create_app(
                     }
                 )
                 continue
-            match = store.resolve_auto_fix_match(
-                decision.project_id,
-                decision.mr_iid,
-                decision.source_branch,
-                decision.target_branch,
-                decision.description,
+            relation = store.get_program_auto_fix_relation_by_child(
+                decision.project_id, decision.mr_iid
             )
             if decision.kind == "merge":
-                if match is None:
+                if relation is None:
                     responses.append(
                         {"accepted": False, "reason": "untracked Merge Request merge event"}
                     )
                     continue
-                store.mark_auto_fix_merged(decision.project_id, decision.mr_iid, decision.sha)
+                store.observe_program_auto_fix_webhook(
+                    decision.project_id,
+                    decision.mr_iid,
+                    status="merged",
+                    merged_sha=decision.sha,
+                    source_branch=decision.source_branch,
+                    target_branch=decision.target_branch,
+                    description=decision.description,
+                    source_sha=None,
+                )
                 responses.append(
                     {
                         "accepted": True,
@@ -492,13 +495,40 @@ def create_app(
                     kind=decision.kind,
                 )
                 continue
-            if match is not None:
+            if relation is not None:
+                store.observe_program_auto_fix_webhook(
+                    decision.project_id,
+                    decision.mr_iid,
+                    status="closed" if decision.kind == "close" else "opened",
+                    merged_sha=None,
+                    source_branch=decision.source_branch,
+                    target_branch=decision.target_branch,
+                    description=decision.description,
+                    source_sha=decision.sha,
+                )
                 responses.append(
                     {
                         "accepted": True,
                         "kind": "autofix",
                         "status": "review run not created",
                     }
+                )
+                continue
+            if (
+                parse_auto_fix_branch(decision.source_branch or "") is not None
+                or parse_auto_fix_marker(decision.description) is not None
+            ):
+                responses.append(
+                    {
+                        "accepted": False,
+                        "kind": "autofix",
+                        "reason": "Auto-fix-shaped Merge Request has no local Relation",
+                    }
+                )
+                continue
+            if decision.kind == "draft":
+                responses.append(
+                    {"accepted": False, "kind": "draft", "reason": "draft merge request"}
                 )
                 continue
             run = store.enqueue(decision.project_id, decision.mr_iid, decision.sha)

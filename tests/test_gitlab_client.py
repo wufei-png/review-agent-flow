@@ -248,6 +248,7 @@ def test_auto_fix_lookup_skips_old_same_branch_mr_without_current_marker() -> No
         SimpleNamespace(
             iid=8,
             title="old",
+            author={"username": "review-bot"},
             source_branch="autofix/MR-1/run-1",
             target_branch="feature",
             web_url="old-url",
@@ -256,6 +257,7 @@ def test_auto_fix_lookup_skips_old_same_branch_mr_without_current_marker() -> No
         SimpleNamespace(
             iid=9,
             title="new",
+            author={"username": "review-bot"},
             source_branch="autofix/MR-1/run-1",
             target_branch="feature",
             web_url="new-url",

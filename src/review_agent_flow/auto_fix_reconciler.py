@@ -1,27 +1,21 @@
-"""Independent Auto-fix Merge Request reconciliation."""
+"""Exceptional reconciliation for Program-owned Auto-fix publication."""
 
 from __future__ import annotations
 
-import logging
+import json
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
 
-from .events import parse_auto_fix_branch
 from .failures import classify_exception
-from .gitlab import GitLabClient, is_valid_sha
-from .runner import LeaseLostError
+from .gitlab import CreatedMergeRequest, GitLabClient, is_valid_sha
+from .notifications import FanoutNotifier
 from .security import redact
 from .store import (
-    DEFAULT_EFFECT_LEASE_SECONDS,
-    EffectReceipt,
-    ReviewRun,
+    DEFAULT_AUTO_FIX_RECONCILIATION_LEASE_SECONDS,
+    AutoFixPublicationPlan,
+    ProgramAutoFixRelation,
     SQLiteStore,
-    auto_fix_intent_marker,
 )
-from .structured_logging import log_event
-
-LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -32,7 +26,7 @@ class AutoFixReconciliationResult:
 
 
 class AutoFixReconciler:
-    """Observe Agent-owned Auto-fix MRs and advance their Effect Receipts."""
+    """Recover uncertain writes and refresh only already-authorized Relations."""
 
     def __init__(
         self,
@@ -44,585 +38,321 @@ class AutoFixReconciler:
         max_attempts: int = 6,
         retry_delay_seconds: float = 5.0,
         max_retry_delay_seconds: float = 300.0,
+        relation_refresh_seconds: float = 300.0,
+        notifier: FanoutNotifier | None = None,
         secret_provider: Callable[[], Iterable[str]] | None = None,
     ) -> None:
-        if not project_id or not project_id.strip():
-            raise ValueError("Auto-fix reconciler project_id cannot be empty")
-        if run_lease_seconds <= 0:
-            raise ValueError("Auto-fix reconciler run_lease_seconds must be positive")
-        if max_attempts <= 0:
-            raise ValueError("Auto-fix reconciler max_attempts must be positive")
-        if retry_delay_seconds < 0:
-            raise ValueError("Auto-fix reconciler retry_delay_seconds cannot be negative")
-        if max_retry_delay_seconds < 0:
-            raise ValueError("Auto-fix reconciler max_retry_delay_seconds cannot be negative")
+        if not project_id.strip() or run_lease_seconds <= 0 or max_attempts <= 0:
+            raise ValueError("invalid Auto-fix Reconciler configuration")
+        if min(retry_delay_seconds, max_retry_delay_seconds, relation_refresh_seconds) < 0:
+            raise ValueError("Auto-fix Reconciler delays cannot be negative")
         self.store = store
         self.gitlab = gitlab
         self.project_id = project_id.strip()
-        self.run_lease_seconds = run_lease_seconds
+        self.lease_seconds = min(
+            DEFAULT_AUTO_FIX_RECONCILIATION_LEASE_SECONDS,
+            max(run_lease_seconds, 1),
+        )
         self.max_attempts = max_attempts
         self.retry_delay_seconds = retry_delay_seconds
         self.max_retry_delay_seconds = max_retry_delay_seconds
+        self.relation_refresh_seconds = relation_refresh_seconds
+        self.notifier = notifier or FanoutNotifier()
         self._secret_provider = secret_provider or (lambda: ())
 
     def _secrets(self) -> tuple[str, ...]:
         return tuple(
-            secret
-            for secret in self._secret_provider()
-            if secret and not secret.isspace()
+            value
+            for value in self._secret_provider()
+            if value and not value.isspace()
         )
 
     def _redact(self, value: object) -> str:
         return redact(value, secrets=self._secrets())
 
-    def _log_run(
-        self,
-        run: ReviewRun,
-        *,
-        status: str,
-        level: int = logging.INFO,
-        diagnostic: object | None = None,
-        **fields: object,
-    ) -> None:
-        log_event(
-            LOGGER,
-            level,
-            secrets=self._secrets(),
-            event="worker.autofix_reconcile",
-            status=status,
-            correlation_id=f"review-run:{run.run_id}",
-            run_id=run.run_id,
-            project_id=run.project_id,
-            mr_iid=run.mr_iid,
-            diagnostic=self._redact(diagnostic) if diagnostic is not None else None,
-            attempt=run.attempts,
-            **fields,
-        )
-
-    def _update_run_receipt(
-        self,
-        run: ReviewRun,
-        receipt: EffectReceipt,
-        *,
-        state: str,
-        external_identity: str | None = None,
-        detail: str | None = None,
-        error: str | None = None,
-        next_attempt_at: str | None = None,
-    ) -> None:
-        updated = self.store.update_effect_receipt(
-            receipt.receipt_id,
-            state=state,
-            external_identity=external_identity,
-            detail=detail,
-            error=error,
-            next_attempt_at=next_attempt_at,
-            run_id=run.run_id,
-            run_claim_token=run.claim_token,
-        )
-        if not updated:
-            raise LeaseLostError(
-                "Review Run lease was lost before updating an Auto-fix receipt"
-            )
-
-    def _backoff(self, attempt: int) -> float:
+    def _delay(self, attempt: int) -> float:
         return min(
             self.retry_delay_seconds * (2 ** max(attempt - 1, 0)),
             self.max_retry_delay_seconds,
         )
 
-    def validate_identity(
+    @staticmethod
+    def _payload(plan: AutoFixPublicationPlan) -> dict[str, object]:
+        if plan.plan_json is None:
+            raise ValueError("uncertain Auto-fix Plan payload was already purged")
+        value = json.loads(plan.plan_json)
+        if not isinstance(value, dict):
+            raise TypeError("uncertain Auto-fix Plan payload is invalid")
+        return value
+
+    def _defer_plan(
         self,
-        run: ReviewRun,
-        parent_merge_request,
-        auto_fix,
-        *,
-        parent_mr_iid: int,
-        expected_branch: str,
-        expected_run_id: int | None = None,
-    ) -> str | None:
-        """Return a failure detail unless every persisted Auto-fix identity agrees."""
-
-        parsed = parse_auto_fix_branch(expected_branch)
-        branch_run_id = run.run_id if expected_run_id is None else expected_run_id
-        if parsed != (parent_mr_iid, branch_run_id):
-            return "Auto-fix expected branch does not match its parent MR and Review Run"
-        if (
-            getattr(parent_merge_request, "project_id", None) != run.project_id
-            or getattr(parent_merge_request, "iid", None) != parent_mr_iid
-        ):
-            return "Auto-fix parent Merge Request identity does not match the Review Run"
-        if getattr(parent_merge_request, "source_branch", None) in {None, ""}:
-            return "Auto-fix parent Merge Request has no source branch"
-        if getattr(auto_fix, "project_id", None) != run.project_id:
-            return "Auto-fix Merge Request belongs to a different project"
-        if getattr(auto_fix, "iid", None) is None or getattr(auto_fix, "iid", 0) <= 0:
-            return "Auto-fix Merge Request has an invalid IID"
-        if getattr(auto_fix, "source_branch", None) != expected_branch:
-            return "Auto-fix Merge Request source branch does not match its receipt"
-        if getattr(auto_fix, "target_branch", None) != parent_merge_request.source_branch:
-            return "Auto-fix Merge Request target branch does not match its parent"
-        state = str(getattr(auto_fix, "state", "") or "").lower()
-        if state not in {"opened", "closed", "merged"}:
-            return "Auto-fix Merge Request returned an unknown state"
-        if state == "merged" and not is_valid_sha(getattr(auto_fix, "merged_sha", None)):
-            return "Merged Auto-fix Merge Request has no valid merged SHA"
-        return None
-
-    def record_observed(
-        self,
-        run: ReviewRun,
-        auto_fix,
-        reconciliation: EffectReceipt,
-        *,
-        claim_token: str | None = None,
-        run_claim_token: str | None = None,
-    ) -> None:
-        """Persist the observed relation behind the active Run or receipt lease."""
-
-        state = str(getattr(auto_fix, "state", "opened") or "opened").lower()
-        relation_status = state if state in {"opened", "closed", "merged"} else "opened"
-        merged_sha = getattr(auto_fix, "merged_sha", None)
-        relation = self.store.record_auto_fix(
-            parent_project_id=run.project_id,
-            parent_mr_iid=run.mr_iid,
-            parent_sha=run.sha,
-            run_id=run.run_id,
-            auto_fix_project_id=auto_fix.project_id,
-            auto_fix_mr_iid=auto_fix.iid,
-            status=relation_status,
-            merged_sha=(
-                merged_sha
-                if relation_status == "merged" and is_valid_sha(merged_sha)
-                else None
-            ),
-            run_claim_token=run_claim_token,
-            effect_receipt_id=reconciliation.receipt_id if claim_token is not None else None,
-            effect_claim_token=claim_token,
-        )
-        if relation is None:
-            raise LeaseLostError(
-                "Auto-fix reconciliation lease was lost before recording the MR"
-            )
-        external_identity = f"{auto_fix.project_id}!{auto_fix.iid}"
-        detail = (
-            f"Auto-fix MR observed with state={relation.status}; "
-            f"url={self._redact(getattr(auto_fix, 'web_url', None))}"
-        )
-        if run_claim_token is not None:
-            self._update_run_receipt(
-                run,
-                reconciliation,
-                state="observed",
-                external_identity=external_identity,
-                detail=detail,
-            )
-        elif not self.store.update_effect_receipt(
-            reconciliation.receipt_id,
-            state="observed",
-            external_identity=external_identity,
-            detail=detail,
-            claim_token=claim_token,
-        ):
-            raise LeaseLostError(
-                "Auto-fix reconciliation lease was lost before receipt completion"
-            )
-        for receipt in self.store.list_effect_receipts(run.run_id, "autofix_expected"):
-            if run_claim_token is not None:
-                self._update_run_receipt(
-                    run,
-                    receipt,
-                    state="observed",
-                    external_identity=external_identity,
-                    detail=detail,
-                )
-            else:
-                self.store.update_effect_receipt(
-                    receipt.receipt_id,
-                    state="observed",
-                    external_identity=external_identity,
-                    detail=detail,
-                )
-
-    def schedule(
-        self,
-        receipt: EffectReceipt,
+        plan: AutoFixPublicationPlan,
         detail: str,
         *,
-        claim_token: str | None = None,
-        run: ReviewRun | None = None,
-    ) -> bool:
-        """Persist the next observation attempt, or exhaust as not observed."""
-
-        safe_detail = self._redact(detail)
-        if receipt.attempt >= self.max_attempts:
-            terminal_detail = (
-                "Auto-fix MR was not observed after "
-                f"{self.max_attempts} reconciliation attempts"
-            )
-            if run is not None:
-                self._update_run_receipt(
-                    run,
-                    receipt,
-                    state="not_observed",
-                    detail=terminal_detail,
-                    error=safe_detail,
-                )
-            elif not self.store.update_effect_receipt(
-                receipt.receipt_id,
-                state="not_observed",
-                detail=terminal_detail,
-                error=safe_detail,
-                next_attempt_at=None,
-                claim_token=claim_token,
-            ):
-                raise LeaseLostError(
-                    "Auto-fix reconciliation lease was lost before exhaustion"
-                )
-            return False
-        next_attempt_at = (
-            datetime.now(UTC) + timedelta(seconds=self._backoff(receipt.attempt))
-        ).isoformat()
-        if run is not None:
-            self._update_run_receipt(
-                run,
-                receipt,
-                state="pending",
-                detail="Auto-fix MR not yet observable; reconciliation will retry",
-                error=safe_detail,
-                next_attempt_at=next_attempt_at,
-            )
-        elif not self.store.update_effect_receipt(
-            receipt.receipt_id,
-            state="pending",
-            detail="Auto-fix MR not yet observable; reconciliation will retry",
-            error=safe_detail,
-            next_attempt_at=next_attempt_at,
-            claim_token=claim_token,
-        ):
-            raise LeaseLostError(
-                "Auto-fix reconciliation lease was lost before scheduling retry"
-            )
-        return True
-
-    def record_if_created(
-        self,
-        run: ReviewRun,
-        merge_request,
-        receipts: dict[str, EffectReceipt],
-    ) -> str | None:
-        """Observe an Auto-fix MR immediately after the Agent returns."""
-
-        branch = f"autofix/MR-{merge_request.iid}/run-{run.run_id}"
-        reconciliation = receipts.get("autofix_reconciliation")
-        if reconciliation is None:
-            return "Auto-fix reconciliation receipt is missing"
-        if reconciliation.dedupe_key != branch:
-            detail = "Auto-fix reconciliation receipt branch does not match the Review Run"
-            self._update_run_receipt(
-                run,
-                reconciliation,
-                state="failed",
-                detail="Auto-fix identity validation failed",
-                error=detail,
-            )
-            return detail
-        if not self.store.has_active_lease(run.run_id, run.claim_token):
-            raise LeaseLostError("Review Run lease lost before Auto-fix reconciliation")
-        try:
-            auto_fix = self.gitlab.find_merge_request_by_source_branch(
-                run.project_id,
-                branch,
-                merge_request.source_branch,
-                auto_fix_intent_marker(run.run_id, run.sha),
-            )
-        except Exception as exc:  # noqa: BLE001 - receipt retains retryable API failures
-            failure = classify_exception(exc, secrets=self._secrets())
-            if failure.retryable:
-                self.schedule(reconciliation, failure.detail, run=run)
-            else:
-                self._update_run_receipt(
-                    run,
-                    reconciliation,
-                    state="failed",
-                    error=failure.detail,
-                    detail="Auto-fix reconciliation failed terminally",
-                )
-            return None
-        if auto_fix is None:
-            self.schedule(reconciliation, "Auto-fix MR was not observed yet", run=run)
-            return None
-        identity_error = self.validate_identity(
-            run,
-            merge_request,
-            auto_fix,
-            parent_mr_iid=run.mr_iid,
-            expected_branch=branch,
-        )
-        if identity_error is not None:
-            self._update_run_receipt(
-                run,
-                reconciliation,
-                state="failed",
-                detail="Auto-fix identity validation failed",
-                error=identity_error,
-            )
-            return identity_error
-        self.record_observed(
-            run,
-            auto_fix,
-            reconciliation,
-            run_claim_token=run.claim_token,
-        )
-        return None
-
-    def _reject(
-        self,
-        run: ReviewRun,
-        receipt: EffectReceipt,
-        detail: str,
+        confirm_absent: bool = False,
     ) -> AutoFixReconciliationResult:
-        updated = self.store.update_effect_receipt(
-            receipt.receipt_id,
-            state="failed",
-            detail="Auto-fix identity validation failed",
-            error=detail,
-            claim_token=receipt.claim_token,
-        )
-        if not updated:
-            return AutoFixReconciliationResult(
-                run.run_id,
-                "deferred",
-                "Auto-fix reconciliation lease lost; reclaim will recover",
-            )
-        self.store.abandon_auto_fix_intent(run.run_id)
-        self._log_run(
-            run,
-            status="failed",
-            level=logging.ERROR,
-            diagnostic=detail,
-            failure_class="autofix_identity",
-        )
-        return AutoFixReconciliationResult(run.run_id, "failed", detail)
-
-    def _complete_missing(
-        self,
-        run: ReviewRun,
-        receipt: EffectReceipt,
-        detail: str,
-    ) -> AutoFixReconciliationResult:
-        scheduled = self.schedule(
-            receipt,
+        retrying = self.store.defer_auto_fix_reconciliation_plan(
+            plan.plan_id,
+            plan.claim_token,
             detail,
-            claim_token=receipt.claim_token,
-        )
-        if not scheduled:
-            self.store.abandon_auto_fix_intent(run.run_id)
-        result_detail = (
-            "Auto-fix reconciliation pending"
-            if scheduled
-            else "Auto-fix reconciliation exhausted; not observed"
-        )
-        self._log_run(
-            run,
-            status="deferred" if scheduled else "succeeded",
-            diagnostic=result_detail,
+            delay_seconds=self._delay(plan.attempts),
+            max_attempts=self.max_attempts,
+            confirm_absent=confirm_absent,
         )
         return AutoFixReconciliationResult(
-            run.run_id,
-            "deferred" if scheduled else "succeeded",
-            result_detail,
+            plan.run_id,
+            "deferred" if retrying else "blocked",
+            self._redact(detail),
         )
 
-    def _reconcile_receipt(
-        self,
-        receipt: EffectReceipt,
+    def _block_plan(
+        self, plan: AutoFixPublicationPlan, detail: str
     ) -> AutoFixReconciliationResult:
-        run = self.store.get_review_run(receipt.run_id)
-        if run is None:
-            self.store.update_effect_receipt(
-                receipt.receipt_id,
-                state="failed",
-                error="Review Run no longer exists",
-                claim_token=receipt.claim_token,
-            )
-            log_event(
-                LOGGER,
-                logging.ERROR,
-                secrets=self._secrets(),
-                event="worker.autofix_reconcile",
-                status="failed",
-                correlation_id=f"review-run:{receipt.run_id}",
-                run_id=receipt.run_id,
-                diagnostic="Review Run no longer exists",
-            )
-            return AutoFixReconciliationResult(
-                receipt.run_id,
-                "failed",
-                "Review Run no longer exists",
-            )
-        if run.project_id != self.project_id:
-            detail = "Auto-fix reconciliation receipt belongs to a different project"
-            self.store.update_effect_receipt(
-                receipt.receipt_id,
-                state="failed",
-                detail="Auto-fix reconciliation project scope mismatch",
-                error=detail,
-                claim_token=receipt.claim_token,
-            )
-            self._log_run(
-                run,
-                status="failed",
-                level=logging.ERROR,
-                diagnostic=detail,
-                failure_class="project_mismatch",
-            )
-            return AutoFixReconciliationResult(receipt.run_id, "failed", detail)
-        expected_branch = f"autofix/MR-{run.mr_iid}/run-{run.run_id}"
-        expected_receipt = next(
-            (
-                item
-                for item in self.store.list_effect_receipts(
-                    run.run_id, "autofix_expected"
-                )
-                if item.dedupe_key == expected_branch
-            ),
-            None,
+        persisted = self.store.finish_auto_fix_publication_plan(
+            plan.plan_id,
+            plan.claim_token,
+            state="blocked",
+            error=detail,
         )
+        return AutoFixReconciliationResult(
+            plan.run_id,
+            "blocked" if persisted else "deferred",
+            self._redact(detail),
+        )
+
+    def _validate_child(
+        self,
+        plan: AutoFixPublicationPlan,
+        child: CreatedMergeRequest,
+        *,
+        branch: str,
+        target_branch: str,
+    ) -> str | None:
         if (
-            parse_auto_fix_branch(receipt.dedupe_key) != (run.mr_iid, run.run_id)
-            or receipt.dedupe_key != expected_branch
+            child.project_id != self.project_id
+            or child.iid <= 0
+            or child.source_branch != branch
+            or child.target_branch != target_branch
+            or plan.marker not in child.description
+            or not child.author_username.strip()
+            or not child.web_url
         ):
-            return self._reject(
-                run,
-                receipt,
-                "Auto-fix reconciliation branch does not match the Review Run",
+            return "reconciled Auto-fix MR identity conflicts with the frozen Plan"
+        state = str(child.state or "opened").lower()
+        if state not in {"opened", "closed", "merged"}:
+            return "reconciled Auto-fix MR returned an unknown state"
+        if state == "merged" and not is_valid_sha(child.merged_sha):
+            return "reconciled merged Auto-fix MR has no valid merge SHA"
+        return None
+
+    def _complete_plan(
+        self,
+        plan: AutoFixPublicationPlan,
+        child: CreatedMergeRequest,
+        *,
+        branch: str,
+        target_branch: str,
+        parent_author: str,
+    ) -> AutoFixReconciliationResult:
+        completed = self.store.complete_auto_fix_publication(
+            plan.plan_id,
+            plan.claim_token,
+            auto_fix_project_id=child.project_id,
+            auto_fix_mr_iid=child.iid,
+            source_branch=child.source_branch,
+            target_branch=child.target_branch,
+            marker=plan.marker,
+            title=f"Auto-fix review: !{child.iid} {child.title}",
+            body="A Program-owned Auto-fix Merge Request is ready for review.",
+            url=child.web_url,
+            recipients=(parent_author,),
+            channels=self.notifier.channel_specs(),
+        )
+        if completed is None:
+            return AutoFixReconciliationResult(
+                plan.run_id,
+                "deferred",
+                "Auto-fix reconciliation lease was lost before Relation persistence",
             )
-        if expected_receipt is None:
-            return self._reject(
-                run,
-                receipt,
-                "Auto-fix expected receipt is missing for reconciliation",
-            )
+        state = str(child.state or "opened").lower()
+        self.store.observe_program_auto_fix_webhook(
+            child.project_id,
+            child.iid,
+            status=state,
+            merged_sha=child.merged_sha,
+            source_branch=branch,
+            target_branch=target_branch,
+            description=child.description,
+        )
+        return AutoFixReconciliationResult(
+            plan.run_id,
+            "succeeded",
+            f"reconciled Auto-fix Merge Request !{child.iid}",
+        )
+
+    def _reconcile_plan(
+        self, plan: AutoFixPublicationPlan
+    ) -> AutoFixReconciliationResult:
         try:
-            parent_merge_request = self.gitlab.get_merge_request(
-                run.project_id, run.mr_iid
-            )
+            payload = self._payload(plan)
+            review_key = payload["review_key"]
+            if not isinstance(review_key, dict):
+                raise TypeError("uncertain Auto-fix ReviewKey is invalid")
+            project_id = str(review_key["project_id"])
+            mr_iid = int(review_key["mr_iid"])
+            sha = str(review_key["sha"])
+            branch = str(payload["branch"])
+            target_branch = str(payload["target_branch"])
+            title = str(payload["title"])
+            readiness = str(payload["initial_readiness"])
+            if project_id != self.project_id:
+                raise ValueError("uncertain Auto-fix Plan belongs to another Project")
+            if not is_valid_sha(sha):
+                raise ValueError("uncertain Auto-fix ReviewKey SHA is invalid")
+            if readiness not in {"draft", "ready"}:
+                raise ValueError("uncertain Auto-fix readiness is invalid")
+            parent = self.gitlab.get_merge_request(project_id, mr_iid)
             if (
-                getattr(parent_merge_request, "project_id", None) != run.project_id
-                or getattr(parent_merge_request, "iid", None) != run.mr_iid
-                or getattr(parent_merge_request, "source_branch", None) in {None, ""}
+                parent.project_id != project_id
+                or parent.iid != mr_iid
+                or not parent.author_username.strip()
             ):
-                return self._reject(
-                    run,
-                    receipt,
-                    "Auto-fix parent Merge Request identity does not match the Review Run",
-                )
-            auto_fix = self.gitlab.find_merge_request_by_source_branch(
-                run.project_id,
-                receipt.dedupe_key,
-                parent_merge_request.source_branch,
-                auto_fix_intent_marker(run.run_id, run.sha),
+                raise ValueError("Auto-fix parent identity is invalid during reconciliation")
+            child = self.gitlab.find_merge_request_by_source_branch(
+                project_id, branch, target_branch, plan.marker
             )
-            if auto_fix is None:
-                return self._complete_missing(
-                    run,
-                    receipt,
-                    "Auto-fix MR is still not observable",
+            if child is None:
+                if plan.branch_commit_sha is None:
+                    return self._defer_plan(
+                        plan,
+                        "uncertain Auto-fix commit has no confirmed MR or persisted commit identity",
+                    )
+                if plan.absence_confirmations < 1:
+                    return self._defer_plan(
+                        plan,
+                        "Auto-fix MR absence requires a second delayed confirmation",
+                        confirm_absent=True,
+                    )
+                if (
+                    str(parent.state or "opened").lower() != "opened"
+                    or parent.source_project_id != project_id
+                    or parent.source_branch != target_branch
+                    or parent.sha != sha
+                ):
+                    return self._block_plan(
+                        plan,
+                        "parent MR no longer permits recovery of a missing Auto-fix MR",
+                    )
+                if not self.store.extend_auto_fix_publication_lease(
+                    plan.plan_id, plan.claim_token, self.lease_seconds
+                ):
+                    return AutoFixReconciliationResult(
+                        plan.run_id,
+                        "deferred",
+                        "Auto-fix reconciliation lease was lost before MR recovery",
+                    )
+                child = self.gitlab.create_merge_request(
+                    project_id,
+                    title,
+                    branch,
+                    target_branch,
+                    plan.marker,
+                    draft=readiness == "draft",
                 )
-            identity_error = self.validate_identity(
-                run,
-                parent_merge_request,
-                auto_fix,
-                parent_mr_iid=run.mr_iid,
-                expected_branch=expected_branch,
+            identity_error = self._validate_child(
+                plan, child, branch=branch, target_branch=target_branch
             )
             if identity_error is not None:
-                return self._reject(run, receipt, identity_error)
-            self.record_observed(
-                run,
-                auto_fix,
-                receipt,
-                claim_token=receipt.claim_token,
+                return self._block_plan(plan, identity_error)
+            return self._complete_plan(
+                plan,
+                child,
+                branch=branch,
+                target_branch=target_branch,
+                parent_author=parent.author_username,
             )
-            self._log_run(
-                run,
-                status="succeeded",
-                diagnostic="Auto-fix reconciliation observed",
-            )
-            return AutoFixReconciliationResult(
-                run.run_id,
-                "succeeded",
-                "Auto-fix reconciliation observed",
-            )
-        except LeaseLostError:
-            return AutoFixReconciliationResult(
-                run.run_id,
-                "deferred",
-                "Auto-fix reconciliation lease lost; reclaim will recover",
-            )
-        except Exception as exc:  # noqa: BLE001 - keep reconciliation independently retryable
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            return self._block_plan(plan, str(exc))
+        except Exception as exc:  # noqa: BLE001 - exceptional work remains durable
             failure = classify_exception(exc, secrets=self._secrets())
             if failure.retryable:
-                try:
-                    result = self._complete_missing(run, receipt, failure.detail)
-                except LeaseLostError:
-                    return AutoFixReconciliationResult(
-                        run.run_id,
-                        "deferred",
-                        "Auto-fix reconciliation lease lost; reclaim will recover",
-                    )
-                self._log_run(
-                    run,
-                    status=result.status,
-                    level=logging.WARNING,
-                    diagnostic=(
-                        failure.detail
-                        if result.status == "deferred"
-                        else "Auto-fix reconciliation exhausted; not observed"
-                    ),
-                    failure_class=failure.failure_class,
-                )
+                return self._defer_plan(plan, failure.detail)
+            return self._block_plan(plan, failure.detail)
+
+    def _defer_relation(
+        self, relation: ProgramAutoFixRelation, detail: str
+    ) -> AutoFixReconciliationResult:
+        persisted = self.store.defer_program_auto_fix_relation_reconciliation(
+            relation.relation_id,
+            relation.reconcile_claim_token,
+            detail,
+            retry_delay_seconds=self._delay(relation.reconcile_attempts),
+        )
+        return AutoFixReconciliationResult(
+            relation.run_id,
+            "deferred",
+            self._redact(detail) if persisted else "Relation reconciliation lease was lost",
+        )
+
+    def _reconcile_relation(
+        self, relation: ProgramAutoFixRelation
+    ) -> AutoFixReconciliationResult:
+        try:
+            child = self.gitlab.get_merge_request(
+                relation.auto_fix_project_id, relation.auto_fix_mr_iid
+            )
+            state = str(child.state or "opened").lower()
+            if (
+                child.project_id != relation.auto_fix_project_id
+                or child.iid != relation.auto_fix_mr_iid
+                or not child.author_username.strip()
+                or state not in {"opened", "closed", "merged"}
+                or (state == "merged" and not is_valid_sha(child.merged_sha))
+            ):
+                raise ValueError("known Auto-fix Relation returned conflicting identity")
+            persisted = self.store.finish_program_auto_fix_relation_reconciliation(
+                relation.relation_id,
+                relation.reconcile_claim_token,
+                status=state,
+                merged_sha=child.merged_sha,
+                source_branch=child.source_branch,
+                target_branch=child.target_branch,
+                description=child.description,
+                source_sha=child.sha,
+                retry_delay_seconds=self.relation_refresh_seconds,
+            )
+            if not persisted:
                 return AutoFixReconciliationResult(
-                    run.run_id,
-                    result.status,
-                    (
-                        "Auto-fix reconciliation retry scheduled"
-                        if result.status == "deferred"
-                        else "Auto-fix reconciliation exhausted; not observed"
-                    ),
+                    relation.run_id,
+                    "deferred",
+                    "Relation reconciliation lease was lost",
                 )
-            updated = self.store.update_effect_receipt(
-                receipt.receipt_id,
-                state="failed",
-                detail="Auto-fix reconciliation failed terminally",
-                error=failure.detail,
-                claim_token=receipt.claim_token,
-            )
-            if updated:
-                self.store.abandon_auto_fix_intent(run.run_id)
-            self._log_run(
-                run,
-                status="failed",
-                level=logging.ERROR,
-                diagnostic=failure.detail,
-                failure_class=failure.failure_class,
-            )
-            return AutoFixReconciliationResult(run.run_id, "failed", failure.detail)
+            current = self.store.get_program_auto_fix_relation(relation.plan_id)
+            detail = "Auto-fix Relation refreshed"
+            if current is not None and current.divergence:
+                detail = f"Auto-fix Relation diverged: {current.divergence}"
+            return AutoFixReconciliationResult(relation.run_id, "succeeded", detail)
+        except Exception as exc:  # noqa: BLE001 - relation refresh is independently retried
+            return self._defer_relation(relation, str(exc))
 
     def process(self, limit: int = 1) -> tuple[AutoFixReconciliationResult, ...]:
-        """Claim and reconcile a bounded batch of pending Auto-fix receipts."""
-
         if limit <= 0:
             raise ValueError("Auto-fix reconciliation limit must be positive")
-        receipts = self.store.claim_pending_effect_receipts(
-            "autofix_reconciliation",
-            limit=limit,
-            lease_seconds=min(
-                DEFAULT_EFFECT_LEASE_SECONDS,
-                max(self.run_lease_seconds, 1),
-            ),
-            max_attempts=self.max_attempts,
-            project_id=self.project_id,
-        )
-        return tuple(self._reconcile_receipt(receipt) for receipt in receipts)
+        results: list[AutoFixReconciliationResult] = []
+        for _ in range(limit):
+            plan = self.store.claim_auto_fix_reconciliation_plan(
+                project_id=self.project_id,
+                lease_seconds=self.lease_seconds,
+            )
+            if plan is not None:
+                results.append(self._reconcile_plan(plan))
+                continue
+            relation = self.store.claim_program_auto_fix_relation(
+                project_id=self.project_id,
+                lease_seconds=self.lease_seconds,
+            )
+            if relation is None:
+                break
+            results.append(self._reconcile_relation(relation))
+        return tuple(results)

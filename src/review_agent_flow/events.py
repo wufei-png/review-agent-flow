@@ -9,7 +9,15 @@ from typing import Any
 from .gitlab import is_valid_sha
 
 AUTO_FIX_TITLE_PREFIX = "[ReviewFlow Auto-Fix]"
-AUTO_FIX_BRANCH_RE = re.compile(r"^autofix/MR-(?P<mr_iid>\d+)/run-(?P<run_id>\d+)$")
+AUTO_FIX_BRANCH_RE = re.compile(
+    r"^autofix/MR-(?P<mr_iid>\d+)/sha-(?P<sha>[0-9a-fA-F]{40}|[0-9a-fA-F]{64})/"
+    r"intent-(?P<nonce>[0-9a-f]{32})$"
+)
+AUTO_FIX_MARKER_RE = re.compile(
+    r"<!-- reviewflow:v1;project=(?P<project>[^;\s]+);mr=(?P<mr_iid>\d+);"
+    r"sha=(?P<sha>[0-9a-fA-F]{40}|[0-9a-fA-F]{64});effect=autofix;"
+    r"intent=(?P<nonce>[0-9a-f]{32});plan_sha256=(?P<digest>[0-9a-f]{64}) -->"
+)
 
 
 @dataclass(frozen=True)
@@ -30,11 +38,31 @@ class WebhookDecision:
     action: str | None = None
 
 
-def parse_auto_fix_branch(branch: str) -> tuple[int, int] | None:
+def parse_auto_fix_branch(branch: str) -> tuple[int, str, str] | None:
     match = AUTO_FIX_BRANCH_RE.fullmatch(branch)
     if match is None:
         return None
-    return int(match.group("mr_iid")), int(match.group("run_id"))
+    return (
+        int(match.group("mr_iid")),
+        match.group("sha").lower(),
+        match.group("nonce"),
+    )
+
+
+def parse_auto_fix_marker(
+    body: str | None,
+) -> tuple[str, int, str, str, str] | None:
+    for line in (body or "").splitlines():
+        match = AUTO_FIX_MARKER_RE.fullmatch(line)
+        if match is not None:
+            return (
+                match.group("project"),
+                int(match.group("mr_iid")),
+                match.group("sha").lower(),
+                match.group("nonce"),
+                match.group("digest"),
+            )
+    return None
 
 
 def _int_or_none(value: Any) -> int | None:
@@ -85,8 +113,7 @@ def _parse_merge_request(payload: dict[str, Any]) -> WebhookDecision:
     if not project_id or mr_iid is None:
         return WebhookDecision(False, "missing project, MR IID, or SHA")
 
-    if attrs.get("work_in_progress") is True or attrs.get("draft") is True:
-        return WebhookDecision(False, "draft merge request", project_id=project_id, mr_iid=mr_iid)
+    is_draft = attrs.get("work_in_progress") is True or attrs.get("draft") is True
 
     title = str(attrs.get("title") or "")
     source_branch = attrs.get("source_branch")
@@ -120,7 +147,7 @@ def _parse_merge_request(payload: dict[str, Any]) -> WebhookDecision:
             **common,
         )
 
-    if action and action not in {"open", "reopen", "update"}:
+    if action and action not in {"open", "reopen", "update", "close"}:
         return WebhookDecision(
             False,
             f"ignored merge request action: {action}",
@@ -144,7 +171,7 @@ def _parse_merge_request(payload: dict[str, Any]) -> WebhookDecision:
     return WebhookDecision(
         True,
         "merge request",
-        kind="normal",
+        kind="close" if action == "close" else ("draft" if is_draft else "normal"),
         sha=str(sha),
         author_username=_user_username(payload, attrs),
         **common,

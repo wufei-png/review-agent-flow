@@ -46,7 +46,7 @@ After GitLab returns the child identity, ReviewFlow persists the Auto-fix Relati
 
 Presentation changes after creation, including title, description text around the marker and Draft/Ready state, do not invalidate a Relation. Source/target/tree drift is observed as divergence; ReviewFlow never force-updates user changes. A Relation records opened, closed and merged states, including the merge SHA used to suppress only that exact parent SHA.
 
-The Reconciler searches only when an external result is uncertain, a process may have crashed, relation state may have changed or an Operator requested recovery. The normal path does not search for Agent-created artifacts because the Agent cannot create them.
+The Reconciler searches only when an external result is uncertain, a process may have crashed, relation state may have changed or an Operator requested recovery. The normal path does not search for Agent-created artifacts because the Agent cannot create them. After an ambiguous create-MR result it requires two delayed, unique zero-candidate observations before recreating the MR, and only when the branch commit identity is already durable and the parent still matches the frozen exact SHA. An ambiguous commit without a durable commit identity is never reissued automatically.
 
 ## Human notifications
 

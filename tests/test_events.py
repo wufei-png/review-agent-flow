@@ -1,8 +1,14 @@
-from review_agent_flow.events import parse_auto_fix_branch, parse_webhook, parse_webhooks
+from review_agent_flow.events import (
+    parse_auto_fix_branch,
+    parse_auto_fix_marker,
+    parse_webhook,
+    parse_webhooks,
+)
 
 SHA = "a" * 40
 MERGED_SHA = "b" * 40
 PIPELINE_SHA = "c" * 40
+NONCE = "d" * 32
 
 
 def _merge_request_payload(**attrs):
@@ -37,13 +43,32 @@ def test_auto_fix_shaped_merge_request_is_not_trusted_by_parser() -> None:
         "Merge Request Hook",
         _merge_request_payload(
             title="[ReviewFlow Auto-Fix] Improve validation",
-            source_branch="autofix/MR-1/run-7",
+            source_branch=f"autofix/MR-1/sha-{SHA}/intent-{NONCE}",
         ),
     )
     assert decision.accepted is True
     assert decision.kind == "normal"
     assert decision.parent_mr_iid is None
-    assert parse_auto_fix_branch("autofix/MR-1/run-7") == (1, 7)
+    assert parse_auto_fix_branch(
+        f"autofix/MR-1/sha-{SHA}/intent-{NONCE}"
+    ) == (1, SHA, NONCE)
+    assert parse_auto_fix_branch("autofix/MR-1/run-7") is None
+
+
+def test_canonical_auto_fix_marker_is_recognized_only_as_an_exact_line() -> None:
+    marker = (
+        f"<!-- reviewflow:v1;project=42;mr=1;sha={SHA};effect=autofix;"
+        f"intent={NONCE};plan_sha256={'e' * 64} -->"
+    )
+
+    assert parse_auto_fix_marker(f"context\n{marker}") == (
+        "42",
+        1,
+        SHA,
+        NONCE,
+        "e" * 64,
+    )
+    assert parse_auto_fix_marker(f"prefix {marker}") is None
 
 
 def test_failed_pipeline_is_ignored() -> None:
@@ -64,7 +89,7 @@ def test_auto_fix_merge_event_carries_the_resulting_parent_sha() -> None:
         _merge_request_payload(
             action="merge",
             title="[ReviewFlow Auto-Fix] Improve validation",
-            source_branch="autofix/MR-1/run-7",
+            source_branch=f"autofix/MR-1/sha-{SHA}/intent-{NONCE}",
             merge_commit_sha=MERGED_SHA,
         ),
     )

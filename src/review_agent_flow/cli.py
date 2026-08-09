@@ -94,6 +94,9 @@ def _run_worker(args: argparse.Namespace) -> int:
     )
     if args.once:
         result = worker.process_one()
+        if result is None:
+            result = worker.reconcile_auto_fixes(limit=1)
+        worker.process_worktree_cleanup(limit=1)
         worker.notification_dispatcher.process_channel_batch()
         if result is None:
             print(json.dumps({"status": "idle"}))

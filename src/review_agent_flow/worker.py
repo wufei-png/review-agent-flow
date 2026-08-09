@@ -5,9 +5,10 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
-import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from queue import Empty, Queue
 from threading import Event, Thread
 
 from .auto_fix_reconciler import AutoFixReconciler
@@ -18,6 +19,7 @@ from .autofix_planner import (
     run_verifier,
 )
 from .autofix_publisher import AutoFixPublisher
+from .events import parse_auto_fix_branch, parse_auto_fix_marker
 from .failures import FailureInfo, classify_exception
 from .gitlab import GitLabClient, canonical_note_marker, is_valid_sha
 from .note_publisher import NotePublisher
@@ -168,6 +170,7 @@ class ReviewWorker:
             max_attempts=reconciliation_max_attempts,
             retry_delay_seconds=retry_delay_seconds,
             max_retry_delay_seconds=max_retry_delay_seconds,
+            notifier=self.notifier,
             secret_provider=self._redaction_secrets,
         )
         self.sha_ensurer = sha_ensurer or GitShaEnsurer(repository)
@@ -330,15 +333,15 @@ class ReviewWorker:
                     return self._lease_recovery_result(run, detail)
                 return WorkerResult(run.run_id, "cancelled", detail=detail)
 
-            auto_fix_match = self.store.resolve_auto_fix_match(
-                run.project_id,
-                run.mr_iid,
-                merge_request.source_branch,
-                merge_request.target_branch,
-                merge_request.description,
+            auto_fix_relation = self.store.get_program_auto_fix_relation_by_child(
+                run.project_id, run.mr_iid
             )
-            if auto_fix_match is not None:
-                detail = "known Auto-fix child does not create or execute a Review Run"
+            if (
+                auto_fix_relation is not None
+                or parse_auto_fix_branch(merge_request.source_branch) is not None
+                or parse_auto_fix_marker(merge_request.description) is not None
+            ):
+                detail = "Auto-fix child does not create or execute a Review Run"
                 if not self._finish_terminal(run, "cancelled", detail, "autofix_child"):
                     return self._lease_recovery_result(run, detail)
                 return WorkerResult(run.run_id, "cancelled", detail=detail)
@@ -902,31 +905,74 @@ class ReviewWorker:
         )
 
     def run_forever(self, poll_interval_seconds: float = 5.0) -> None:
-        notification_stop = Event()
-        notification_thread = Thread(
-            target=self.notification_dispatcher.run_forever,
-            kwargs={
-                "poll_interval_seconds": min(max(poll_interval_seconds, 0.1), 1.0),
-                "stop_event": notification_stop,
-            },
-            name="reviewflow-notification-dispatcher",
-        )
-        notification_thread.start()
-        try:
-            while True:
+        if poll_interval_seconds <= 0:
+            raise ValueError("Worker poll interval must be positive")
+        stop_event = Event()
+        failures: Queue[tuple[str, BaseException]] = Queue()
+
+        def review_publication_loop() -> None:
+            while not stop_event.is_set():
                 result = self.process_one()
+                if result is None or result.status == "deferred":
+                    stop_event.wait(poll_interval_seconds)
+
+        def reconciliation_cleanup_loop() -> None:
+            while not stop_event.is_set():
                 cleanup_count = self.process_worktree_cleanup(limit=1)
                 reconciliation = self.reconcile_auto_fixes(limit=1)
-                if (
-                    result is None
-                    or result.status == "deferred"
-                    or cleanup_count > 0
-                    or (reconciliation is not None and reconciliation.status == "deferred")
-                ):
-                    time.sleep(poll_interval_seconds)
+                if cleanup_count == 0 and reconciliation is None:
+                    stop_event.wait(poll_interval_seconds)
+
+        def supervise(name: str, target: Callable[[], None]) -> None:
+            try:
+                target()
+            except BaseException as exc:  # noqa: BLE001 - any loop exit restarts the Worker
+                failures.put((name, exc))
+                stop_event.set()
+            else:
+                if not stop_event.is_set():
+                    failures.put((name, RuntimeError(f"{name} exited unexpectedly")))
+                    stop_event.set()
+
+        loops = (
+            (
+                "Review/Publication loop",
+                review_publication_loop,
+            ),
+            (
+                "Notification loop",
+                lambda: self.notification_dispatcher.run_forever(
+                    poll_interval_seconds=min(max(poll_interval_seconds, 0.1), 1.0),
+                    stop_event=stop_event,
+                ),
+            ),
+            (
+                "Reconciliation/Cleanup loop",
+                reconciliation_cleanup_loop,
+            ),
+        )
+        threads = [
+            Thread(
+                target=supervise,
+                args=(name, target),
+                name=f"reviewflow-{name.lower().replace('/', '-').replace(' ', '-')}",
+                daemon=True,
+            )
+            for name, target in loops
+        ]
+        for thread in threads:
+            thread.start()
+        try:
+            while True:
+                try:
+                    name, error = failures.get(timeout=0.5)
+                except Empty:
+                    continue
+                raise RuntimeError(f"{name} failed; supervised Worker must restart") from error
         finally:
-            notification_stop.set()
-            notification_thread.join()
+            stop_event.set()
+            for thread in threads:
+                thread.join(timeout=1.0)
 
     def process_worktree_cleanup(self, limit: int = 1) -> int:
         if limit <= 0:

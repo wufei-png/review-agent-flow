@@ -25,7 +25,7 @@ from review_agent_flow.operator_config import (
 from review_agent_flow.policy import AIPolicy as ProjectAIPolicy
 from review_agent_flow.policy import HumanPolicy, ReviewPolicy
 from review_agent_flow.runner import AgentResult
-from review_agent_flow.store import SQLiteStore, auto_fix_intent_marker
+from review_agent_flow.store import SQLiteStore
 from review_agent_flow.worker import ReviewWorker as ProductionReviewWorker
 from review_agent_flow.worktree import GitWorktreeManager, WorktreeError
 
@@ -727,6 +727,33 @@ def test_worker_services_pending_publication_before_new_review_run(
     assert claimed is not None and claimed.run_id == queued.run_id
 
 
+def test_supervised_worker_fails_when_one_independent_loop_exits(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    sha = _git_repository(repository)
+    worker = ReviewWorker(
+        SQLiteStore(tmp_path / "review.db"),
+        FakeGitLab(
+            MergeRequest("42", 1, "Parent", "alice", "feature", "main", sha, "https://mr")
+        ),
+        GitWorktreeManager(repository, tmp_path / "worktrees"),
+        ReviewPolicy(),
+        repository,
+        "https://gitlab",
+        project_id="42",
+    )
+
+    def fail_review_loop():
+        raise RuntimeError("review loop crashed")
+
+    monkeypatch.setattr(worker, "process_one", fail_review_loop)
+
+    with pytest.raises(RuntimeError, match="Review/Publication loop failed"):
+        worker.run_forever(0.01)
+
+
 def test_workspace_diff_without_proposal_blocks_only_auto_fix(tmp_path: Path) -> None:
     repository = tmp_path / "repo"
     repository.mkdir()
@@ -1377,49 +1404,6 @@ def test_worker_does_not_reconcile_another_project_receipt(tmp_path: Path) -> No
     assert saved.state == "pending"
 
 
-def test_worker_rejects_cross_project_claim_before_gitlab_lookup(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    repository = tmp_path / "repo"
-    repository.mkdir()
-    sha = "f" * 40
-    store = SQLiteStore(tmp_path / "review.db")
-    run = store.enqueue("99", 1, sha)
-    receipt = store.create_effect_receipt(
-        run.run_id,
-        "autofix_reconciliation",
-        "autofix/MR-1/run-1",
-        state="pending",
-    )
-    gitlab = EventualAutoFixGitLab(
-        MergeRequest("99", 1, "Other project", "alice", "feature", "main", sha, "https://mr")
-    )
-    monkeypatch.setattr(
-        store,
-        "claim_pending_effect_receipts",
-        lambda *args, **kwargs: (receipt,),
-    )
-    worker = ReviewWorker(
-        store,
-        gitlab,
-        GitWorktreeManager(repository, tmp_path / "worktrees"),
-        ReviewPolicy(),
-        repository,
-        "https://gitlab",
-        project_id="42",
-    )
-
-    result = worker.reconcile_auto_fixes()
-
-    assert result is not None and result.status == "failed"
-    assert gitlab.get_calls == 0
-    assert gitlab.find_calls == 0
-    saved = store.get_effect_receipt(receipt.receipt_id)
-    assert saved is not None
-    assert saved.state == "failed"
-
-
 def test_retryable_gitlab_failure_requeues_then_fails_at_attempt_cap(tmp_path: Path) -> None:
     repository = tmp_path / "repo"
     repository.mkdir()
@@ -1750,18 +1734,17 @@ def test_known_autofix_child_pending_run_is_cancelled_before_effects(tmp_path: P
     claimed_parent = store.claim_next(project_id="42")
     assert claimed_parent is not None
     assert store.finish(parent_run.run_id, "succeeded", claim_token=claimed_parent.claim_token)
-    store.record_auto_fix("42", 1, parent_sha, parent_run.run_id, "42", 9)
     child_run = store.enqueue("42", 9, child_sha)
     child = MergeRequest(
         "42",
         9,
         "Auto-fix child",
         "review-bot",
-        "autofix/MR-1/run-1",
+        f"autofix/MR-1/sha-{parent_sha}/intent-{'d' * 32}",
         "feature",
         child_sha,
         "https://auto-fix",
-        description=auto_fix_intent_marker(parent_run.run_id, parent_sha),
+        description="Auto-fix shaped child",
     )
     worker = ReviewWorker(
         store,
@@ -1780,3 +1763,45 @@ def test_known_autofix_child_pending_run_is_cancelled_before_effects(tmp_path: P
     assert store.list_effect_receipts(child_run.run_id) == ()
     with sqlite3.connect(tmp_path / "review.db") as connection:
         assert connection.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0] == 0
+
+
+def test_autofix_marker_on_ordinary_branch_is_cancelled_before_effects(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    child_sha = "b" * 40
+    parent_sha = "a" * 40
+    nonce = "d" * 32
+    marker = (
+        f"<!-- reviewflow:v1;project=42;mr=1;sha={parent_sha};effect=autofix;"
+        f"intent={nonce};plan_sha256={'e' * 64} -->"
+    )
+    store = SQLiteStore(tmp_path / "review.db")
+    child_run = store.enqueue("42", 9, child_sha)
+    child = MergeRequest(
+        "42",
+        9,
+        "Marker-shaped child",
+        "review-bot",
+        "ordinary-looking-branch",
+        "feature",
+        child_sha,
+        "https://auto-fix",
+        description=marker,
+    )
+    worker = ReviewWorker(
+        store,
+        FakeGitLab(child),
+        GitWorktreeManager(repository, tmp_path / "worktrees"),
+        ReviewPolicy(),
+        repository,
+        "https://gitlab",
+        project_id="42",
+    )
+
+    result = worker.process_one()
+
+    assert result is not None and result.run_id == child_run.run_id
+    assert result.status == "cancelled"
+    assert store.list_effect_receipts(child_run.run_id) == ()

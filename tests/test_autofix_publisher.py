@@ -1,6 +1,7 @@
 import sqlite3
 from pathlib import Path
 
+from review_agent_flow.auto_fix_reconciler import AutoFixReconciler
 from review_agent_flow.autofix_publisher import AutoFixPublisher
 from review_agent_flow.gitlab import CreatedCommit, CreatedMergeRequest, MergeRequest
 from review_agent_flow.notifications import FanoutNotifier, NotificationEvent, NotificationResult
@@ -23,6 +24,9 @@ class FakeGitLab:
         self.parent = parent
         self.get_failures = 0
         self.commit_error: Exception | None = None
+        self.mr_error: Exception | None = None
+        self.found_merge_request: CreatedMergeRequest | None = None
+        self.child_lookup: MergeRequest | None = None
         self.commit_payloads: list[dict[str, object]] = []
         self.mr_payloads: list[dict[str, object]] = []
 
@@ -30,6 +34,8 @@ class FakeGitLab:
         if self.get_failures:
             self.get_failures -= 1
             raise RuntimeError("temporary parent lookup failure")
+        if self.child_lookup is not None and mr_iid == self.child_lookup.iid:
+            return self.child_lookup
         return self.parent
 
     def create_repository_commit(
@@ -75,6 +81,8 @@ class FakeGitLab:
                 "draft": draft,
             }
         )
+        if self.mr_error is not None:
+            raise self.mr_error
         return CreatedMergeRequest(
             project_id,
             9,
@@ -86,6 +94,15 @@ class FakeGitLab:
             author_username="review-bot",
             draft=draft,
         )
+
+    def find_merge_request_by_source_branch(
+        self,
+        project_id: str,
+        source_branch: str,
+        target_branch: str,
+        marker: str | None = None,
+    ) -> CreatedMergeRequest | None:
+        return self.found_merge_request
 
 
 def _frozen_plan(tmp_path: Path) -> tuple[SQLiteStore, int, int, str]:
@@ -296,3 +313,206 @@ def test_stale_parent_supersedes_plan_without_gitlab_write(tmp_path: Path) -> No
     assert plan is not None and plan.state == "superseded"
     assert store.get_auto_fix_publication_intent(run_id).state == "superseded"
     assert store.list_effect_receipts(run_id, "autofix_plan")[0].state == "superseded"
+
+
+def test_reconciler_recovers_missing_merge_request_after_confirmed_commit(
+    tmp_path: Path,
+) -> None:
+    store, run_id, plan_id, _branch = _frozen_plan(tmp_path)
+    gitlab = FakeGitLab(
+        MergeRequest("42", 1, "Parent", "alice", "feature", "main", SHA, "https://parent")
+    )
+    gitlab.mr_error = RuntimeError("MR response lost")
+    first = _publisher(store, gitlab).process(plan_id=plan_id)
+    assert first is not None and first.status == "needs_reconciliation"
+    gitlab.mr_error = None
+    reconciler = AutoFixReconciler(
+        store,
+        gitlab,
+        "42",
+        run_lease_seconds=60,
+        retry_delay_seconds=0,
+        notifier=FanoutNotifier((Channel(),)),
+    )
+
+    absence = reconciler.process()
+    results = reconciler.process()
+
+    assert absence and absence[0].status == "deferred"
+    assert results and results[0].status == "succeeded"
+    assert len(gitlab.commit_payloads) == 1
+    assert len(gitlab.mr_payloads) == 2
+    plan = store.get_auto_fix_publication_plan(run_id)
+    assert plan is not None and plan.state == "published" and plan.plan_json is None
+    assert store.get_program_auto_fix_relation(plan_id) is not None
+    assert store.list_effect_receipts(run_id, "autofix_plan")[0].state == "published"
+
+
+def test_reconciler_does_not_reissue_an_uncertain_unrecorded_commit(
+    tmp_path: Path,
+) -> None:
+    store, run_id, plan_id, _branch = _frozen_plan(tmp_path)
+    gitlab = FakeGitLab(
+        MergeRequest("42", 1, "Parent", "alice", "feature", "main", SHA, "https://parent")
+    )
+    gitlab.commit_error = RuntimeError("commit response lost")
+    first = _publisher(store, gitlab).process(plan_id=plan_id)
+    assert first is not None and first.status == "needs_reconciliation"
+    gitlab.commit_error = None
+    reconciler = AutoFixReconciler(
+        store,
+        gitlab,
+        "42",
+        run_lease_seconds=60,
+        retry_delay_seconds=0,
+    )
+
+    results = reconciler.process()
+
+    assert results and results[0].status == "deferred"
+    assert len(gitlab.commit_payloads) == 1
+    assert gitlab.mr_payloads == []
+    plan = store.get_auto_fix_publication_plan(run_id)
+    assert plan is not None and plan.state == "needs_reconciliation"
+
+
+def test_reconciler_records_relation_tree_drift_and_merge_sha(tmp_path: Path) -> None:
+    store, _run_id, plan_id, branch = _frozen_plan(tmp_path)
+    gitlab = FakeGitLab(
+        MergeRequest("42", 1, "Parent", "alice", "feature", "main", SHA, "https://parent")
+    )
+    published = _publisher(store, gitlab).process(plan_id=plan_id)
+    assert published is not None and published.status == "published"
+    relation = store.get_program_auto_fix_relation(plan_id)
+    assert relation is not None
+    merged_sha = "b" * 40
+    gitlab.child_lookup = MergeRequest(
+        "42",
+        9,
+        "User renamed title",
+        "review-bot",
+        f"{branch}-changed",
+        "feature",
+        "e" * 40,
+        "https://gitlab/merge_requests/9",
+        description=f"context\n{relation.marker}",
+        state="merged",
+        merged_sha=merged_sha,
+    )
+    reconciler = AutoFixReconciler(
+        store,
+        gitlab,
+        "42",
+        run_lease_seconds=60,
+        relation_refresh_seconds=300,
+    )
+
+    results = reconciler.process()
+
+    assert results and results[0].status == "succeeded"
+    current = store.get_program_auto_fix_relation(plan_id)
+    assert current is not None and current.status == "merged"
+    assert current.merged_sha == merged_sha
+    assert current.divergence == "source_branch,tree"
+    assert store.is_suppressed_parent_sha("42", 1, merged_sha) is True
+
+
+def test_reconciler_rejects_missing_mr_recovery_after_parent_head_advances(
+    tmp_path: Path,
+) -> None:
+    store, _run_id, plan_id, _branch = _frozen_plan(tmp_path)
+    gitlab = FakeGitLab(
+        MergeRequest("42", 1, "Parent", "alice", "feature", "main", SHA, "https://parent")
+    )
+    gitlab.mr_error = RuntimeError("MR response lost")
+    first = _publisher(store, gitlab).process(plan_id=plan_id)
+    assert first is not None and first.status == "needs_reconciliation"
+    gitlab.mr_error = None
+    gitlab.parent = MergeRequest(
+        "42", 1, "Parent", "alice", "feature", "main", "b" * 40, "https://parent"
+    )
+    reconciler = AutoFixReconciler(
+        store,
+        gitlab,
+        "42",
+        run_lease_seconds=60,
+        retry_delay_seconds=0,
+    )
+
+    absence = reconciler.process()
+    blocked = reconciler.process()
+
+    assert absence and absence[0].status == "deferred"
+    assert blocked and blocked[0].status == "blocked"
+    assert len(gitlab.mr_payloads) == 1
+
+
+def test_relation_lookup_failure_preserves_webhook_divergence(tmp_path: Path) -> None:
+    store, _run_id, plan_id, branch = _frozen_plan(tmp_path)
+    gitlab = FakeGitLab(
+        MergeRequest("42", 1, "Parent", "alice", "feature", "main", SHA, "https://parent")
+    )
+    assert _publisher(store, gitlab).process(plan_id=plan_id).status == "published"
+    relation = store.get_program_auto_fix_relation(plan_id)
+    assert relation is not None
+    store.observe_program_auto_fix_webhook(
+        "42",
+        relation.auto_fix_mr_iid,
+        status="opened",
+        merged_sha=None,
+        source_branch=f"{branch}-changed",
+        target_branch=relation.target_branch,
+        description=relation.marker,
+        source_sha=relation.published_commit_sha,
+    )
+    reconciler = AutoFixReconciler(
+        store,
+        gitlab,
+        "42",
+        run_lease_seconds=60,
+        retry_delay_seconds=0,
+    )
+
+    results = reconciler.process()
+
+    assert results and results[0].status == "deferred"
+    current = store.get_program_auto_fix_relation(plan_id)
+    assert current is not None and current.divergence == "source_branch"
+
+
+def test_relation_refresh_cannot_overwrite_concurrent_confirmed_merge(
+    tmp_path: Path,
+) -> None:
+    store, _run_id, plan_id, _branch = _frozen_plan(tmp_path)
+    gitlab = FakeGitLab(
+        MergeRequest("42", 1, "Parent", "alice", "feature", "main", SHA, "https://parent")
+    )
+    assert _publisher(store, gitlab).process(plan_id=plan_id).status == "published"
+    claimed = store.claim_program_auto_fix_relation(project_id="42")
+    assert claimed is not None
+    merged_sha = "b" * 40
+    store.observe_program_auto_fix_webhook(
+        "42",
+        claimed.auto_fix_mr_iid,
+        status="merged",
+        merged_sha=merged_sha,
+        source_branch=claimed.source_branch,
+        target_branch=claimed.target_branch,
+        description=claimed.marker,
+    )
+
+    persisted = store.finish_program_auto_fix_relation_reconciliation(
+        claimed.relation_id,
+        claimed.reconcile_claim_token,
+        status="opened",
+        merged_sha=None,
+        source_branch=claimed.source_branch,
+        target_branch=claimed.target_branch,
+        description=claimed.marker,
+        source_sha=claimed.published_commit_sha,
+    )
+
+    assert persisted is True
+    current = store.get_program_auto_fix_relation(plan_id)
+    assert current is not None and current.status == "merged"
+    assert current.merged_sha == merged_sha

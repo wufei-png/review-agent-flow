@@ -36,6 +36,12 @@ def test_worker_resolves_relative_policy_from_repository(monkeypatch, tmp_path: 
         def process_one(self):
             return None
 
+        def reconcile_auto_fixes(self, limit):
+            return None
+
+        def process_worktree_cleanup(self, limit):
+            return 0
+
         def run_forever(self, poll_interval):
             raise AssertionError("test must use --once")
 
@@ -86,6 +92,12 @@ def test_worker_once_emits_json_run_status(monkeypatch, tmp_path: Path, capsys) 
 
         def process_one(self):
             return WorkerResult(7, "succeeded", detail="done")
+
+        def reconcile_auto_fixes(self, limit):
+            return None
+
+        def process_worktree_cleanup(self, limit):
+            return 0
 
         def run_forever(self, poll_interval):
             raise AssertionError("test must use --once")

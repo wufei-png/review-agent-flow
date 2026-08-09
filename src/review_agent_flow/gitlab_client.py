@@ -288,6 +288,7 @@ class PythonGitLabClient(GitLabClient):
         mrs = self._project(project_id).mergerequests.list(
             state="all", source_branch=source_branch, target_branch=target_branch, per_page=100
         )
+        matches: list[CreatedMergeRequest] = []
         for mr in mrs:
             description = str(getattr(mr, "description", "") or "")
             if marker is not None and marker not in description:
@@ -298,15 +299,34 @@ class PythonGitLabClient(GitLabClient):
             merged_sha = getattr(mr, "merge_commit_sha", None) or getattr(
                 mr, "merged_commit_sha", None
             )
-            return CreatedMergeRequest(
-                project_id=str(project_id),
-                iid=int(mr.iid),
-                title=str(mr.title),
-                source_branch=str(mr.source_branch),
-                target_branch=str(mr.target_branch),
-                web_url=str(mr.web_url),
-                description=description,
-                state=state,
-                merged_sha=str(merged_sha) if merged_sha else None,
+            author = getattr(mr, "author", {}) or {}
+            author_username = str(
+                author.get("username", "")
+                if isinstance(author, dict)
+                else getattr(author, "username", "")
             )
-        return None
+            if self._review_bot_username and author_username != self._review_bot_username:
+                continue
+            matches.append(
+                CreatedMergeRequest(
+                    project_id=str(project_id),
+                    iid=int(mr.iid),
+                    title=str(mr.title),
+                    source_branch=str(mr.source_branch),
+                    target_branch=str(mr.target_branch),
+                    web_url=str(mr.web_url),
+                    description=description,
+                    state=state,
+                    merged_sha=str(merged_sha) if merged_sha else None,
+                    author_username=author_username,
+                    draft=bool(
+                        getattr(mr, "draft", False)
+                        or getattr(mr, "work_in_progress", False)
+                    ),
+                )
+            )
+        if len(matches) > 1:
+            raise GitLabIdentityConflict(
+                "multiple Auto-fix Merge Requests match one frozen Publication Plan"
+            )
+        return matches[0] if matches else None

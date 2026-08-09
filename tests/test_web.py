@@ -1,12 +1,83 @@
 import pytest
 from fastapi.testclient import TestClient
 
-from review_agent_flow.store import SQLiteStore, auto_fix_intent_marker
+from review_agent_flow.store import SQLiteStore
 from review_agent_flow.web import StartupConfigurationError, create_app
 
 SHA = "a" * 40
 MERGED_SHA = "b" * 40
 PIPELINE_SHA = "c" * 40
+
+
+def _published_relation(
+    store: SQLiteStore, *, child_iid: int = 9, target_branch: str = "feature/validation"
+):
+    run = store.enqueue("42", 1, SHA)
+    claimed = store.claim_next(project_id="42")
+    assert claimed is not None
+    intent = store.create_auto_fix_publication_intent(run.run_id, claimed.claim_token)
+    assert intent is not None
+    receipt = store.create_effect_receipt(
+        run.run_id,
+        "autofix_plan",
+        f"autofix-intent:{intent.nonce}",
+        state="planned",
+    )
+    branch = f"autofix/MR-1/sha-{SHA}/intent-{intent.nonce}"
+    payload = {
+        "version": 1,
+        "review_key": {"project_id": "42", "mr_iid": 1, "sha": SHA},
+        "intent": {"generation": 1, "nonce": intent.nonce},
+        "proposal_summary": "Apply fix",
+        "candidate_sha256": "c" * 64,
+        "actions": [
+            {
+                "action": "update",
+                "file_path": "README.md",
+                "content": "fixed\n",
+                "execute_filemode": False,
+            }
+        ],
+        "verification": {"candidate_sha256": "c" * 64, "command_sha256": "d" * 64},
+        "branch": branch,
+        "marker_template": (
+            f"<!-- reviewflow:v1;project=42;mr=1;sha={SHA};effect=autofix;"
+            f"intent={intent.nonce};plan_sha256={{plan_sha256}} -->"
+        ),
+        "commit_message": "fix",
+        "title": "Draft: [ReviewFlow Auto-Fix] Parent",
+        "target_branch": target_branch,
+        "initial_readiness": "draft",
+        "ci_trigger": "manual",
+    }
+    plan = store.freeze_auto_fix_publication_plan(
+        run.run_id, receipt.receipt_id, payload, claimed.claim_token
+    )
+    assert plan is not None
+    assert store.finish(run.run_id, "succeeded", claim_token=claimed.claim_token)
+    claimed_plan = store.claim_auto_fix_publication_plan(
+        plan_id=plan.plan_id, project_id="42"
+    )
+    assert claimed_plan is not None
+    assert store.record_auto_fix_branch_commit(
+        plan.plan_id, claimed_plan.claim_token, "f" * 40
+    )
+    completed = store.complete_auto_fix_publication(
+        plan.plan_id,
+        claimed_plan.claim_token,
+        auto_fix_project_id="42",
+        auto_fix_mr_iid=child_iid,
+        source_branch=branch,
+        target_branch=target_branch,
+        marker=plan.marker,
+        title="Auto-fix",
+        body="ready",
+        url="https://child",
+        recipients=("alice",),
+        channels=(),
+    )
+    assert completed is not None
+    return completed[0]
 
 
 def test_webhook_configuration_is_required(tmp_path) -> None:
@@ -43,8 +114,7 @@ def test_gitlab_webhook_is_idempotent_and_secret_checked(tmp_path) -> None:
 
 def test_auto_fix_merge_marks_only_the_resulting_sha(tmp_path) -> None:
     store = SQLiteStore(tmp_path / "review.db")
-    run = store.enqueue("42", 1, SHA)
-    store.record_auto_fix("42", 1, SHA, run.run_id, "42", 9)
+    relation = _published_relation(store)
     client = TestClient(create_app(store, webhook_secret="secret", project_id="42"))
     payload = {
         "project": {"id": 42},
@@ -52,10 +122,11 @@ def test_auto_fix_merge_marks_only_the_resulting_sha(tmp_path) -> None:
             "action": "merge",
             "iid": 9,
             "title": "[ReviewFlow Auto-Fix] Improve validation",
-            "source_branch": "autofix/MR-1/run-1",
+            "source_branch": relation.source_branch,
             "target_branch": "feature/validation",
             "last_commit": {"id": SHA},
             "merge_commit_sha": MERGED_SHA,
+            "description": relation.marker,
             "work_in_progress": False,
         },
     }
@@ -67,7 +138,67 @@ def test_auto_fix_merge_marks_only_the_resulting_sha(tmp_path) -> None:
     assert store.is_suppressed_parent_sha("42", 1, MERGED_SHA) is True
 
 
-def test_auto_fix_looking_title_and_branch_are_normal_without_intent(tmp_path) -> None:
+def test_draft_child_webhook_wakes_existing_relation_without_changing_identity(
+    tmp_path,
+) -> None:
+    store = SQLiteStore(tmp_path / "review.db")
+    relation = _published_relation(store)
+    client = TestClient(create_app(store, webhook_secret="secret", project_id="42"))
+
+    response = client.post(
+        "/webhooks/gitlab",
+        json={
+            "project": {"id": 42},
+            "object_attributes": {
+                "action": "update",
+                "iid": relation.auto_fix_mr_iid,
+                "title": "Draft: renamed",
+                "source_branch": relation.source_branch,
+                "target_branch": relation.target_branch,
+                "last_commit": {"id": relation.published_commit_sha},
+                "description": f"context\n{relation.marker}",
+                "draft": True,
+            },
+        },
+        headers={"X-Gitlab-Token": "secret"},
+    )
+
+    assert response.json()["accepted"] is True
+    assert response.json()["kind"] == "autofix"
+    current = store.get_program_auto_fix_relation(relation.plan_id)
+    assert current is not None and current.reconcile_requested is True
+    assert current.divergence is None
+
+
+def test_closing_draft_child_records_closed_before_draft_presentation(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "review.db")
+    relation = _published_relation(store)
+    client = TestClient(create_app(store, webhook_secret="secret", project_id="42"))
+
+    response = client.post(
+        "/webhooks/gitlab",
+        json={
+            "project": {"id": 42},
+            "object_attributes": {
+                "action": "close",
+                "iid": relation.auto_fix_mr_iid,
+                "title": "Draft: closed",
+                "source_branch": relation.source_branch,
+                "target_branch": relation.target_branch,
+                "last_commit": {"id": relation.published_commit_sha},
+                "description": relation.marker,
+                "draft": True,
+            },
+        },
+        headers={"X-Gitlab-Token": "secret"},
+    )
+
+    assert response.json()["kind"] == "autofix"
+    current = store.get_program_auto_fix_relation(relation.plan_id)
+    assert current is not None and current.status == "closed"
+
+
+def test_auto_fix_shaped_branch_without_relation_never_creates_review_run(tmp_path) -> None:
     store = SQLiteStore(tmp_path / "review.db")
     client = TestClient(create_app(store, webhook_secret="secret", project_id="42"))
     response = client.post(
@@ -78,7 +209,7 @@ def test_auto_fix_looking_title_and_branch_are_normal_without_intent(tmp_path) -
                 "action": "update",
                 "iid": 7,
                 "title": "[ReviewFlow Auto-Fix] spoof",
-                "source_branch": "autofix/MR-1/run-999",
+                "source_branch": f"autofix/MR-1/sha-{SHA}/intent-{'d' * 32}",
                 "target_branch": "feature/validation",
                 "last_commit": {"id": SHA},
             },
@@ -86,49 +217,70 @@ def test_auto_fix_looking_title_and_branch_are_normal_without_intent(tmp_path) -
         headers={"X-Gitlab-Token": "secret"},
     )
     assert response.status_code == 200
-    assert response.json()["kind"] == "normal"
+    assert response.json()["accepted"] is False
+    assert response.json()["kind"] == "autofix"
+    assert store.claim_next() is None
 
 
-def test_auto_fix_intent_requires_description_marker(tmp_path) -> None:
+def test_auto_fix_marker_cannot_establish_relation_without_local_authority(tmp_path) -> None:
     store = SQLiteStore(tmp_path / "review.db")
-    run = store.enqueue("42", 1, SHA)
-    store.create_auto_fix_intent(
-        "42",
-        1,
-        SHA,
-        run.run_id,
-        "autofix/MR-1/run-1",
-        "feature/validation",
-        "[ReviewFlow Auto-Fix] Improve validation",
-    )
     client = TestClient(create_app(store, webhook_secret="secret", project_id="42"))
+    nonce = "d" * 32
+    branch = f"autofix/MR-1/sha-{SHA}/intent-{nonce}"
+    marker = (
+        f"<!-- reviewflow:v1;project=42;mr=1;sha={SHA};effect=autofix;"
+        f"intent={nonce};plan_sha256={'e' * 64} -->"
+    )
     payload = {
         "project": {"id": 42},
         "object_attributes": {
             "action": "update",
             "iid": 9,
             "title": "[ReviewFlow Auto-Fix] Improve validation",
-            "source_branch": "autofix/MR-1/run-1",
+            "source_branch": branch,
             "target_branch": "feature/validation",
             "last_commit": {"id": MERGED_SHA},
-            "description": "marker omitted",
+            "description": marker,
         },
     }
     headers = {"X-Gitlab-Token": "secret"}
-    unmarked = client.post("/webhooks/gitlab", json=payload, headers=headers)
-    marked_payload = {
-        **payload,
-        "object_attributes": {
-            **payload["object_attributes"],
-            "description": auto_fix_intent_marker(run.run_id, SHA),
-        },
-    }
-    marked = client.post("/webhooks/gitlab", json=marked_payload, headers=headers)
+    response = client.post("/webhooks/gitlab", json=payload, headers=headers)
 
-    assert unmarked.json()["kind"] == "normal"
-    assert marked.json()["kind"] == "autofix"
-    assert marked.json()["status"] == "review run not created"
-    assert "run_id" not in marked.json()
+    assert response.json()["accepted"] is False
+    assert response.json()["kind"] == "autofix"
+    assert "run_id" not in response.json()
+    assert store.get_program_auto_fix_relation_by_child("42", 9) is None
+
+
+def test_auto_fix_marker_on_arbitrary_branch_cannot_create_review_run(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "review.db")
+    client = TestClient(create_app(store, webhook_secret="secret", project_id="42"))
+    nonce = "d" * 32
+    marker = (
+        f"<!-- reviewflow:v1;project=42;mr=1;sha={SHA};effect=autofix;"
+        f"intent={nonce};plan_sha256={'e' * 64} -->"
+    )
+
+    response = client.post(
+        "/webhooks/gitlab",
+        json={
+            "project": {"id": 42},
+            "object_attributes": {
+                "action": "update",
+                "iid": 10,
+                "title": "Spoof",
+                "source_branch": "ordinary-looking-branch",
+                "target_branch": "feature/validation",
+                "last_commit": {"id": SHA},
+                "description": marker,
+            },
+        },
+        headers={"X-Gitlab-Token": "secret"},
+    )
+
+    assert response.json()["accepted"] is False
+    assert response.json()["kind"] == "autofix"
+    assert store.claim_next() is None
 
 
 def test_pipeline_hook_wakes_existing_deferred_run(tmp_path) -> None:

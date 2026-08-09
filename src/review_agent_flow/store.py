@@ -21,12 +21,13 @@ DEFAULT_NOTIFICATION_LEASE_SECONDS = 30
 DEFAULT_NOTIFICATION_MAX_ATTEMPTS = 3
 DEFAULT_WORKTREE_CLEANUP_LEASE_SECONDS = 60
 DEFAULT_WORKTREE_CLEANUP_MAX_ATTEMPTS = 5
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 DEFAULT_EFFECT_LEASE_SECONDS = 60
 DEFAULT_NOTE_PUBLICATION_LEASE_SECONDS = 60
 DEFAULT_NOTE_PUBLICATION_MAX_ATTEMPTS = 5
 DEFAULT_NOTE_UNCERTAIN_LOOKUP_ATTEMPTS = 3
 DEFAULT_AUTO_FIX_PUBLICATION_LEASE_SECONDS = 60
+DEFAULT_AUTO_FIX_RECONCILIATION_LEASE_SECONDS = 60
 
 
 def auto_fix_intent_marker(run_id: int, parent_sha: str) -> str:
@@ -152,6 +153,7 @@ class AutoFixPublicationPlan:
     created_at: str
     updated_at: str
     attempts: int
+    absence_confirmations: int
     write_uncertain: bool
     branch_commit_sha: str | None
     external_mr_iid: int | None
@@ -176,8 +178,16 @@ class ProgramAutoFixRelation:
     target_branch: str
     marker: str
     plan_sha256: str
+    published_commit_sha: str
     status: str
     merged_sha: str | None
+    divergence: str | None
+    reconcile_requested: bool
+    reconcile_attempts: int
+    reconcile_next_at: str | None
+    reconcile_lease_until: str | None
+    reconcile_claim_token: str | None
+    last_error: str | None
     created_at: str
     updated_at: str
 
@@ -257,7 +267,7 @@ class WorktreeRecord:
 class SQLiteStore:
     """Small SQLite store.
 
-    Version 6 is intentionally a fresh schema.  There is no production database
+    Version 7 is intentionally a fresh schema.  There is no production database
     migration contract for this pre-release implementation; an older database
     must be recreated rather than guessed into a new notification or Auto-fix
     routing model.
@@ -424,6 +434,7 @@ class SQLiteStore:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     attempts INTEGER NOT NULL DEFAULT 0,
+                    absence_confirmations INTEGER NOT NULL DEFAULT 0,
                     write_uncertain INTEGER NOT NULL DEFAULT 0,
                     branch_commit_sha TEXT,
                     external_mr_iid INTEGER,
@@ -448,8 +459,16 @@ class SQLiteStore:
                     target_branch TEXT NOT NULL,
                     marker TEXT NOT NULL UNIQUE,
                     plan_sha256 TEXT NOT NULL UNIQUE,
+                    published_commit_sha TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'opened',
                     merged_sha TEXT,
+                    divergence TEXT,
+                    reconcile_requested INTEGER NOT NULL DEFAULT 0,
+                    reconcile_attempts INTEGER NOT NULL DEFAULT 0,
+                    reconcile_next_at TEXT,
+                    reconcile_lease_until TEXT,
+                    reconcile_claim_token TEXT,
+                    last_error TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     UNIQUE(auto_fix_project_id, auto_fix_mr_iid)
@@ -568,7 +587,7 @@ class SQLiteStore:
                     last_error TEXT,
                     UNIQUE(run_id, path)
                 );
-                PRAGMA user_version = 6;
+                PRAGMA user_version = 7;
                 """
             )
 
@@ -665,9 +684,28 @@ class SQLiteStore:
         return (
             "id AS plan_id, intent_id, run_id, plan_json, plan_sha256, marker, "
             "candidate_sha256, verification_json, state, created_at, updated_at, "
-            "attempts, write_uncertain, branch_commit_sha, external_mr_iid, "
+            "attempts, absence_confirmations, write_uncertain, branch_commit_sha, external_mr_iid, "
             "next_attempt_at, lease_until, claim_token, last_error"
         )
+
+    @staticmethod
+    def _program_auto_fix_relation_columns() -> str:
+        return (
+            "id AS relation_id, intent_id, plan_id, run_id, parent_project_id, "
+            "parent_mr_iid, parent_sha, auto_fix_project_id, auto_fix_mr_iid, "
+            "source_branch, target_branch, marker, plan_sha256, status, merged_sha, "
+            "published_commit_sha, "
+            "divergence, reconcile_requested, reconcile_attempts, reconcile_next_at, "
+            "reconcile_lease_until, reconcile_claim_token, last_error, created_at, updated_at"
+        )
+
+    @staticmethod
+    def _program_auto_fix_relation_from_row(
+        row: sqlite3.Row,
+    ) -> ProgramAutoFixRelation:
+        values = dict(row)
+        values["reconcile_requested"] = bool(values["reconcile_requested"])
+        return ProgramAutoFixRelation(**values)
 
     def enqueue(self, project_id: str, mr_iid: int, sha: str) -> ReviewRun:
         if not project_id or not str(project_id).strip():
@@ -2449,6 +2487,145 @@ class SQLiteStore:
         assert claimed is not None
         return self._auto_fix_publication_plan_from_row(claimed)
 
+    def claim_auto_fix_reconciliation_plan(
+        self,
+        *,
+        project_id: str,
+        lease_seconds: int = DEFAULT_AUTO_FIX_RECONCILIATION_LEASE_SECONDS,
+    ) -> AutoFixPublicationPlan | None:
+        if not project_id.strip() or lease_seconds <= 0:
+            raise ValueError("invalid Auto-fix reconciliation claim")
+        now_value = self._now()
+        now = now_value.isoformat()
+        lease_until = (now_value + timedelta(seconds=lease_seconds)).isoformat()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                UPDATE auto_fix_publication_plans
+                SET state = 'needs_reconciliation', lease_until = NULL,
+                    claim_token = NULL, updated_at = ?, write_uncertain = 1,
+                    last_error = COALESCE(
+                        last_error, 'reconciliation lease expired before completion'
+                    )
+                WHERE state = 'reconciling'
+                  AND (lease_until IS NULL OR lease_until <= ?)
+                  AND EXISTS (
+                      SELECT 1 FROM auto_fix_publication_intents i
+                      WHERE i.id = auto_fix_publication_plans.intent_id
+                        AND i.project_id = ?
+                  )
+                """,
+                (now, now, project_id),
+            )
+            row = connection.execute(
+                """
+                SELECT p.id
+                FROM auto_fix_publication_plans p
+                JOIN auto_fix_publication_intents i ON i.id = p.intent_id
+                WHERE p.state = 'needs_reconciliation'
+                  AND (p.next_attempt_at IS NULL OR p.next_attempt_at <= ?)
+                  AND i.project_id = ?
+                ORDER BY p.id LIMIT 1
+                """,
+                (now, project_id),
+            ).fetchone()
+            if row is None:
+                return None
+            token = uuid4().hex
+            updated = connection.execute(
+                """
+                UPDATE auto_fix_publication_plans
+                SET state = 'reconciling', attempts = attempts + 1,
+                    lease_until = ?, claim_token = ?, updated_at = ?
+                WHERE id = ? AND state = 'needs_reconciliation'
+                """,
+                (lease_until, token, now, row["id"]),
+            )
+            if updated.rowcount != 1:
+                return None
+            claimed = connection.execute(
+                f"SELECT {self._auto_fix_publication_plan_columns()} "
+                "FROM auto_fix_publication_plans WHERE id = ?",
+                (row["id"],),
+            ).fetchone()
+        assert claimed is not None
+        return self._auto_fix_publication_plan_from_row(claimed)
+
+    def defer_auto_fix_reconciliation_plan(
+        self,
+        plan_id: int,
+        claim_token: str | None,
+        error: str,
+        *,
+        delay_seconds: float,
+        max_attempts: int,
+        confirm_absent: bool = False,
+    ) -> bool:
+        if not claim_token or delay_seconds < 0 or max_attempts <= 0:
+            return False
+        now_value = self._now()
+        now = now_value.isoformat()
+        next_attempt_at = (now_value + timedelta(seconds=delay_seconds)).isoformat()
+        safe_error = self._redact(error)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT p.attempts, p.run_id, p.intent_id, i.nonce
+                FROM auto_fix_publication_plans p
+                JOIN auto_fix_publication_intents i ON i.id = p.intent_id
+                WHERE p.id = ? AND p.state = 'reconciling' AND p.claim_token = ?
+                  AND p.lease_until IS NOT NULL AND p.lease_until > ?
+                """,
+                (plan_id, claim_token, now),
+            ).fetchone()
+            if row is None:
+                return False
+            exhausted = int(row["attempts"]) >= max_attempts
+            state = "blocked" if exhausted else "needs_reconciliation"
+            connection.execute(
+                """
+                UPDATE auto_fix_publication_plans
+                SET state = ?, next_attempt_at = ?, lease_until = NULL,
+                    claim_token = NULL, last_error = ?, updated_at = ?,
+                    absence_confirmations = absence_confirmations + ?
+                WHERE id = ? AND state = 'reconciling' AND claim_token = ?
+                """,
+                (
+                    state,
+                    None if exhausted else next_attempt_at,
+                    safe_error,
+                    now,
+                    int(confirm_absent),
+                    plan_id,
+                    claim_token,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE auto_fix_publication_intents
+                SET state = ?, updated_at = ?, last_error = ? WHERE id = ?
+                """,
+                (state, now, safe_error, row["intent_id"]),
+            )
+            connection.execute(
+                """
+                UPDATE effect_receipts
+                SET state = ?, error = ?, updated_at = ?
+                WHERE run_id = ? AND effect_kind = 'autofix_plan'
+                  AND dedupe_key = ?
+                """,
+                (
+                    state,
+                    safe_error,
+                    now,
+                    row["run_id"],
+                    f"autofix-intent:{row['nonce']}",
+                ),
+            )
+        return not exhausted
+
     def finish_auto_fix_publication_plan(
         self,
         plan_id: int,
@@ -2470,7 +2647,8 @@ class SQLiteStore:
                 SELECT p.run_id, p.intent_id, i.nonce
                 FROM auto_fix_publication_plans p
                 JOIN auto_fix_publication_intents i ON i.id = p.intent_id
-                WHERE p.id = ? AND p.state = 'running' AND p.claim_token = ?
+                WHERE p.id = ? AND p.state IN ('running', 'reconciling')
+                  AND p.claim_token = ?
                   AND p.lease_until IS NOT NULL AND p.lease_until > ?
                 """,
                 (plan_id, claim_token, now),
@@ -2482,7 +2660,8 @@ class SQLiteStore:
                 UPDATE auto_fix_publication_plans
                 SET state = ?, write_uncertain = ?, last_error = ?, updated_at = ?,
                     next_attempt_at = NULL, lease_until = NULL, claim_token = NULL
-                WHERE id = ? AND state = 'running' AND claim_token = ?
+                WHERE id = ? AND state IN ('running', 'reconciling')
+                  AND claim_token = ?
                   AND lease_until IS NOT NULL AND lease_until > ?
                 """,
                 (
@@ -2509,7 +2688,8 @@ class SQLiteStore:
                     UPDATE effect_receipts
                     SET state = ?, detail = ?, error = ?, updated_at = ?
                     WHERE run_id = ? AND effect_kind = 'autofix_plan'
-                      AND dedupe_key = ? AND state = 'plan_frozen'
+                      AND dedupe_key = ?
+                      AND state IN ('plan_frozen', 'needs_reconciliation')
                     """,
                     (
                         state,
@@ -2540,7 +2720,8 @@ class SQLiteStore:
                 """
                 UPDATE auto_fix_publication_plans
                 SET lease_until = ?, updated_at = ?
-                WHERE id = ? AND state = 'running' AND claim_token = ?
+                WHERE id = ? AND state IN ('running', 'reconciling')
+                  AND claim_token = ?
                   AND lease_until IS NOT NULL AND lease_until > ?
                 """,
                 (lease_until, now, plan_id, claim_token, now),
@@ -2679,7 +2860,8 @@ class SQLiteStore:
                        i.project_id, i.mr_iid, i.sha, i.nonce
                 FROM auto_fix_publication_plans p
                 JOIN auto_fix_publication_intents i ON i.id = p.intent_id
-                WHERE p.id = ? AND p.state = 'running' AND p.claim_token = ?
+                WHERE p.id = ? AND p.state IN ('running', 'reconciling')
+                  AND p.claim_token = ?
                   AND p.lease_until IS NOT NULL AND p.lease_until > ?
                   AND p.branch_commit_sha IS NOT NULL
                 """,
@@ -2701,8 +2883,8 @@ class SQLiteStore:
                     intent_id, plan_id, run_id, parent_project_id, parent_mr_iid,
                     parent_sha, auto_fix_project_id, auto_fix_mr_iid,
                     source_branch, target_branch, marker, plan_sha256,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    published_commit_sha, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(plan_id) DO NOTHING
                 """,
                 (
@@ -2718,23 +2900,20 @@ class SQLiteStore:
                     target_branch,
                     marker,
                     row["plan_sha256"],
+                    row["branch_commit_sha"],
                     now,
                     now,
                 ),
             )
             relation_row = connection.execute(
-                """
-                SELECT id AS relation_id, intent_id, plan_id, run_id,
-                       parent_project_id, parent_mr_iid, parent_sha,
-                       auto_fix_project_id, auto_fix_mr_iid, source_branch,
-                       target_branch, marker, plan_sha256, status, merged_sha,
-                       created_at, updated_at
+                f"""
+                SELECT {self._program_auto_fix_relation_columns()}
                 FROM auto_fix_relations WHERE plan_id = ?
                 """,
                 (plan_id,),
             ).fetchone()
             assert relation_row is not None
-            relation = ProgramAutoFixRelation(**dict(relation_row))
+            relation = self._program_auto_fix_relation_from_row(relation_row)
             if (
                 relation.auto_fix_project_id != auto_fix_project_id
                 or relation.auto_fix_mr_iid != auto_fix_mr_iid
@@ -2831,7 +3010,8 @@ class SQLiteStore:
                     detail = 'Program-owned Auto-fix Merge Request published',
                     error = NULL, updated_at = ?
                 WHERE run_id = ? AND effect_kind = 'autofix_plan'
-                  AND dedupe_key = ? AND state = 'plan_frozen'
+                  AND dedupe_key = ?
+                  AND state IN ('plan_frozen', 'needs_reconciliation')
                 """,
                 (
                     f"gitlab:{auto_fix_project_id}!{auto_fix_mr_iid}",
@@ -2847,17 +3027,287 @@ class SQLiteStore:
     ) -> ProgramAutoFixRelation | None:
         with self._connect() as connection:
             row = connection.execute(
-                """
-                SELECT id AS relation_id, intent_id, plan_id, run_id,
-                       parent_project_id, parent_mr_iid, parent_sha,
-                       auto_fix_project_id, auto_fix_mr_iid, source_branch,
-                       target_branch, marker, plan_sha256, status, merged_sha,
-                       created_at, updated_at
+                f"""
+                SELECT {self._program_auto_fix_relation_columns()}
                 FROM auto_fix_relations WHERE plan_id = ?
                 """,
                 (plan_id,),
             ).fetchone()
-        return ProgramAutoFixRelation(**dict(row)) if row is not None else None
+        return self._program_auto_fix_relation_from_row(row) if row is not None else None
+
+    def get_program_auto_fix_relation_by_child(
+        self, project_id: str, mr_iid: int
+    ) -> ProgramAutoFixRelation | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                f"SELECT {self._program_auto_fix_relation_columns()} "
+                "FROM auto_fix_relations "
+                "WHERE auto_fix_project_id = ? AND auto_fix_mr_iid = ?",
+                (project_id, mr_iid),
+            ).fetchone()
+        return self._program_auto_fix_relation_from_row(row) if row is not None else None
+
+    @staticmethod
+    def _program_relation_divergence(
+        relation: sqlite3.Row,
+        source_branch: str,
+        target_branch: str,
+        description: str,
+        source_sha: str | None = None,
+    ) -> str | None:
+        mismatches: list[str] = []
+        if source_branch != str(relation["source_branch"]):
+            mismatches.append("source_branch")
+        if target_branch != str(relation["target_branch"]):
+            mismatches.append("target_branch")
+        if str(relation["marker"]) not in description:
+            mismatches.append("marker")
+        if source_sha is not None and source_sha != str(relation["published_commit_sha"]):
+            mismatches.append("tree")
+        return ",".join(mismatches) if mismatches else None
+
+    def observe_program_auto_fix_webhook(
+        self,
+        project_id: str,
+        mr_iid: int,
+        *,
+        status: str,
+        merged_sha: str | None,
+        source_branch: str | None,
+        target_branch: str | None,
+        description: str | None,
+        source_sha: str | None = None,
+    ) -> ProgramAutoFixRelation | None:
+        """Update and wake only a pre-existing Program-owned Relation."""
+
+        if status not in {"opened", "closed", "merged"}:
+            raise ValueError("invalid Auto-fix relation status")
+        if status == "merged" and not is_valid_sha(merged_sha):
+            raise ValueError("merged Auto-fix relation requires a valid SHA")
+        now = self._now().isoformat()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM auto_fix_relations "
+                "WHERE auto_fix_project_id = ? AND auto_fix_mr_iid = ?",
+                (project_id, mr_iid),
+            ).fetchone()
+            if row is None:
+                return None
+            divergence = str(row["divergence"]) if row["divergence"] else None
+            if (
+                source_branch is not None
+                and target_branch is not None
+                and description is not None
+            ):
+                divergence = self._program_relation_divergence(
+                    row, source_branch, target_branch, description, source_sha
+                )
+            connection.execute(
+                """
+                UPDATE auto_fix_relations
+                SET status = CASE WHEN status = 'merged' THEN status ELSE ? END,
+                    merged_sha = CASE
+                        WHEN status = 'merged' THEN merged_sha
+                        WHEN ? = 'merged' THEN ?
+                        ELSE NULL
+                    END,
+                    divergence = ?, reconcile_requested = 1,
+                    reconcile_next_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    status,
+                    status,
+                    merged_sha,
+                    divergence,
+                    now,
+                    now,
+                    row["id"],
+                ),
+            )
+            updated = connection.execute(
+                f"SELECT {self._program_auto_fix_relation_columns()} "
+                "FROM auto_fix_relations WHERE id = ?",
+                (row["id"],),
+            ).fetchone()
+        assert updated is not None
+        return self._program_auto_fix_relation_from_row(updated)
+
+    def claim_program_auto_fix_relation(
+        self,
+        *,
+        project_id: str,
+        lease_seconds: int = DEFAULT_AUTO_FIX_RECONCILIATION_LEASE_SECONDS,
+    ) -> ProgramAutoFixRelation | None:
+        if not project_id.strip() or lease_seconds <= 0:
+            raise ValueError("invalid Auto-fix Relation reconciliation claim")
+        now_value = self._now()
+        now = now_value.isoformat()
+        lease_until = (now_value + timedelta(seconds=lease_seconds)).isoformat()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                UPDATE auto_fix_relations
+                SET reconcile_lease_until = NULL, reconcile_claim_token = NULL,
+                    reconcile_requested = 1, reconcile_next_at = ?, updated_at = ?,
+                    last_error = COALESCE(
+                        last_error, 'Relation reconciliation lease expired'
+                    )
+                WHERE auto_fix_project_id = ?
+                  AND reconcile_claim_token IS NOT NULL
+                  AND (reconcile_lease_until IS NULL OR reconcile_lease_until <= ?)
+                """,
+                (now, now, project_id, now),
+            )
+            row = connection.execute(
+                """
+                SELECT id FROM auto_fix_relations
+                WHERE auto_fix_project_id = ?
+                  AND reconcile_claim_token IS NULL
+                  AND (
+                      reconcile_requested = 1
+                      OR (
+                          status != 'merged'
+                          AND (reconcile_next_at IS NULL OR reconcile_next_at <= ?)
+                      )
+                  )
+                ORDER BY reconcile_requested DESC, id
+                LIMIT 1
+                """,
+                (project_id, now),
+            ).fetchone()
+            if row is None:
+                return None
+            token = uuid4().hex
+            updated = connection.execute(
+                """
+                UPDATE auto_fix_relations
+                SET reconcile_claim_token = ?, reconcile_lease_until = ?,
+                    reconcile_attempts = reconcile_attempts + 1,
+                    reconcile_requested = 0, updated_at = ?
+                WHERE id = ? AND reconcile_claim_token IS NULL
+                """,
+                (token, lease_until, now, row["id"]),
+            )
+            if updated.rowcount != 1:
+                return None
+            claimed = connection.execute(
+                f"SELECT {self._program_auto_fix_relation_columns()} "
+                "FROM auto_fix_relations WHERE id = ?",
+                (row["id"],),
+            ).fetchone()
+        assert claimed is not None
+        return self._program_auto_fix_relation_from_row(claimed)
+
+    def finish_program_auto_fix_relation_reconciliation(
+        self,
+        relation_id: int,
+        claim_token: str | None,
+        *,
+        status: str,
+        merged_sha: str | None,
+        source_branch: str,
+        target_branch: str,
+        description: str,
+        source_sha: str,
+        error: str | None = None,
+        retry_delay_seconds: float = 300.0,
+    ) -> bool:
+        if not claim_token or retry_delay_seconds < 0:
+            return False
+        if status not in {"opened", "closed", "merged"}:
+            raise ValueError("invalid Auto-fix relation status")
+        if status == "merged" and not is_valid_sha(merged_sha):
+            raise ValueError("merged Auto-fix relation requires a valid SHA")
+        now_value = self._now()
+        now = now_value.isoformat()
+        next_at = (now_value + timedelta(seconds=retry_delay_seconds)).isoformat()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT * FROM auto_fix_relations
+                WHERE id = ? AND reconcile_claim_token = ?
+                  AND reconcile_lease_until IS NOT NULL
+                  AND reconcile_lease_until > ?
+                """,
+                (relation_id, claim_token, now),
+            ).fetchone()
+            if row is None:
+                return False
+            divergence = self._program_relation_divergence(
+                row, source_branch, target_branch, description, source_sha
+            )
+            cursor = connection.execute(
+                """
+                UPDATE auto_fix_relations
+                SET status = CASE WHEN status = 'merged' THEN status ELSE ? END,
+                    merged_sha = CASE
+                        WHEN status = 'merged' THEN merged_sha
+                        WHEN ? = 'merged' THEN ?
+                        ELSE NULL
+                    END,
+                    divergence = ?,
+                    reconcile_next_at = CASE
+                        WHEN status = 'merged' OR ? = 'merged' THEN NULL
+                        ELSE ?
+                    END,
+                    reconcile_lease_until = NULL,
+                    reconcile_claim_token = NULL, last_error = ?, updated_at = ?
+                WHERE id = ? AND reconcile_claim_token = ?
+                """,
+                (
+                    status,
+                    status,
+                    merged_sha if status == "merged" else None,
+                    divergence,
+                    status,
+                    next_at,
+                    self._redact(error) if error else None,
+                    now,
+                    relation_id,
+                    claim_token,
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def defer_program_auto_fix_relation_reconciliation(
+        self,
+        relation_id: int,
+        claim_token: str | None,
+        error: str,
+        *,
+        retry_delay_seconds: float,
+    ) -> bool:
+        """Release a Relation claim without rewriting its observed identity or state."""
+
+        if not claim_token or retry_delay_seconds < 0:
+            return False
+        now_value = self._now()
+        now = now_value.isoformat()
+        next_at = (now_value + timedelta(seconds=retry_delay_seconds)).isoformat()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE auto_fix_relations
+                SET reconcile_next_at = ?, reconcile_lease_until = NULL,
+                    reconcile_claim_token = NULL, last_error = ?, updated_at = ?
+                WHERE id = ? AND reconcile_claim_token = ?
+                  AND reconcile_lease_until IS NOT NULL
+                  AND reconcile_lease_until > ?
+                """,
+                (
+                    next_at,
+                    self._redact(error),
+                    now,
+                    relation_id,
+                    claim_token,
+                    now,
+                ),
+            )
+        return cursor.rowcount == 1
 
     def get_auto_fix_notification_request(
         self, relation_id: int
@@ -3290,7 +3740,13 @@ class SQLiteStore:
         with self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT 1 FROM auto_fix_mrs
+                SELECT 1 FROM (
+                    SELECT parent_project_id, parent_mr_iid, status, merged_sha
+                    FROM auto_fix_relations
+                    UNION ALL
+                    SELECT parent_project_id, parent_mr_iid, status, merged_sha
+                    FROM auto_fix_mrs
+                )
                 WHERE parent_project_id = ? AND parent_mr_iid = ?
                   AND status = 'merged' AND merged_sha = ?
                 LIMIT 1
