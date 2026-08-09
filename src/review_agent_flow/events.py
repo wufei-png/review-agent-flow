@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from .gitlab import is_valid_sha
+from .gitlab import is_valid_sha, normalize_sha
 
 AUTO_FIX_TITLE_PREFIX = "[ReviewFlow Auto-Fix]"
 AUTO_FIX_BRANCH_RE = re.compile(
@@ -142,8 +142,8 @@ def _parse_merge_request(payload: dict[str, Any]) -> WebhookDecision:
             True,
             "merge request merged",
             kind="merge",
-            sha=merged_sha,
-            merged_sha=merged_sha,
+            sha=normalize_sha(merged_sha),
+            merged_sha=normalize_sha(merged_sha),
             **common,
         )
 
@@ -172,7 +172,7 @@ def _parse_merge_request(payload: dict[str, Any]) -> WebhookDecision:
         True,
         "merge request",
         kind="close" if action == "close" else ("draft" if is_draft else "normal"),
-        sha=str(sha),
+        sha=normalize_sha(sha),
         author_username=_user_username(payload, attrs),
         **common,
     )
@@ -231,7 +231,7 @@ def _parse_pipeline(payload: dict[str, Any]) -> tuple[WebhookDecision, ...]:
                 kind="pipeline",
                 project_id=project_id,
                 mr_iid=mr_iid,
-                sha=str(sha),
+                sha=normalize_sha(sha),
                 title=title,
                 source_branch=str(source_branch) if source_branch else None,
                 target_branch=str(merge_request.get("target_branch") or attrs.get("target_branch") or "") or None,

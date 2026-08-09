@@ -29,7 +29,7 @@ pending -> running -> succeeded
        +-- deferred Pipeline Gate or Draft check
 ```
 
-The Store atomically claims eligible work with an opaque token and lease. Expired work is recovered with bounded attempts; stale tokens cannot heartbeat, finish or mutate a reclaimed item. Transient GitLab, rate-limit and transport failures use capped backoff. Configuration, policy, invalid SHA and Agent contract failures are terminal. A head change cancels or supersedes the old key and enqueues the new exact SHA without publishing old effects.
+The Store atomically claims eligible work with an opaque token and lease. Expired work is recovered with a dedicated bounded lease-recovery counter; stale tokens cannot heartbeat, finish or mutate a reclaimed item. Transient GitLab, rate-limit and transport failures use capped backoff and a separate failure-attempt counter. Claim count is diagnostic and eligibility deferrals do not consume either failure budget. Configuration, policy, invalid SHA and Agent contract failures are terminal. A head change cancels or supersedes the old key and enqueues the new exact SHA without publishing old effects. All accepted Git SHAs are canonicalized to lowercase before they participate in identity or marker construction.
 
 Note, Auto-fix and notification state is independent from process success. Requested Outputs, the Effective Run Decision and Output Expectations are frozen before effects proceed. User-visible Review Outcome is a projection over those durable expectations and receipts, not a synonym for Agent exit status.
 
@@ -37,14 +37,14 @@ Note, Auto-fix and notification state is independent from process success. Reque
 
 The pre-release implementation performs a hard cutover to a fresh schema; it does not migrate or read legacy ReviewRun kinds, Run-ID markers or Agent-owned publication state. The schema retains at least:
 
-- `review_runs`: ReviewKey, status, attempts, lease/token, timestamps and redacted diagnostics;
+- `review_runs`: ReviewKey, status, claim/failure/lease-recovery counters, lease/token, timestamps and redacted diagnostics;
 - `requested_outputs`, `effective_run_decisions` and `output_expectations`: immutable decisions used by the Outcome projection;
 - `note_publication_requests` and effect receipts: canonical marker, state, attempt, trusted external identity and deletion observation;
 - `auto_fix_publication_intents`: immutable generation and nonce, with at most one active generation per ReviewKey;
 - `auto_fix_publication_plans`: full canonical Plan, digest, verification evidence and publication state;
 - `auto_fix_relations`: parent identity, child identity, observed state, divergence and merge SHA;
 - `notification_requests` and delivery outbox: immutable event identity and generation, rendered fields, channel, attempts, lease and status;
-- `review_run_failures`: failure class, retryability, claim attempt and redacted diagnostic;
+- `review_run_failures`: failure class, retryability, diagnostic claim number and redacted diagnostic;
 - `worktree_cleanup`: workspace path, Run/SHA, attempts, lease and cleanup status;
 - `operator_recoveries`: recovery ID, action, exact supplied identities, reason, principal, host, tool version, result and redacted diagnostic.
 

@@ -412,6 +412,30 @@ def test_webhook_rejects_project_mismatch_for_ignored_event(tmp_path) -> None:
     assert store.claim_next() is None
 
 
+def test_webhook_does_not_enqueue_a_closed_parent_merge_request(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "review.db")
+    client = TestClient(create_app(store, webhook_secret="secret", project_id="42"))
+
+    response = client.post(
+        "/webhooks/gitlab",
+        json={
+            "project": {"id": 42},
+            "object_attributes": {
+                "action": "close",
+                "iid": 1,
+                "last_commit": {"id": SHA},
+                "work_in_progress": False,
+            },
+        },
+        headers={"X-Gitlab-Token": "secret", "X-Gitlab-Event": "Merge Request Hook"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["accepted"] is False
+    assert response.json()["kind"] == "close"
+    assert store.claim_next() is None
+
+
 def test_webhook_rejects_invalid_sha_without_enqueueing(tmp_path) -> None:
     store = SQLiteStore(tmp_path / "review.db")
     client = TestClient(create_app(store, webhook_secret="secret", project_id="42"))

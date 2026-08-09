@@ -401,13 +401,14 @@ class ReviewWorker:
                     return self._lease_recovery_result(run, detail)
                 return WorkerResult(run.run_id, "cancelled", detail=detail)
 
-            if merge_request.sha != run.sha:
-                detail = f"stale run SHA; current Merge Request head is {merge_request.sha}"
+            current_sha = merge_request.sha.lower()
+            if current_sha != run.sha:
+                detail = f"stale run SHA; current Merge Request head is {current_sha}"
                 current_run = self.store.cancel_and_enqueue_latest(
                     run_id=run.run_id,
                     project_id=run.project_id,
                     mr_iid=run.mr_iid,
-                    sha=merge_request.sha,
+                    sha=current_sha,
                     reason=detail,
                     claim_token=run.claim_token,
                     failure_class="stale_sha",
@@ -649,7 +650,7 @@ class ReviewWorker:
                 run.run_id,
                 failure.failure_class,
                 failure.detail,
-                delay_seconds=self._backoff(run.attempts),
+                delay_seconds=self._backoff(run.failure_attempts + 1),
                 max_attempts=self.max_attempts,
                 claim_token=run.claim_token,
             )
@@ -740,7 +741,7 @@ class ReviewWorker:
         return updated
 
     def _retry_or_fail(self, run: ReviewRun, failure: FailureInfo) -> bool:
-        delay = self._backoff(run.attempts)
+        delay = self._backoff(run.failure_attempts + 1)
         requeued = self.store.retry_or_fail(
             run.run_id,
             failure.failure_class,

@@ -12,7 +12,7 @@ from pathlib import Path
 from urllib.parse import quote
 from uuid import uuid4
 
-from .gitlab import canonical_note_marker, has_exact_note_marker, is_valid_sha
+from .gitlab import canonical_note_marker, has_exact_note_marker, is_valid_sha, normalize_sha
 from .security import redact
 
 DEFAULT_LEASE_SECONDS = 1860
@@ -21,7 +21,7 @@ DEFAULT_NOTIFICATION_LEASE_SECONDS = 30
 DEFAULT_NOTIFICATION_MAX_ATTEMPTS = 3
 DEFAULT_WORKTREE_CLEANUP_LEASE_SECONDS = 60
 DEFAULT_WORKTREE_CLEANUP_MAX_ATTEMPTS = 5
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 DEFAULT_EFFECT_LEASE_SECONDS = 60
 DEFAULT_NOTE_PUBLICATION_LEASE_SECONDS = 60
 DEFAULT_NOTE_PUBLICATION_MAX_ATTEMPTS = 5
@@ -38,6 +38,8 @@ class ReviewRun:
     sha: str
     status: str
     attempts: int = 0
+    failure_attempts: int = 0
+    lease_recoveries: int = 0
     lease_until: str | None = None
     claim_token: str | None = None
     failure_class: str | None = None
@@ -246,7 +248,7 @@ class WorktreeRecord:
 class SQLiteStore:
     """Small SQLite store.
 
-    Version 9 is intentionally a fresh schema.  There is no production database
+    Version 10 is intentionally a fresh schema.  There is no production database
     migration contract for this pre-release implementation; an older database
     must be recreated rather than guessed into a new notification or Auto-fix
     routing model.
@@ -364,6 +366,8 @@ class SQLiteStore:
                     next_attempt_at TEXT,
                     lease_until TEXT,
                     attempts INTEGER NOT NULL DEFAULT 0,
+                    failure_attempts INTEGER NOT NULL DEFAULT 0,
+                    lease_recoveries INTEGER NOT NULL DEFAULT 0,
                     claim_token TEXT,
                     failure_class TEXT,
                     retryable INTEGER NOT NULL DEFAULT 0,
@@ -554,7 +558,7 @@ class SQLiteStore:
                     last_error TEXT,
                     UNIQUE(run_id, path)
                 );
-                PRAGMA user_version = 9;
+                PRAGMA user_version = 10;
                 """
             )
 
@@ -576,6 +580,7 @@ class SQLiteStore:
     def _review_run_columns() -> str:
         return (
             "id AS run_id, project_id, mr_iid, sha, status, attempts, "
+            "failure_attempts, lease_recoveries, "
             "lease_until, claim_token, failure_class, retryable, error, next_attempt_at, "
             "created_at, finished_at"
         )
@@ -677,8 +682,7 @@ class SQLiteStore:
     def enqueue(self, project_id: str, mr_iid: int, sha: str) -> ReviewRun:
         if not project_id or not str(project_id).strip():
             raise ValueError("project_id cannot be empty")
-        if not is_valid_sha(sha):
-            raise ValueError("invalid SHA: expected 40 or 64 hexadecimal characters")
+        sha = normalize_sha(sha)
         created_at = datetime.now(UTC).isoformat()
         with self._connect() as connection:
             connection.execute(
@@ -700,6 +704,7 @@ class SQLiteStore:
     def wake_run(self, project_id: str, mr_iid: int, sha: str) -> ReviewRun | None:
         """Make a deferred Review Run immediately eligible after a green Pipeline."""
 
+        sha = normalize_sha(sha)
         now = self._now().isoformat()
         with self._connect() as connection:
             connection.execute(
@@ -784,6 +789,9 @@ class SQLiteStore:
             "status": run.status,
             "attempt": run.attempts,
             "attempts": run.attempts,
+            "claim_count": run.attempts,
+            "failure_attempts": run.failure_attempts,
+            "lease_recoveries": run.lease_recoveries,
             "failure": latest_failure,
             "failures": failure_items,
             "effect_receipts": receipt_items,
@@ -822,7 +830,7 @@ class SQLiteStore:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             expired_query = (
-                "SELECT id, attempts FROM review_runs "
+                "SELECT id, attempts, lease_recoveries FROM review_runs "
                 "WHERE status = 'running' AND (lease_until IS NULL OR lease_until <= ?)"
             )
             expired_parameters: tuple[object, ...] = (now_text,)
@@ -833,23 +841,24 @@ class SQLiteStore:
             recovery_query = """
                 UPDATE review_runs
                 SET status = CASE
-                        WHEN COALESCE(attempts, 0) >= ? THEN 'failed'
+                        WHEN COALESCE(lease_recoveries, 0) + 1 >= ? THEN 'failed'
                         ELSE 'pending'
                     END,
                     finished_at = CASE
-                        WHEN COALESCE(attempts, 0) >= ? THEN ?
+                        WHEN COALESCE(lease_recoveries, 0) + 1 >= ? THEN ?
                         ELSE NULL
                     END,
                     error = CASE
-                        WHEN COALESCE(attempts, 0) >= ? THEN 'worker lease expired'
+                        WHEN COALESCE(lease_recoveries, 0) + 1 >= ? THEN 'worker lease expired'
                         ELSE 'worker lease expired; retrying'
                     END,
                     failure_class = 'lease_expired',
                     retryable = 1,
                     next_attempt_at = CASE
-                        WHEN COALESCE(attempts, 0) >= ? THEN NULL
+                        WHEN COALESCE(lease_recoveries, 0) + 1 >= ? THEN NULL
                         ELSE ?
                     END,
+                    lease_recoveries = COALESCE(lease_recoveries, 0) + 1,
                     lease_until = NULL,
                     claim_token = NULL
                 WHERE status = 'running'
@@ -869,7 +878,7 @@ class SQLiteStore:
                 recovery_parameters += (project_id,)
             connection.execute(recovery_query, recovery_parameters)
             for expired in expired_runs:
-                exhausted = int(expired["attempts"] or 0) >= max_attempts
+                exhausted = int(expired["lease_recoveries"] or 0) + 1 >= max_attempts
                 self._record_failure(
                     connection,
                     int(expired["id"]),
@@ -1076,7 +1085,7 @@ class SQLiteStore:
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         claim_token: str | None = None,
     ) -> bool:
-        """Record a retryable failure and requeue it until the attempt cap."""
+        """Record a retryable failure and requeue it until the failure cap."""
 
         if not failure_class:
             raise ValueError("failure_class cannot be empty")
@@ -1088,7 +1097,10 @@ class SQLiteStore:
         safe_reason = self._redact(reason)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            query = "SELECT attempts FROM review_runs WHERE id = ? AND status = 'running'"
+            query = (
+                "SELECT attempts, failure_attempts FROM review_runs "
+                "WHERE id = ? AND status = 'running'"
+            )
             parameters: tuple[object, ...] = (run_id,)
             if claim_token is not None:
                 query += " AND claim_token = ?"
@@ -1097,7 +1109,8 @@ class SQLiteStore:
             if row is None:
                 return False
             attempts = int(row["attempts"] or 0)
-            exhausted = attempts >= max_attempts
+            failure_attempts = int(row["failure_attempts"] or 0) + 1
+            exhausted = failure_attempts >= max_attempts
             status = "failed" if exhausted else "pending"
             finished_at = now.isoformat() if exhausted else None
             next_attempt_at = None if exhausted else (
@@ -1106,6 +1119,7 @@ class SQLiteStore:
             update_query = (
                 "UPDATE review_runs SET status = ?, finished_at = ?, error = ?, "
                 "failure_class = ?, retryable = 1, next_attempt_at = ?, "
+                "failure_attempts = ?, "
                 "lease_until = NULL, claim_token = NULL WHERE id = ? AND status = 'running'"
             )
             update_parameters: tuple[object, ...] = (
@@ -1114,6 +1128,7 @@ class SQLiteStore:
                 safe_reason,
                 failure_class,
                 next_attempt_at,
+                failure_attempts,
                 run_id,
             )
             if claim_token is not None:
@@ -1975,8 +1990,7 @@ class SQLiteStore:
 
         if not project_id or not project_id.strip():
             raise ValueError("project_id cannot be empty")
-        if not is_valid_sha(sha):
-            raise ValueError("invalid SHA: expected 40 or 64 hexadecimal characters")
+        sha = normalize_sha(sha)
         created_at = datetime.now(UTC).isoformat()
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")

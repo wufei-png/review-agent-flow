@@ -27,6 +27,17 @@ def test_enqueue_is_idempotent_and_claimable(tmp_path) -> None:
     assert store.claim_next() is None
 
 
+def test_sha_identity_is_case_insensitive(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "review.db")
+    uppercase_sha = "ABCDEF" * 6 + "ABCD"
+
+    first = store.enqueue("42", 1, uppercase_sha)
+    duplicate = store.enqueue("42", 1, uppercase_sha.lower())
+
+    assert duplicate.run_id == first.run_id
+    assert first.sha == uppercase_sha.lower()
+
+
 def test_review_run_schema_and_status_have_no_kind_discriminator(tmp_path) -> None:
     database = tmp_path / "review.db"
     store = SQLiteStore(database)
@@ -91,6 +102,38 @@ def test_deferred_run_does_not_block_a_later_run(tmp_path) -> None:
     next_run = store.claim_next()
     assert next_run is not None
     assert next_run.run_id == second.run_id
+
+
+def test_eligibility_deferrals_do_not_consume_failure_retry_budget(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "review.db")
+    run = store.enqueue("42", 1, SHA)
+
+    for _ in range(4):
+        claimed = store.claim_next()
+        assert claimed is not None
+        assert store.requeue(
+            claimed.run_id,
+            "waiting for successful pipeline",
+            claim_token=claimed.claim_token,
+        )
+
+    claimed = store.claim_next()
+    assert claimed is not None
+    assert claimed.attempts == 5
+    assert claimed.failure_attempts == 0
+    assert store.retry_or_fail(
+        run.run_id,
+        "gitlab_transport",
+        "temporary provider failure",
+        delay_seconds=0,
+        max_attempts=3,
+        claim_token=claimed.claim_token,
+    )
+
+    pending = store.get_review_run(run.run_id)
+    assert pending is not None
+    assert pending.status == "pending"
+    assert pending.failure_attempts == 1
 
 
 def test_expired_worker_lease_is_reclaimed_with_a_new_token(tmp_path) -> None:

@@ -531,6 +531,15 @@ def create_app(
                     {"accepted": False, "kind": "draft", "reason": "draft merge request"}
                 )
                 continue
+            if decision.kind == "close":
+                responses.append(
+                    {
+                        "accepted": False,
+                        "kind": "close",
+                        "reason": "closed parent Merge Request does not create a Review Run",
+                    }
+                )
+                continue
             run = store.enqueue(decision.project_id, decision.mr_iid, decision.sha)
             responses.append(
                 {

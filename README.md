@@ -43,9 +43,11 @@ pytest
 ruff check .
 ```
 
-当前代码已完成从 checkpoint 中 Agent-owned 预发布实现到上述本地目标的
-硬切换。不提供旧 Policy/SQLite/marker 兼容契约；项目尚在开发阶段，请以
-当前测试和 implementation-status 为准。
+当前代码已完成从 checkpoint 中 Agent-owned 预发布实现到 Program-owned
+发布路径的硬切换；Review Outcome、目标分支 Policy Snapshot 和生产运维门禁
+仍在实现中。不提供旧 Policy/SQLite/marker 兼容契约；项目尚在无生产数据的
+开发阶段，schema 变化时直接重建数据库，请以当前测试和
+implementation-status 为准。
 
 Store 丢失后的 Auto-fix Relation 只能通过显式 Operator 命令恢复。命令还需
 提供发布前保存的规范 Publication Plan JSON，以便重新核对远端 commit 的父

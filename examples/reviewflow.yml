@@ -1,4 +1,4 @@
-version: 2
+version: 3
 
 pipeline_gate: true
 
@@ -9,9 +9,8 @@ human:
 
 ai:
   enabled: false
-  command:
-    - opencode
-    - run
+  backend: local-agent
+  profile: default
   skill: .gitlab/review-agent/SKILL.md
   auto_fix: false
 

@@ -25,8 +25,7 @@ def canonical_note_marker(project_id: str, mr_iid: int, sha: str) -> str:
         raise ValueError("project_id must use marker-safe characters")
     if type(mr_iid) is not int or mr_iid <= 0:
         raise ValueError("mr_iid must be a positive integer")
-    if not is_valid_sha(sha):
-        raise ValueError("invalid SHA: expected 40 or 64 hexadecimal characters")
+    sha = normalize_sha(sha)
     return (
         f"<!-- reviewflow:v1;project={project_id};mr={mr_iid};"
         f"sha={sha};effect=note -->"
@@ -49,6 +48,14 @@ def is_valid_sha(value: object) -> bool:
     """Return whether *value* is an exact Git SHA accepted by ReviewFlow."""
 
     return isinstance(value, str) and _SHA_RE.fullmatch(value) is not None
+
+
+def normalize_sha(value: object) -> str:
+    """Return the canonical lowercase form of an accepted Git SHA."""
+
+    if not is_valid_sha(value):
+        raise ValueError("invalid SHA: expected 40 or 64 hexadecimal characters")
+    return str(value).lower()
 
 
 @dataclass(frozen=True)

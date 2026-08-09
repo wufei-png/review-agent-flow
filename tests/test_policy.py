@@ -46,6 +46,15 @@ notifications:
     assert policy.notifications.channels[0]["webhook_env"] == "FEISHU_WEBHOOK"
 
 
+def test_example_policy_matches_current_schema() -> None:
+    path = Path(__file__).parents[1] / "examples" / "reviewflow.yml"
+
+    policy = load_policy(path)
+
+    assert policy.ai.backend == "local-agent"
+    assert policy.ai.profile == "default"
+
+
 def test_rejects_invalid_policy(tmp_path: Path) -> None:
     path = tmp_path / "reviewflow.yml"
     path.write_text("ai:\n  enabled: maybe\n", encoding="utf-8")
