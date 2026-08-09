@@ -6,6 +6,7 @@ import os
 from typing import Any
 
 from .gitlab import (
+    CreatedCommit,
     CreatedMergeRequest,
     GitLabClient,
     GitLabIdentityConflict,
@@ -14,6 +15,7 @@ from .gitlab import (
     NoteMarkerLookup,
     Pipeline,
     has_exact_note_marker,
+    is_valid_sha,
 )
 
 
@@ -195,6 +197,34 @@ class PythonGitLabClient(GitLabClient):
     def create_branch(self, project_id: str, branch: str, ref: str) -> None:
         self._project(project_id).branches.create({"branch": branch, "ref": ref})
 
+    def create_repository_commit(
+        self,
+        project_id: str,
+        branch: str,
+        start_sha: str,
+        commit_message: str,
+        actions: tuple[dict[str, object], ...],
+        *,
+        force: bool = False,
+    ) -> CreatedCommit:
+        if not self._review_bot_username:
+            raise RuntimeError(
+                "GITLAB_REVIEW_BOT_USERNAME is required for Auto-fix publication"
+            )
+        commit = self._project(project_id).commits.create(
+            {
+                "branch": branch,
+                "start_sha": start_sha,
+                "commit_message": commit_message,
+                "actions": list(actions),
+                "force": force,
+            }
+        )
+        commit_sha = str(getattr(commit, "id", "") or "")
+        if not is_valid_sha(commit_sha):
+            raise GitLabIdentityConflict("GitLab returned an invalid Auto-fix commit identity")
+        return CreatedCommit(str(project_id), commit_sha, branch)
+
     def create_merge_request(
         self,
         project_id: str,
@@ -202,15 +232,37 @@ class PythonGitLabClient(GitLabClient):
         source_branch: str,
         target_branch: str,
         description: str,
+        *,
+        draft: bool = False,
     ) -> CreatedMergeRequest:
+        if not self._review_bot_username:
+            raise RuntimeError(
+                "GITLAB_REVIEW_BOT_USERNAME is required for Auto-fix publication"
+            )
+        published_title = title
+        if draft and not title.startswith(("Draft:", "[Draft]", "(Draft)")):
+            published_title = f"Draft: {title}"
         mr = self._project(project_id).mergerequests.create(
             {
-                "title": title,
+                "title": published_title,
                 "source_branch": source_branch,
                 "target_branch": target_branch,
                 "description": description,
             }
         )
+        author = getattr(mr, "author", {}) or {}
+        author_username = str(
+            author.get("username", "")
+            if isinstance(author, dict)
+            else getattr(author, "username", "")
+        )
+        if (
+            self._review_bot_username
+            and author_username != self._review_bot_username
+        ):
+            raise GitLabIdentityConflict(
+                "created Auto-fix Merge Request author does not match the Review Bot"
+            )
         return CreatedMergeRequest(
             project_id=str(project_id),
             iid=int(mr.iid),
@@ -219,6 +271,11 @@ class PythonGitLabClient(GitLabClient):
             target_branch=str(mr.target_branch),
             web_url=str(mr.web_url),
             description=str(getattr(mr, "description", "") or ""),
+            author_username=author_username,
+            draft=bool(
+                getattr(mr, "draft", False)
+                or getattr(mr, "work_in_progress", False)
+            ),
         )
 
     def find_merge_request_by_source_branch(

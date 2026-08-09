@@ -112,6 +112,73 @@ def test_merge_request_preserves_source_project_identity() -> None:
     assert merge_request.source_project_id == "99"
 
 
+def test_autofix_commit_uses_start_sha_and_never_forces() -> None:
+    payloads: list[dict[str, object]] = []
+
+    def create(payload: dict[str, object]) -> SimpleNamespace:
+        payloads.append(payload)
+        return SimpleNamespace(id="f" * 40)
+
+    project = SimpleNamespace(commits=SimpleNamespace(create=create))
+    client = _client(project)
+    actions = ({"action": "delete", "file_path": "old.txt"},)
+
+    commit = client.create_repository_commit(
+        "42",
+        "autofix/branch",
+        SHA,
+        "Auto-fix",
+        actions,
+        force=False,
+    )
+
+    assert commit.sha == "f" * 40
+    assert payloads == [
+        {
+            "branch": "autofix/branch",
+            "start_sha": SHA,
+            "commit_message": "Auto-fix",
+            "actions": list(actions),
+            "force": False,
+        }
+    ]
+
+
+def test_autofix_merge_request_freezes_creation_readiness_and_bot_author() -> None:
+    payloads: list[dict[str, object]] = []
+
+    def create(payload: dict[str, object]) -> SimpleNamespace:
+        payloads.append(payload)
+        return SimpleNamespace(
+            iid=9,
+            title=payload["title"],
+            source_branch=payload["source_branch"],
+            target_branch=payload["target_branch"],
+            description=payload["description"],
+            web_url="https://mr/9",
+            author={"username": "review-bot"},
+            draft=True,
+            work_in_progress=False,
+        )
+
+    project = SimpleNamespace(mergerequests=SimpleNamespace(create=create))
+    client = _client(project)
+
+    merge_request = client.create_merge_request(
+        "42",
+        "Draft: [ReviewFlow Auto-Fix] Parent",
+        "autofix/branch",
+        "feature",
+        "marker",
+        draft=True,
+    )
+
+    assert merge_request.author_username == "review-bot"
+    assert merge_request.draft is True
+    assert payloads[0]["title"] == "Draft: [ReviewFlow Auto-Fix] Parent"
+    assert "draft" not in payloads[0]
+
+
 def test_note_marker_paginates_and_requires_review_bot_author() -> None:
     marker = canonical_note_marker("42", 1, SHA)
     notes = FakeNotes(

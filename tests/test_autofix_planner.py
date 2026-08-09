@@ -185,3 +185,4 @@ def test_publication_payload_contains_only_independent_digest_inputs(tmp_path: P
     assert payload["branch"] == f"autofix/MR-1/sha-{sha}/intent-nonce"
     assert payload["marker_template"].endswith("plan_sha256={plan_sha256} -->")
     assert str(payload["commit_message"]).endswith("[skip ci]")
+    assert str(payload["title"]).startswith("Draft: ")

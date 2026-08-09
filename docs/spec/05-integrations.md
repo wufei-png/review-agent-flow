@@ -38,6 +38,8 @@ autofix/MR-<iid>/sha-<sha>/intent-<nonce>
 <!-- reviewflow:v1;project=<project-id>;mr=<iid>;sha=<sha>;effect=autofix;intent=<nonce>;plan_sha256=<digest> -->
 ```
 
+For `initial_readiness=draft`, the frozen creation title begins with GitLab's canonical `Draft: ` prefix; `ready` omits it. Readiness is not sent as an undocumented create-MR field.
+
 The digest input is the canonical UTF-8 JSON Plan payload with sorted keys and no insignificant whitespace. It contains every publication input and a marker template, but excludes the derived `plan_sha256` value and final rendered marker. ReviewFlow hashes that payload, renders the marker from the digest, and freezes the payload, digest and final marker together. This avoids self-reference while binding every independent publication choice. Retry uses the same frozen Plan and Intent nonce.
 
 After GitLab returns the child identity, ReviewFlow persists the Auto-fix Relation and its idempotent Notification Request in one SQLite transaction. A publishable Relation cannot be committed without that request; reconciliation repairs an older incomplete transaction state before treating publication as complete.

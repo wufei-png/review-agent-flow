@@ -63,6 +63,7 @@ def _run_worker(args: argparse.Namespace) -> int:
         )
     except OperatorConfigError as exc:
         raise SystemExit(f"invalid Operator configuration: {exc}") from exc
+    review_bot_username = _required(None, "GITLAB_REVIEW_BOT_USERNAME")
     if policy.ai.auto_fix and (
         not operator_config.autofix_publication.enabled
         or project_id not in operator_config.autofix_publication.allowed_projects
@@ -71,7 +72,7 @@ def _run_worker(args: argparse.Namespace) -> int:
     store = SQLiteStore(args.db or os.getenv("REVIEW_AGENT_FLOW_DB", "review-agent-flow.sqlite3"))
     worker = ReviewWorker(
         store=store,
-        gitlab=PythonGitLabClient(gitlab_url, gitlab_token),
+        gitlab=PythonGitLabClient(gitlab_url, gitlab_token, review_bot_username),
         worktrees=GitWorktreeManager(
             repository=repository,
             root=Path(args.worktrees or os.getenv("REVIEW_AGENT_FLOW_WORKTREES", "/tmp/review-agent-flow")),

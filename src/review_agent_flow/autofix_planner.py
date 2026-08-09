@@ -369,6 +369,9 @@ def build_publication_plan_payload(
     commit_message = f"ReviewFlow Auto-fix for !{mr_iid} at {sha}"
     if ci_trigger == "manual":
         commit_message += "\n\n[skip ci]"
+    title = f"[ReviewFlow Auto-Fix] {parent_title}"
+    if initial_readiness == "draft":
+        title = f"Draft: {title}"
     return {
         "version": 1,
         "review_key": {"project_id": project_id, "mr_iid": mr_iid, "sha": sha},
@@ -383,7 +386,7 @@ def build_publication_plan_payload(
         "branch": branch,
         "marker_template": marker_template,
         "commit_message": commit_message,
-        "title": f"[ReviewFlow Auto-Fix] {parent_title}",
+        "title": title,
         "target_branch": target_branch,
         "initial_readiness": initial_readiness,
         "ci_trigger": ci_trigger,

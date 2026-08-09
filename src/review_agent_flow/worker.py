@@ -17,6 +17,7 @@ from .autofix_planner import (
     capture_diff_envelope,
     run_verifier,
 )
+from .autofix_publisher import AutoFixPublisher
 from .failures import FailureInfo, classify_exception
 from .gitlab import GitLabClient, canonical_note_marker, is_valid_sha
 from .note_publisher import NotePublisher
@@ -149,6 +150,16 @@ class ReviewWorker:
             retry_delay_seconds=retry_delay_seconds,
             max_retry_delay_seconds=max_retry_delay_seconds,
         )
+        self.auto_fix_publisher = AutoFixPublisher(
+            store,
+            gitlab,
+            self.project_id,
+            self.autofix_publication,
+            self.notifier,
+            retry_delay_seconds=retry_delay_seconds,
+            max_retry_delay_seconds=max_retry_delay_seconds,
+            secrets=self._redaction_secrets(),
+        )
         self.auto_fix_reconciler = AutoFixReconciler(
             store,
             gitlab,
@@ -248,6 +259,13 @@ class ReviewWorker:
         )
 
     def process_one(self) -> WorkerResult | None:
+        auto_fix_publication = self.auto_fix_publisher.process()
+        if auto_fix_publication is not None:
+            return WorkerResult(
+                auto_fix_publication.run_id,
+                auto_fix_publication.status,
+                detail=auto_fix_publication.detail,
+            )
         run = self.store.claim_next(
             lease_seconds=self.lease_seconds,
             max_attempts=self.max_attempts,
@@ -283,6 +301,7 @@ class ReviewWorker:
         receipts: dict[str, EffectReceipt] = {}
         agent_finished = False
         note_request_id: int | None = None
+        auto_fix_plan_id: int | None = None
 
         auto_fix_intent: AutoFixPublicationIntent | None = None
         try:
@@ -503,6 +522,12 @@ class ReviewWorker:
                         auto_fix_intent,
                         receipts["autofix_plan"],
                     )
+                    frozen_plan = self.store.get_auto_fix_publication_plan(run.run_id)
+                    auto_fix_plan_id = (
+                        frozen_plan.plan_id
+                        if frozen_plan is not None and frozen_plan.state == "frozen"
+                        else None
+                    )
                 if not self.store.finish(run.run_id, "succeeded", claim_token=run.claim_token):
                     raise LeaseLostError("Review Run lease lost before Agent result completion")
                 self._log_run(run, status="succeeded", diagnostic="Agent process exited successfully")
@@ -527,6 +552,16 @@ class ReviewWorker:
                         self._log_run(
                             run,
                             status="note_publication_deferred",
+                            level=logging.WARNING,
+                            diagnostic=exc,
+                        )
+                if auto_fix_plan_id is not None:
+                    try:
+                        self.auto_fix_publisher.process(plan_id=auto_fix_plan_id)
+                    except Exception as exc:  # noqa: BLE001 - Plan state is independently durable
+                        self._log_run(
+                            run,
+                            status="autofix_publication_deferred",
                             level=logging.WARNING,
                             diagnostic=exc,
                         )

@@ -1,4 +1,3 @@
-import json
 import sqlite3
 import subprocess
 import sys
@@ -6,7 +5,9 @@ from pathlib import Path
 
 import pytest
 
+from review_agent_flow.autofix_publisher import AutoFixPublicationResult
 from review_agent_flow.gitlab import (
+    CreatedCommit,
     CreatedMergeRequest,
     MergeRequest,
     Note,
@@ -89,6 +90,8 @@ class FakeGitLab:
         self.notes: list[Note] = []
         self.created_note_bodies: list[str] = []
         self.note_lookups: list[str] = []
+        self.created_commits: list[dict[str, object]] = []
+        self.created_auto_fix_mrs: list[CreatedMergeRequest] = []
 
     def get_merge_request(self, project_id: str, mr_iid: int) -> MergeRequest:
         return self.mr
@@ -124,10 +127,51 @@ class FakeGitLab:
     def create_branch(self, project_id: str, branch: str, ref: str) -> None:
         pass
 
+    def create_repository_commit(
+        self,
+        project_id: str,
+        branch: str,
+        start_sha: str,
+        commit_message: str,
+        actions: tuple[dict[str, object], ...],
+        *,
+        force: bool = False,
+    ) -> CreatedCommit:
+        self.created_commits.append(
+            {
+                "project_id": project_id,
+                "branch": branch,
+                "start_sha": start_sha,
+                "commit_message": commit_message,
+                "actions": actions,
+                "force": force,
+            }
+        )
+        return CreatedCommit(project_id, "f" * 40, branch)
+
     def create_merge_request(
-        self, project_id: str, title: str, source_branch: str, target_branch: str, description: str
+        self,
+        project_id: str,
+        title: str,
+        source_branch: str,
+        target_branch: str,
+        description: str,
+        *,
+        draft: bool = False,
     ) -> CreatedMergeRequest:
-        return CreatedMergeRequest(project_id, 2, title, source_branch, target_branch, "url")
+        merge_request = CreatedMergeRequest(
+            project_id,
+            2,
+            title,
+            source_branch,
+            target_branch,
+            "url",
+            description=description,
+            author_username="review-bot",
+            draft=draft,
+        )
+        self.created_auto_fix_mrs.append(merge_request)
+        return merge_request
 
     def find_merge_request_by_source_branch(
         self,
@@ -601,7 +645,7 @@ def test_worker_resolves_program_auto_fix_intent_when_agent_has_no_proposal(
     assert store.get_auto_fix_publication_plan(run.run_id) is None
 
 
-def test_worker_freezes_verified_program_owned_auto_fix_plan(tmp_path: Path) -> None:
+def test_worker_publishes_verified_program_owned_auto_fix_plan(tmp_path: Path) -> None:
     repository = tmp_path / "repo"
     repository.mkdir()
     sha = _git_repository(repository)
@@ -619,9 +663,10 @@ def test_worker_freezes_verified_program_owned_auto_fix_plan(tmp_path: Path) -> 
             "'autofix_proposal': {'summary': 'Apply fix'}}))"
         ),
     )
+    gitlab = FakeGitLab(mr)
     worker = ReviewWorker(
         store,
-        FakeGitLab(mr),
+        gitlab,
         GitWorktreeManager(repository, tmp_path / "worktrees"),
         ReviewPolicy(ai=AIPolicy(enabled=True, auto_fix=True, command=command)),
         repository,
@@ -634,15 +679,52 @@ def test_worker_freezes_verified_program_owned_auto_fix_plan(tmp_path: Path) -> 
     assert result is not None and result.status == "succeeded"
     intent = store.get_auto_fix_publication_intent(run.run_id)
     plan = store.get_auto_fix_publication_plan(run.run_id)
-    assert intent is not None and intent.state == "plan_frozen"
+    assert intent is not None and intent.state == "published"
     assert plan is not None
-    payload = json.loads(plan.plan_json)
-    assert payload["branch"] == f"autofix/MR-1/sha-{sha}/intent-{intent.nonce}"
-    assert payload["initial_readiness"] == "draft"
-    assert payload["ci_trigger"] == "manual"
+    assert plan.plan_json is None
     assert plan.marker.endswith(f"plan_sha256={plan.plan_sha256} -->")
+    assert plan.state == "published"
+    assert gitlab.created_commits[0]["start_sha"] == sha
+    assert gitlab.created_commits[0]["force"] is False
+    assert gitlab.created_auto_fix_mrs[0].draft is True
     receipt = store.list_effect_receipts(run.run_id, "autofix_plan")[0]
-    assert receipt.state == "plan_frozen"
+    assert receipt.state == "published"
+    relation = store.get_program_auto_fix_relation(plan.plan_id)
+    assert relation is not None and relation.auto_fix_mr_iid == 2
+    assert relation.source_branch == f"autofix/MR-1/sha-{sha}/intent-{intent.nonce}"
+    request = store.get_auto_fix_notification_request(relation.relation_id)
+    assert request is not None and request.recipients == ("alice",)
+
+
+def test_worker_services_pending_publication_before_new_review_run(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    sha = _git_repository(repository)
+    mr = MergeRequest("42", 1, "Queued", "alice", "feature", "main", sha, "https://mr")
+    store = SQLiteStore(tmp_path / "review.db")
+    queued = store.enqueue("42", 1, sha)
+    worker = ReviewWorker(
+        store,
+        FakeGitLab(mr),
+        GitWorktreeManager(repository, tmp_path / "worktrees"),
+        ReviewPolicy(),
+        repository,
+        "https://gitlab",
+        project_id="42",
+    )
+    monkeypatch.setattr(
+        worker.auto_fix_publisher,
+        "process",
+        lambda: AutoFixPublicationResult(77, 88, "published", "done"),
+    )
+
+    result = worker.process_one()
+
+    assert result == type(result)(88, "published", detail="done")
+    claimed = store.claim_next(project_id="42")
+    assert claimed is not None and claimed.run_id == queued.run_id
 
 
 def test_workspace_diff_without_proposal_blocks_only_auto_fix(tmp_path: Path) -> None:

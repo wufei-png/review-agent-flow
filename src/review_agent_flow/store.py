@@ -21,11 +21,12 @@ DEFAULT_NOTIFICATION_LEASE_SECONDS = 30
 DEFAULT_NOTIFICATION_MAX_ATTEMPTS = 3
 DEFAULT_WORKTREE_CLEANUP_LEASE_SECONDS = 60
 DEFAULT_WORKTREE_CLEANUP_MAX_ATTEMPTS = 5
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 DEFAULT_EFFECT_LEASE_SECONDS = 60
 DEFAULT_NOTE_PUBLICATION_LEASE_SECONDS = 60
 DEFAULT_NOTE_PUBLICATION_MAX_ATTEMPTS = 5
 DEFAULT_NOTE_UNCERTAIN_LOOKUP_ATTEMPTS = 3
+DEFAULT_AUTO_FIX_PUBLICATION_LEASE_SECONDS = 60
 
 
 def auto_fix_intent_marker(run_id: int, parent_sha: str) -> str:
@@ -142,12 +143,54 @@ class AutoFixPublicationPlan:
     plan_id: int
     intent_id: int
     run_id: int
-    plan_json: str
+    plan_json: str | None
     plan_sha256: str
     marker: str
     candidate_sha256: str
     verification_json: str
     state: str
+    created_at: str
+    updated_at: str
+    attempts: int
+    write_uncertain: bool
+    branch_commit_sha: str | None
+    external_mr_iid: int | None
+    next_attempt_at: str | None
+    lease_until: str | None
+    claim_token: str | None
+    last_error: str | None
+
+
+@dataclass(frozen=True)
+class ProgramAutoFixRelation:
+    relation_id: int
+    intent_id: int
+    plan_id: int
+    run_id: int
+    parent_project_id: str
+    parent_mr_iid: int
+    parent_sha: str
+    auto_fix_project_id: str
+    auto_fix_mr_iid: int
+    source_branch: str
+    target_branch: str
+    marker: str
+    plan_sha256: str
+    status: str
+    merged_sha: str | None
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class NotificationRequest:
+    request_id: int
+    relation_id: int
+    correlation_id: str
+    title: str
+    body: str
+    url: str | None
+    recipients: tuple[str, ...]
     created_at: str
 
 
@@ -214,7 +257,7 @@ class WorktreeRecord:
 class SQLiteStore:
     """Small SQLite store.
 
-    Version 5 is intentionally a fresh schema.  There is no production database
+    Version 6 is intentionally a fresh schema.  There is no production database
     migration contract for this pre-release implementation; an older database
     must be recreated rather than guessed into a new notification or Auto-fix
     routing model.
@@ -372,12 +415,53 @@ class SQLiteStore:
                     intent_id INTEGER NOT NULL UNIQUE
                         REFERENCES auto_fix_publication_intents(id),
                     run_id INTEGER NOT NULL UNIQUE REFERENCES review_runs(id),
-                    plan_json TEXT NOT NULL,
+                    plan_json TEXT,
                     plan_sha256 TEXT NOT NULL UNIQUE,
                     marker TEXT NOT NULL UNIQUE,
                     candidate_sha256 TEXT NOT NULL,
                     verification_json TEXT NOT NULL,
                     state TEXT NOT NULL DEFAULT 'frozen',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    write_uncertain INTEGER NOT NULL DEFAULT 0,
+                    branch_commit_sha TEXT,
+                    external_mr_iid INTEGER,
+                    next_attempt_at TEXT,
+                    lease_until TEXT,
+                    claim_token TEXT,
+                    last_error TEXT
+                );
+                CREATE TABLE IF NOT EXISTS auto_fix_relations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    intent_id INTEGER NOT NULL UNIQUE
+                        REFERENCES auto_fix_publication_intents(id),
+                    plan_id INTEGER NOT NULL UNIQUE
+                        REFERENCES auto_fix_publication_plans(id),
+                    run_id INTEGER NOT NULL UNIQUE REFERENCES review_runs(id),
+                    parent_project_id TEXT NOT NULL,
+                    parent_mr_iid INTEGER NOT NULL,
+                    parent_sha TEXT NOT NULL,
+                    auto_fix_project_id TEXT NOT NULL,
+                    auto_fix_mr_iid INTEGER NOT NULL,
+                    source_branch TEXT NOT NULL,
+                    target_branch TEXT NOT NULL,
+                    marker TEXT NOT NULL UNIQUE,
+                    plan_sha256 TEXT NOT NULL UNIQUE,
+                    status TEXT NOT NULL DEFAULT 'opened',
+                    merged_sha TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(auto_fix_project_id, auto_fix_mr_iid)
+                );
+                CREATE TABLE IF NOT EXISTS notification_requests (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    relation_id INTEGER NOT NULL UNIQUE REFERENCES auto_fix_relations(id),
+                    correlation_id TEXT NOT NULL UNIQUE,
+                    title TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    url TEXT,
+                    recipients_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS review_run_failures (
@@ -484,7 +568,7 @@ class SQLiteStore:
                     last_error TEXT,
                     UNIQUE(run_id, path)
                 );
-                PRAGMA user_version = 5;
+                PRAGMA user_version = 6;
                 """
             )
 
@@ -572,13 +656,17 @@ class SQLiteStore:
     def _auto_fix_publication_plan_from_row(
         row: sqlite3.Row,
     ) -> AutoFixPublicationPlan:
-        return AutoFixPublicationPlan(**dict(row))
+        values = dict(row)
+        values["write_uncertain"] = bool(values["write_uncertain"])
+        return AutoFixPublicationPlan(**values)
 
     @staticmethod
     def _auto_fix_publication_plan_columns() -> str:
         return (
             "id AS plan_id, intent_id, run_id, plan_json, plan_sha256, marker, "
-            "candidate_sha256, verification_json, state, created_at"
+            "candidate_sha256, verification_json, state, created_at, updated_at, "
+            "attempts, write_uncertain, branch_commit_sha, external_mr_iid, "
+            "next_attempt_at, lease_until, claim_token, last_error"
         )
 
     def enqueue(self, project_id: str, mr_iid: int, sha: str) -> ReviewRun:
@@ -2185,8 +2273,8 @@ class SQLiteStore:
                     """
                     INSERT INTO auto_fix_publication_plans(
                         intent_id, run_id, plan_json, plan_sha256, marker,
-                        candidate_sha256, verification_json, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        candidate_sha256, verification_json, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         intent.intent_id,
@@ -2196,6 +2284,7 @@ class SQLiteStore:
                         marker,
                         candidate_sha256,
                         verification_json,
+                        now,
                         now,
                     ),
                 )
@@ -2245,6 +2334,548 @@ class SQLiteStore:
         return (
             self._auto_fix_publication_plan_from_row(row) if row is not None else None
         )
+
+    def claim_auto_fix_publication_plan(
+        self,
+        *,
+        plan_id: int | None = None,
+        project_id: str | None = None,
+        lease_seconds: int = DEFAULT_AUTO_FIX_PUBLICATION_LEASE_SECONDS,
+    ) -> AutoFixPublicationPlan | None:
+        if lease_seconds <= 0:
+            raise ValueError("Auto-fix publication lease must be positive")
+        now_value = self._now()
+        now = now_value.isoformat()
+        lease_until = (now_value + timedelta(seconds=lease_seconds)).isoformat()
+        filters = ""
+        parameters: list[object] = [now]
+        reclaim_filters = ""
+        reclaim_parameters: list[object] = [now, now]
+        if plan_id is not None:
+            filters += " AND auto_fix_publication_plans.id = ?"
+            parameters.append(plan_id)
+            reclaim_filters += " AND id = ?"
+            reclaim_parameters.append(plan_id)
+        if project_id is not None:
+            if not project_id.strip():
+                raise ValueError("project_id cannot be empty")
+            filters += " AND auto_fix_publication_intents.project_id = ?"
+            parameters.append(project_id)
+            reclaim_filters += (
+                " AND EXISTS (SELECT 1 FROM auto_fix_publication_intents "
+                "WHERE auto_fix_publication_intents.id = "
+                "auto_fix_publication_plans.intent_id "
+                "AND auto_fix_publication_intents.project_id = ?)"
+            )
+            reclaim_parameters.append(project_id)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                f"""
+                UPDATE auto_fix_publication_plans
+                SET state = 'needs_reconciliation', write_uncertain = 1,
+                    lease_until = NULL, claim_token = NULL, updated_at = ?,
+                    last_error = COALESCE(
+                        last_error, 'publication lease expired with external result uncertain'
+                    )
+                WHERE state = 'running'
+                  AND (lease_until IS NULL OR lease_until <= ?)
+                  {reclaim_filters}
+                """,
+                tuple(reclaim_parameters),
+            )
+            connection.execute(
+                """
+                UPDATE auto_fix_publication_intents
+                SET state = 'needs_reconciliation', updated_at = ?,
+                    last_error = COALESCE(
+                        last_error, 'publication lease expired with external result uncertain'
+                    )
+                WHERE state = 'plan_frozen' AND id IN (
+                    SELECT intent_id FROM auto_fix_publication_plans
+                    WHERE state = 'needs_reconciliation' AND write_uncertain = 1
+                )
+                """,
+                (now,),
+            )
+            connection.execute(
+                """
+                UPDATE effect_receipts
+                SET state = 'needs_reconciliation', updated_at = ?,
+                    error = COALESCE(
+                        error, 'publication lease expired with external result uncertain'
+                    )
+                WHERE effect_kind = 'autofix_plan' AND state = 'plan_frozen'
+                  AND run_id IN (
+                    SELECT run_id FROM auto_fix_publication_plans
+                    WHERE state = 'needs_reconciliation' AND write_uncertain = 1
+                  )
+                """,
+                (now,),
+            )
+            row = connection.execute(
+                f"""
+                SELECT auto_fix_publication_plans.id
+                FROM auto_fix_publication_plans
+                JOIN auto_fix_publication_intents
+                  ON auto_fix_publication_intents.id = auto_fix_publication_plans.intent_id
+                WHERE auto_fix_publication_plans.state = 'frozen'
+                  AND (auto_fix_publication_plans.next_attempt_at IS NULL
+                       OR auto_fix_publication_plans.next_attempt_at <= ?)
+                  {filters}
+                ORDER BY auto_fix_publication_plans.id LIMIT 1
+                """,
+                tuple(parameters),
+            ).fetchone()
+            if row is None:
+                return None
+            token = uuid4().hex
+            updated = connection.execute(
+                """
+                UPDATE auto_fix_publication_plans
+                SET state = 'running', attempts = attempts + 1,
+                    lease_until = ?, claim_token = ?, updated_at = ?, last_error = NULL
+                WHERE id = ? AND state = 'frozen'
+                """,
+                (lease_until, token, now, row["id"]),
+            )
+            if updated.rowcount != 1:
+                return None
+            claimed = connection.execute(
+                f"SELECT {self._auto_fix_publication_plan_columns()} "
+                "FROM auto_fix_publication_plans WHERE id = ?",
+                (row["id"],),
+            ).fetchone()
+        assert claimed is not None
+        return self._auto_fix_publication_plan_from_row(claimed)
+
+    def finish_auto_fix_publication_plan(
+        self,
+        plan_id: int,
+        claim_token: str | None,
+        *,
+        state: str,
+        error: str,
+        write_uncertain: bool = False,
+    ) -> bool:
+        if state not in {"blocked", "superseded", "needs_reconciliation"}:
+            raise ValueError("invalid Auto-fix Publication Plan terminal state")
+        if not claim_token:
+            return False
+        now = self._now().isoformat()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT p.run_id, p.intent_id, i.nonce
+                FROM auto_fix_publication_plans p
+                JOIN auto_fix_publication_intents i ON i.id = p.intent_id
+                WHERE p.id = ? AND p.state = 'running' AND p.claim_token = ?
+                  AND p.lease_until IS NOT NULL AND p.lease_until > ?
+                """,
+                (plan_id, claim_token, now),
+            ).fetchone()
+            if row is None:
+                return False
+            cursor = connection.execute(
+                """
+                UPDATE auto_fix_publication_plans
+                SET state = ?, write_uncertain = ?, last_error = ?, updated_at = ?,
+                    next_attempt_at = NULL, lease_until = NULL, claim_token = NULL
+                WHERE id = ? AND state = 'running' AND claim_token = ?
+                  AND lease_until IS NOT NULL AND lease_until > ?
+                """,
+                (
+                    state,
+                    int(write_uncertain),
+                    self._redact(error),
+                    now,
+                    plan_id,
+                    claim_token,
+                    now,
+                ),
+            )
+            if cursor.rowcount == 1:
+                connection.execute(
+                    """
+                    UPDATE auto_fix_publication_intents
+                    SET state = ?, updated_at = ?, last_error = ?
+                    WHERE id = ?
+                    """,
+                    (state, now, self._redact(error), row["intent_id"]),
+                )
+                connection.execute(
+                    """
+                    UPDATE effect_receipts
+                    SET state = ?, detail = ?, error = ?, updated_at = ?
+                    WHERE run_id = ? AND effect_kind = 'autofix_plan'
+                      AND dedupe_key = ? AND state = 'plan_frozen'
+                    """,
+                    (
+                        state,
+                        "Auto-fix publication requires reconciliation"
+                        if state == "needs_reconciliation"
+                        else "Auto-fix publication did not create a Relation",
+                        self._redact(error),
+                        now,
+                        row["run_id"],
+                        f"autofix-intent:{row['nonce']}",
+                    ),
+                )
+        return cursor.rowcount == 1
+
+    def extend_auto_fix_publication_lease(
+        self,
+        plan_id: int,
+        claim_token: str | None,
+        lease_seconds: int = DEFAULT_AUTO_FIX_PUBLICATION_LEASE_SECONDS,
+    ) -> bool:
+        if not claim_token or lease_seconds <= 0:
+            return False
+        now_value = self._now()
+        now = now_value.isoformat()
+        lease_until = (now_value + timedelta(seconds=lease_seconds)).isoformat()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE auto_fix_publication_plans
+                SET lease_until = ?, updated_at = ?
+                WHERE id = ? AND state = 'running' AND claim_token = ?
+                  AND lease_until IS NOT NULL AND lease_until > ?
+                """,
+                (lease_until, now, plan_id, claim_token, now),
+            )
+        return cursor.rowcount == 1
+
+    def retry_auto_fix_publication_plan(
+        self,
+        plan_id: int,
+        claim_token: str | None,
+        error: str,
+        *,
+        delay_seconds: float,
+        max_attempts: int,
+    ) -> bool:
+        if not claim_token:
+            return False
+        if delay_seconds < 0 or max_attempts <= 0:
+            raise ValueError("invalid Auto-fix publication retry settings")
+        now_value = self._now()
+        now = now_value.isoformat()
+        next_attempt = (now_value + timedelta(seconds=delay_seconds)).isoformat()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT p.attempts, p.run_id, p.intent_id, i.nonce
+                FROM auto_fix_publication_plans p
+                JOIN auto_fix_publication_intents i ON i.id = p.intent_id
+                WHERE p.id = ? AND p.state = 'running' AND p.claim_token = ?
+                  AND p.lease_until IS NOT NULL AND p.lease_until > ?
+                  AND p.branch_commit_sha IS NULL
+                """,
+                (plan_id, claim_token, now),
+            ).fetchone()
+            if row is None:
+                return False
+            exhausted = int(row["attempts"]) >= max_attempts
+            connection.execute(
+                """
+                UPDATE auto_fix_publication_plans
+                SET state = ?, next_attempt_at = ?, lease_until = NULL,
+                    claim_token = NULL, last_error = ?, updated_at = ?
+                WHERE id = ? AND state = 'running' AND claim_token = ?
+                """,
+                (
+                    "blocked" if exhausted else "frozen",
+                    None if exhausted else next_attempt,
+                    self._redact(error),
+                    now,
+                    plan_id,
+                    claim_token,
+                ),
+            )
+            if exhausted:
+                safe_error = self._redact(error)
+                connection.execute(
+                    """
+                    UPDATE auto_fix_publication_intents
+                    SET state = 'blocked', updated_at = ?, last_error = ?
+                    WHERE id = ?
+                    """,
+                    (now, safe_error, row["intent_id"]),
+                )
+                connection.execute(
+                    """
+                    UPDATE effect_receipts
+                    SET state = 'blocked',
+                        detail = 'Auto-fix publication preflight retry limit reached',
+                        error = ?, updated_at = ?
+                    WHERE run_id = ? AND effect_kind = 'autofix_plan'
+                      AND dedupe_key = ? AND state = 'plan_frozen'
+                    """,
+                    (
+                        safe_error,
+                        now,
+                        row["run_id"],
+                        f"autofix-intent:{row['nonce']}",
+                    ),
+                )
+        return not exhausted
+
+    def record_auto_fix_branch_commit(
+        self,
+        plan_id: int,
+        claim_token: str | None,
+        commit_sha: str,
+    ) -> bool:
+        if not is_valid_sha(commit_sha):
+            raise ValueError("invalid Auto-fix commit SHA")
+        if not claim_token:
+            return False
+        now = self._now().isoformat()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE auto_fix_publication_plans
+                SET branch_commit_sha = ?, updated_at = ?
+                WHERE id = ? AND state = 'running' AND claim_token = ?
+                  AND lease_until IS NOT NULL AND lease_until > ?
+                  AND (branch_commit_sha IS NULL OR branch_commit_sha = ?)
+                """,
+                (commit_sha, now, plan_id, claim_token, now, commit_sha),
+            )
+        return cursor.rowcount == 1
+
+    def complete_auto_fix_publication(
+        self,
+        plan_id: int,
+        claim_token: str | None,
+        *,
+        auto_fix_project_id: str,
+        auto_fix_mr_iid: int,
+        source_branch: str,
+        target_branch: str,
+        marker: str,
+        title: str,
+        body: str,
+        url: str,
+        recipients: tuple[str, ...],
+        channels: tuple[tuple[str, str], ...],
+    ) -> tuple[ProgramAutoFixRelation, NotificationRequest] | None:
+        """Persist Relation, Notification Request and deliveries in one transaction."""
+
+        if not claim_token or auto_fix_mr_iid <= 0:
+            return None
+        if len({channel_id for channel_id, _channel in channels}) != len(channels):
+            raise ValueError("notification channel IDs must be unique")
+        now = self._now().isoformat()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT p.id AS plan_id, p.run_id, p.plan_json, p.plan_sha256,
+                       p.marker, p.branch_commit_sha, i.id AS intent_id,
+                       i.project_id, i.mr_iid, i.sha, i.nonce
+                FROM auto_fix_publication_plans p
+                JOIN auto_fix_publication_intents i ON i.id = p.intent_id
+                WHERE p.id = ? AND p.state = 'running' AND p.claim_token = ?
+                  AND p.lease_until IS NOT NULL AND p.lease_until > ?
+                  AND p.branch_commit_sha IS NOT NULL
+                """,
+                (plan_id, claim_token, now),
+            ).fetchone()
+            if row is None:
+                return None
+            payload = json.loads(str(row["plan_json"]))
+            if (
+                auto_fix_project_id != str(row["project_id"])
+                or source_branch != payload.get("branch")
+                or target_branch != payload.get("target_branch")
+                or marker != str(row["marker"])
+            ):
+                raise ValueError("published Auto-fix identity does not match its frozen Plan")
+            connection.execute(
+                """
+                INSERT INTO auto_fix_relations(
+                    intent_id, plan_id, run_id, parent_project_id, parent_mr_iid,
+                    parent_sha, auto_fix_project_id, auto_fix_mr_iid,
+                    source_branch, target_branch, marker, plan_sha256,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(plan_id) DO NOTHING
+                """,
+                (
+                    row["intent_id"],
+                    row["plan_id"],
+                    row["run_id"],
+                    row["project_id"],
+                    row["mr_iid"],
+                    row["sha"],
+                    auto_fix_project_id,
+                    auto_fix_mr_iid,
+                    source_branch,
+                    target_branch,
+                    marker,
+                    row["plan_sha256"],
+                    now,
+                    now,
+                ),
+            )
+            relation_row = connection.execute(
+                """
+                SELECT id AS relation_id, intent_id, plan_id, run_id,
+                       parent_project_id, parent_mr_iid, parent_sha,
+                       auto_fix_project_id, auto_fix_mr_iid, source_branch,
+                       target_branch, marker, plan_sha256, status, merged_sha,
+                       created_at, updated_at
+                FROM auto_fix_relations WHERE plan_id = ?
+                """,
+                (plan_id,),
+            ).fetchone()
+            assert relation_row is not None
+            relation = ProgramAutoFixRelation(**dict(relation_row))
+            if (
+                relation.auto_fix_project_id != auto_fix_project_id
+                or relation.auto_fix_mr_iid != auto_fix_mr_iid
+                or relation.source_branch != source_branch
+                or relation.target_branch != target_branch
+                or relation.marker != marker
+            ):
+                raise ValueError("Auto-fix Relation is immutable")
+            correlation_id = f"autofix-plan:{row['plan_sha256']}"
+            recipients_json = json.dumps(recipients)
+            connection.execute(
+                """
+                INSERT INTO notification_requests(
+                    relation_id, correlation_id, title, body, url,
+                    recipients_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(relation_id) DO NOTHING
+                """,
+                (
+                    relation.relation_id,
+                    correlation_id,
+                    title,
+                    body,
+                    url,
+                    recipients_json,
+                    now,
+                ),
+            )
+            request_row = connection.execute(
+                """
+                SELECT id AS request_id, relation_id, correlation_id, title,
+                       body, url, recipients_json, created_at
+                FROM notification_requests WHERE relation_id = ?
+                """,
+                (relation.relation_id,),
+            ).fetchone()
+            assert request_row is not None
+            request_values = dict(request_row)
+            request_recipients = tuple(json.loads(request_values.pop("recipients_json")))
+            request = NotificationRequest(
+                **request_values, recipients=request_recipients
+            )
+            if (
+                request.correlation_id != correlation_id
+                or request.title != title
+                or request.body != body
+                or request.url != url
+                or request.recipients != recipients
+            ):
+                raise ValueError("Auto-fix Notification Request is immutable")
+            for channel_id, channel in channels:
+                connection.execute(
+                    """
+                    INSERT INTO notification_outbox(
+                        correlation_id, channel_id, channel, title, body, url,
+                        recipients_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(correlation_id, channel_id) DO NOTHING
+                    """,
+                    (
+                        correlation_id,
+                        channel_id,
+                        channel,
+                        title,
+                        body,
+                        url,
+                        recipients_json,
+                        now,
+                    ),
+                )
+            connection.execute(
+                """
+                UPDATE auto_fix_publication_plans
+                SET state = 'published', external_mr_iid = ?, write_uncertain = 0,
+                    updated_at = ?, lease_until = NULL, claim_token = NULL,
+                    last_error = NULL, plan_json = NULL
+                WHERE id = ?
+                """,
+                (auto_fix_mr_iid, now, plan_id),
+            )
+            connection.execute(
+                """
+                UPDATE auto_fix_publication_intents
+                SET state = 'published', updated_at = ?, last_error = NULL
+                WHERE id = ?
+                """,
+                (now, row["intent_id"]),
+            )
+            connection.execute(
+                """
+                UPDATE effect_receipts
+                SET state = 'published',
+                    external_identity = ?,
+                    detail = 'Program-owned Auto-fix Merge Request published',
+                    error = NULL, updated_at = ?
+                WHERE run_id = ? AND effect_kind = 'autofix_plan'
+                  AND dedupe_key = ? AND state = 'plan_frozen'
+                """,
+                (
+                    f"gitlab:{auto_fix_project_id}!{auto_fix_mr_iid}",
+                    now,
+                    row["run_id"],
+                    f"autofix-intent:{row['nonce']}",
+                ),
+            )
+        return relation, request
+
+    def get_program_auto_fix_relation(
+        self, plan_id: int
+    ) -> ProgramAutoFixRelation | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id AS relation_id, intent_id, plan_id, run_id,
+                       parent_project_id, parent_mr_iid, parent_sha,
+                       auto_fix_project_id, auto_fix_mr_iid, source_branch,
+                       target_branch, marker, plan_sha256, status, merged_sha,
+                       created_at, updated_at
+                FROM auto_fix_relations WHERE plan_id = ?
+                """,
+                (plan_id,),
+            ).fetchone()
+        return ProgramAutoFixRelation(**dict(row)) if row is not None else None
+
+    def get_auto_fix_notification_request(
+        self, relation_id: int
+    ) -> NotificationRequest | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id AS request_id, relation_id, correlation_id, title,
+                       body, url, recipients_json, created_at
+                FROM notification_requests WHERE relation_id = ?
+                """,
+                (relation_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        values = dict(row)
+        recipients = tuple(json.loads(values.pop("recipients_json")))
+        return NotificationRequest(**values, recipients=recipients)
 
     def create_auto_fix_intent(
         self,

@@ -125,6 +125,15 @@ class CreatedMergeRequest:
     description: str = ""
     state: str = "opened"
     merged_sha: str | None = None
+    author_username: str = ""
+    draft: bool = False
+
+
+@dataclass(frozen=True)
+class CreatedCommit:
+    project_id: str
+    sha: str
+    branch: str
 
 
 class GitLabClient(Protocol):
@@ -150,6 +159,17 @@ class GitLabClient(Protocol):
 
     def create_branch(self, project_id: str, branch: str, ref: str) -> None: ...
 
+    def create_repository_commit(
+        self,
+        project_id: str,
+        branch: str,
+        start_sha: str,
+        commit_message: str,
+        actions: tuple[dict[str, object], ...],
+        *,
+        force: bool = False,
+    ) -> CreatedCommit: ...
+
     def create_merge_request(
         self,
         project_id: str,
@@ -157,6 +177,8 @@ class GitLabClient(Protocol):
         source_branch: str,
         target_branch: str,
         description: str,
+        *,
+        draft: bool = False,
     ) -> CreatedMergeRequest: ...
 
     def find_merge_request_by_source_branch(
