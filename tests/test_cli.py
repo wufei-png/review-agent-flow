@@ -45,6 +45,14 @@ def test_worker_resolves_relative_policy_from_repository(monkeypatch, tmp_path: 
     monkeypatch.setattr(cli, "GitWorktreeManager", lambda repository, root: object())
     monkeypatch.setattr(cli, "ReviewWorker", FakeWorker)
     monkeypatch.setattr(cli, "notifiers_from_policy", lambda channels: object())
+    monkeypatch.setattr(
+        cli,
+        "load_operator_config",
+        lambda path: SimpleNamespace(
+            autofix_publication=SimpleNamespace(enabled=False, allowed_projects=frozenset())
+        ),
+    )
+    monkeypatch.setattr(cli, "resolve_backend", lambda *args, **kwargs: None)
 
     args = SimpleNamespace(
         gitlab_url="https://gitlab",
@@ -52,9 +60,9 @@ def test_worker_resolves_relative_policy_from_repository(monkeypatch, tmp_path: 
         project_id="42",
         repository=str(repository),
         policy=None,
+        operator_config=str(tmp_path / "operator.yml"),
         db=None,
         worktrees=None,
-        agent_timeout=1800,
         fetch_timeout=60,
         poll_interval=5.0,
         once=True,
@@ -87,6 +95,14 @@ def test_worker_once_emits_json_run_status(monkeypatch, tmp_path: Path, capsys) 
     monkeypatch.setattr(cli, "GitWorktreeManager", lambda repository, root: object())
     monkeypatch.setattr(cli, "ReviewWorker", FakeWorker)
     monkeypatch.setattr(cli, "notifiers_from_policy", lambda channels: object())
+    monkeypatch.setattr(
+        cli,
+        "load_operator_config",
+        lambda path: SimpleNamespace(
+            autofix_publication=SimpleNamespace(enabled=False, allowed_projects=frozenset())
+        ),
+    )
+    monkeypatch.setattr(cli, "resolve_backend", lambda *args, **kwargs: None)
 
     args = SimpleNamespace(
         gitlab_url="https://gitlab",
@@ -94,9 +110,9 @@ def test_worker_once_emits_json_run_status(monkeypatch, tmp_path: Path, capsys) 
         project_id="42",
         repository=str(repository),
         policy=None,
+        operator_config=str(tmp_path / "operator.yml"),
         db=None,
         worktrees=None,
-        agent_timeout=1800,
         poll_interval=5.0,
         once=True,
     )
@@ -120,14 +136,40 @@ def test_worker_entry_requires_a_bound_project(monkeypatch, tmp_path: Path) -> N
         project_id=None,
         repository=str(repository),
         policy=None,
+        operator_config=None,
         db=None,
         worktrees=None,
-        agent_timeout=1800,
         poll_interval=5.0,
         once=True,
     )
     monkeypatch.delenv("REVIEW_AGENT_FLOW_PROJECT_ID", raising=False)
     with pytest.raises(SystemExit, match="REVIEW_AGENT_FLOW_PROJECT_ID"):
+        cli._run_worker(args)
+
+
+def test_worker_requires_external_operator_configuration(monkeypatch, tmp_path: Path) -> None:
+    repository = tmp_path / "project"
+    repository.mkdir()
+    args = SimpleNamespace(
+        gitlab_url="https://gitlab",
+        gitlab_token="token",
+        project_id="42",
+        repository=str(repository),
+        policy=None,
+        operator_config=None,
+        db=None,
+        worktrees=None,
+        fetch_timeout=60,
+        poll_interval=5.0,
+        once=True,
+    )
+    monkeypatch.delenv("REVIEW_AGENT_FLOW_OPERATOR_CONFIG", raising=False)
+    with pytest.raises(SystemExit, match="REVIEW_AGENT_FLOW_OPERATOR_CONFIG"):
+        cli._run_worker(args)
+
+    inside = repository / "operator.yml"
+    args.operator_config = str(inside)
+    with pytest.raises(SystemExit, match="outside the reviewed repository"):
         cli._run_worker(args)
 
 

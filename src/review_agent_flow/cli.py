@@ -11,6 +11,7 @@ from pathlib import Path
 
 from .gitlab_client import PythonGitLabClient
 from .notifications import notifiers_from_policy
+from .operator_config import OperatorConfigError, load_operator_config, resolve_backend
 from .policy import load_policy, policy_template
 from .repository import GitShaEnsurer
 from .store import SQLiteStore
@@ -44,6 +45,29 @@ def _run_worker(args: argparse.Namespace) -> int:
     if not policy_path.is_absolute():
         policy_path = repository / policy_path
     policy = load_policy(policy_path)
+    operator_path = Path(
+        _required(args.operator_config, "REVIEW_AGENT_FLOW_OPERATOR_CONFIG")
+    ).expanduser().resolve()
+    if operator_path == repository or repository in operator_path.parents:
+        raise SystemExit("Operator configuration must be outside the reviewed repository")
+    try:
+        operator_config = load_operator_config(operator_path)
+        agent_backend = resolve_backend(
+            operator_config,
+            policy.ai,
+            project_id,
+            forbidden_environment=(
+                str(channel["webhook_env"])
+                for channel in policy.notifications.channels
+            ),
+        )
+    except OperatorConfigError as exc:
+        raise SystemExit(f"invalid Operator configuration: {exc}") from exc
+    if policy.ai.auto_fix and (
+        not operator_config.autofix_publication.enabled
+        or project_id not in operator_config.autofix_publication.allowed_projects
+    ):
+        raise SystemExit("Auto-fix is not authorized for this Project by the Operator")
     store = SQLiteStore(args.db or os.getenv("REVIEW_AGENT_FLOW_DB", "review-agent-flow.sqlite3"))
     worker = ReviewWorker(
         store=store,
@@ -61,9 +85,10 @@ def _run_worker(args: argparse.Namespace) -> int:
             repository, fetch_timeout_seconds=getattr(args, "fetch_timeout", 30.0)
         ),
         notifier=notifiers_from_policy(policy.notifications.channels),
-        agent_timeout_seconds=args.agent_timeout,
-        lease_seconds=args.agent_timeout + 60,
+        agent_timeout_seconds=agent_backend.timeout_seconds if agent_backend else 1800,
+        lease_seconds=(agent_backend.timeout_seconds if agent_backend else 1800) + 60,
         retry_delay_seconds=args.poll_interval,
+        agent_backend=agent_backend,
     )
     if args.once:
         result = worker.process_one()
@@ -107,9 +132,9 @@ def main(argv: list[str] | None = None) -> int:
     worker.add_argument("--project-id")
     worker.add_argument("--repository")
     worker.add_argument("--policy")
+    worker.add_argument("--operator-config")
     worker.add_argument("--db")
     worker.add_argument("--worktrees")
-    worker.add_argument("--agent-timeout", type=int, default=1800)
     worker.add_argument("--fetch-timeout", type=int, default=60)
     worker.add_argument("--poll-interval", type=float, default=5.0)
     worker.add_argument("--once", action="store_true")

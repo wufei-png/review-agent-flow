@@ -15,6 +15,7 @@ from .failures import FailureInfo, classify_exception
 from .gitlab import GitLabClient, canonical_note_marker, has_exact_note_marker, is_valid_sha
 from .notification_dispatcher import NotificationDispatcher
 from .notifications import FanoutNotifier, NotificationEvent
+from .operator_config import ResolvedBackend
 from .policy import ReviewPolicy
 from .repository import GitShaEnsurer
 from .runner import AgentContext, AgentResult, LeaseLostError, LocalCliAgentRunner
@@ -72,6 +73,7 @@ class ReviewWorker:
         worktree_cleanup_max_attempts: int = DEFAULT_WORKTREE_CLEANUP_MAX_ATTEMPTS,
         max_retry_delay_seconds: float = 300.0,
         reconciliation_max_attempts: int = DEFAULT_RECONCILIATION_MAX_ATTEMPTS,
+        agent_backend: ResolvedBackend | None = None,
     ) -> None:
         configured_project_id = (
             project_id if project_id is not None else os.getenv("REVIEW_AGENT_FLOW_PROJECT_ID")
@@ -85,6 +87,9 @@ class ReviewWorker:
         self.gitlab = gitlab
         self.worktrees = worktrees
         self.policy = policy
+        if policy.ai.enabled and agent_backend is None:
+            raise ValueError("AI Review requires an Operator-authorized Agent Backend/Profile")
+        self.agent_backend = agent_backend
         self.repository = repository
         self.gitlab_url = gitlab_url
         self.gitlab_token = gitlab_token
@@ -92,7 +97,9 @@ class ReviewWorker:
         if callable(register_secret):
             register_secret(gitlab_token)
         self.notifier = notifier or FanoutNotifier()
-        self.agent_timeout_seconds = agent_timeout_seconds
+        self.agent_timeout_seconds = (
+            agent_backend.timeout_seconds if agent_backend is not None else agent_timeout_seconds
+        )
         self.lease_seconds = lease_seconds
         self.max_attempts = max_attempts
         self.retry_delay_seconds = retry_delay_seconds
@@ -910,8 +917,9 @@ class ReviewWorker:
         auto_fix_intent,
         marker: str,
     ) -> AgentResult:
-        command = self.policy.ai.command
-        runner = LocalCliAgentRunner(command, self.agent_timeout_seconds)
+        if self.agent_backend is None:
+            raise ValueError("AI Review has no Operator-authorized Agent Backend/Profile")
+        runner = LocalCliAgentRunner(self.agent_backend.command, self.agent_timeout_seconds)
         skill_path = DEFAULT_REVIEW_AGENT_SKILL
         if self.policy.ai.skill_path:
             configured = Path(self.policy.ai.skill_path)
@@ -943,6 +951,7 @@ class ReviewWorker:
             heartbeat_interval_seconds=max(
                 0.1, min(30.0, self.lease_seconds / 3)
             ),
+            extra_env=self.agent_backend.environment,
         )
 
     def _notify_humans(self, run: ReviewRun, merge_request) -> None:

@@ -2,9 +2,9 @@
 
 ## Migration status
 
-The normative specifications and ADRs describe the accepted Program-owned publication target. The code at the documentation-alignment checkpoint still implements the superseded pre-release model and must not be described as target-complete.
+The normative specifications and ADRs describe the accepted Program-owned publication target. Migration is in progress, and the implementation must not be described as target-complete until every acceptance criterion below is implemented and verified.
 
-The current code still has Policy v2 with a Project-provided Agent command, ReviewRun kinds and Run-ID markers, Agent-owned GitLab Note/MR publication, and an Auto-fix reconciler that searches for Agent-created MRs. Those paths are intentionally replaced in later implementation stages. There is no migration or compatibility requirement for their database rows, policies or markers.
+Policy v3, kind-free ReviewKey storage/Note identity and strict external Operator Backend/Profile authorization are implemented. The current code still has Agent-owned GitLab Note/MR publication and an Auto-fix reconciler that searches for Agent-created MRs. Those remaining paths are intentionally replaced in later implementation stages. There is no migration or compatibility requirement for old database rows, policies or markers.
 
 Implemented foundations that remain useful include exact-SHA worktrees, bound-Project webhook validation, SQLite claims/leases, notification outbox primitives, GitLab event normalization, Pipeline Gate, provider protocols and Feishu/WeCom adapters. Their contracts may still change while adopting the target model.
 

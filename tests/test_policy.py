@@ -17,13 +17,14 @@ def test_loads_project_policy(tmp_path: Path) -> None:
     path.parent.mkdir()
     path.write_text(
         """
-version: 2
+version: 3
 pipeline_gate: true
 human:
   reviewers: [alice, bob]
 ai:
   enabled: true
-  command: opencode run
+  backend: local-agent
+  profile: default
   skill: .gitlab/review-agent/SKILL.md
   auto_fix: true
 notifications:
@@ -37,7 +38,8 @@ notifications:
     policy = load_policy(path)
     assert policy.pipeline_gate is True
     assert policy.human.reviewers == ("alice", "bob")
-    assert policy.ai.command == ("opencode", "run")
+    assert policy.ai.backend == "local-agent"
+    assert policy.ai.profile == "default"
     assert policy.ai.auto_fix is True
     assert policy.notifications.channels[0]["id"] == "feishu-reviewers"
     assert policy.notifications.channels[0]["type"] == "feishu"
@@ -51,10 +53,10 @@ def test_rejects_invalid_policy(tmp_path: Path) -> None:
         load_policy(path)
 
 
-def test_ai_enabled_requires_a_command(tmp_path: Path) -> None:
+def test_ai_enabled_requires_a_backend_and_profile(tmp_path: Path) -> None:
     path = tmp_path / "reviewflow.yml"
     path.write_text("ai:\n  enabled: true\n", encoding="utf-8")
-    with pytest.raises(PolicyError, match="ai.command"):
+    with pytest.raises(PolicyError, match="ai.backend and ai.profile"):
         load_policy(path)
 
 
@@ -69,4 +71,17 @@ def test_requires_explicit_policy_schema_upgrade(tmp_path: Path) -> None:
     path = tmp_path / "reviewflow.yml"
     path.write_text("version: 1\n", encoding="utf-8")
     with pytest.raises(PolicyError, match="unsupported policy version: 1"):
+        load_policy(path)
+
+
+def test_policy_rejects_project_owned_command_and_version_two(tmp_path: Path) -> None:
+    path = tmp_path / "reviewflow.yml"
+    path.write_text(
+        "version: 3\nai:\n  enabled: true\n  command: [opencode, run]\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(PolicyError, match="unknown fields: command"):
+        load_policy(path)
+    path.write_text("version: 2\n", encoding="utf-8")
+    with pytest.raises(PolicyError, match="unsupported policy version: 2"):
         load_policy(path)

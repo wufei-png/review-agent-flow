@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-POLICY_SCHEMA_VERSION = 2
+POLICY_SCHEMA_VERSION = 3
 
 
 class PolicyError(ValueError):
@@ -25,7 +24,8 @@ class HumanPolicy:
 @dataclass(frozen=True)
 class AIPolicy:
     enabled: bool = False
-    command: tuple[str, ...] = ()
+    backend: str | None = None
+    profile: str | None = None
     skill_path: str | None = None
     auto_fix: bool = False
 
@@ -64,20 +64,6 @@ def _as_bool(value: Any, field_name: str, default: bool) -> bool:
     if not isinstance(value, bool):
         raise PolicyError(f"{field_name} must be a boolean")
     return value
-
-
-def _as_command(value: Any) -> tuple[str, ...]:
-    if value is None:
-        return ()
-    if isinstance(value, str):
-        command = tuple(shlex.split(value))
-    elif isinstance(value, list) and all(isinstance(item, str) and item for item in value):
-        command = tuple(value)
-    else:
-        raise PolicyError("ai.command must be a string or a list of strings")
-    if not command:
-        raise PolicyError("ai.command cannot be empty when provided")
-    return command
 
 
 def _as_reviewers(value: Any) -> tuple[str, ...]:
@@ -173,18 +159,19 @@ def load_policy(path: str | Path | None = None) -> ReviewPolicy:
     ai = _as_mapping(raw.get("ai"), "ai")
     notifications = _as_mapping(raw.get("notifications"), "notifications")
     _reject_unknown(human, {"enabled", "reviewers"}, "human")
-    _reject_unknown(ai, {"enabled", "command", "skill", "auto_fix"}, "ai")
+    _reject_unknown(ai, {"enabled", "backend", "profile", "skill", "auto_fix"}, "ai")
     _reject_unknown(notifications, {"channels"}, "notifications")
     channels = _as_channels(notifications.get("channels", []))
 
     ai_policy = AIPolicy(
         enabled=_as_bool(ai.get("enabled"), "ai.enabled", False),
-        command=_as_command(ai.get("command")),
+        backend=_as_optional_string(ai.get("backend"), "ai.backend"),
+        profile=_as_optional_string(ai.get("profile"), "ai.profile"),
         skill_path=_as_optional_string(ai.get("skill"), "ai.skill"),
         auto_fix=_as_bool(ai.get("auto_fix"), "ai.auto_fix", False),
     )
-    if ai_policy.enabled and not ai_policy.command:
-        raise PolicyError("ai.command is required when ai.enabled is true")
+    if ai_policy.enabled and (ai_policy.backend is None or ai_policy.profile is None):
+        raise PolicyError("ai.backend and ai.profile are required when ai.enabled is true")
     if ai_policy.auto_fix and not ai_policy.enabled:
         raise PolicyError("ai.auto_fix requires ai.enabled to be true")
 
@@ -216,9 +203,8 @@ human:
 # AI and auto-fix are opt-in safe defaults.
 ai:
   enabled: false
-  command:
-    - opencode
-    - run
+  backend: local-agent
+  profile: default
   skill: .gitlab/review-agent/SKILL.md
   auto_fix: false
 

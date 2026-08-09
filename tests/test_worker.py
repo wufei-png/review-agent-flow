@@ -13,11 +13,42 @@ from review_agent_flow.gitlab import (
     canonical_note_marker,
 )
 from review_agent_flow.notifications import FanoutNotifier, NotificationEvent, NotificationResult
-from review_agent_flow.policy import AIPolicy, HumanPolicy, ReviewPolicy
+from review_agent_flow.operator_config import ResolvedBackend
+from review_agent_flow.policy import AIPolicy as ProjectAIPolicy
+from review_agent_flow.policy import HumanPolicy, ReviewPolicy
 from review_agent_flow.runner import AgentResult
 from review_agent_flow.store import SQLiteStore, auto_fix_intent_marker
-from review_agent_flow.worker import ReviewWorker
+from review_agent_flow.worker import ReviewWorker as ProductionReviewWorker
 from review_agent_flow.worktree import GitWorktreeManager, WorktreeError
+
+_TEST_AGENT_COMMANDS: dict[int, tuple[str, ...]] = {}
+
+
+def AIPolicy(*, command=(), **values):
+    """Create Project AI requests while keeping executable authority test-owned."""
+
+    enabled = bool(values.get("enabled", False))
+    policy = ProjectAIPolicy(
+        **values,
+        backend="test-agent" if enabled else None,
+        profile="default" if enabled else None,
+    )
+    if command:
+        _TEST_AGENT_COMMANDS[id(policy)] = tuple(command)
+    return policy
+
+
+def ReviewWorker(*args, **kwargs):
+    """Inject the Operator-resolved backend required by production ReviewWorker."""
+
+    policy = kwargs.get("policy") or args[3]
+    command = _TEST_AGENT_COMMANDS.get(id(policy.ai))
+    if policy.ai.enabled and "agent_backend" not in kwargs:
+        assert command
+        kwargs["agent_backend"] = ResolvedBackend(
+            "test-agent", "default", command, 1800, {}, None
+        )
+    return ProductionReviewWorker(*args, **kwargs)
 
 
 class ProjectId(str):
