@@ -46,7 +46,9 @@ After GitLab returns the child identity, ReviewFlow persists the Auto-fix Relati
 
 Presentation changes after creation, including title, description text around the marker and Draft/Ready state, do not invalidate a Relation. Source/target/tree drift is observed as divergence; ReviewFlow never force-updates user changes. A Relation records opened, closed and merged states, including the merge SHA used to suppress only that exact parent SHA.
 
-The Reconciler searches only when an external result is uncertain, a process may have crashed, relation state may have changed or an Operator requested recovery. The normal path does not search for Agent-created artifacts because the Agent cannot create them. After an ambiguous create-MR result it requires two delayed, unique zero-candidate observations before recreating the MR, and only when the branch commit identity is already durable and the parent still matches the frozen exact SHA. An ambiguous commit without a durable commit identity is never reissued automatically.
+Before each GitLab write, the Publisher durably moves the Plan from `preflight` to `commit_write_started`, or from `commit_confirmed` to `mr_write_started`. Successful responses persist `commit_confirmed` and `mr_confirmed` with their exact identities before the next step. A process lease that expires in `preflight` is safe to reclaim normally; every later unfinished phase enters reconciliation.
+
+The Reconciler searches only when an external result is uncertain, a process may have crashed, relation state may have changed or an Operator requested recovery. The normal path does not search for Agent-created artifacts because the Agent cannot create them. After an ambiguous create-MR result it requires two unique zero-candidate observations separated by at least five seconds, independent of polling/retry configuration, before clearing the uncertain boundary and recreating the MR. Recreation is allowed only when the branch commit identity is already durable and the parent still matches the frozen exact SHA. A discovered or persisted-IID child is re-fetched and its exact source head must equal that durable commit before Relation persistence. An ambiguous commit without a durable commit identity is never reissued automatically.
 
 ## Human notifications
 
@@ -61,6 +63,8 @@ The webhook adapter succeeds only for HTTP 2xx plus provider business success (`
 Store-loss recovery is never inferred from an Auto-fix-looking branch, title or marker alone. A trusted-host Operator CLI requires an exact Project, parent MR, parent SHA, Intent nonce, Plan digest, the canonical full Plan payload and child MR identity. It requires one unique configured Review Bot MR, revalidates the parent and child identities, and reconstructs the child commit's single exact parent plus its bounded paths, contents and executable modes before comparing those remote actions with the Plan. It records reason, principal, hostname, time, tool version, recovery ID and success or failure.
 
 Recovery does not automatically resend historical notifications because delivery state is indeterminate. A separate audited resend command creates a new immutable Notification Request generation and fresh outbox deliveries; it does not reset or overwrite historical delivery state.
+
+An audited `rearm-autofix-plan` command resets the attempt budget of one blocked immutable Plan. It returns a `preflight` Plan to publication and every later phase only to reconciliation. `abandon-autofix-plan` terminally stops an idle frozen, blocked or reconciliation-needed Plan. Neither command changes Plan content, digest, Intent nonce, or GitLab state.
 
 ## Agent and model integrations
 

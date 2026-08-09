@@ -13,7 +13,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from . import __version__
-from .autofix_recovery import AutoFixRecoveryService, OperatorContext
+from .autofix_recovery import AutoFixPlanOperator, AutoFixRecoveryService, OperatorContext
 from .gitlab_client import PythonGitLabClient
 from .notifications import notifiers_from_operator
 from .operator_config import (
@@ -251,6 +251,36 @@ def _run_resend_auto_fix_notification(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_transition_auto_fix_plan(args: argparse.Namespace, action: str) -> int:
+    store = SQLiteStore(
+        args.db or os.getenv("REVIEW_AGENT_FLOW_DB", "review-agent-flow.sqlite3")
+    )
+    context = _operator_context(args)
+    try:
+        audit = AutoFixPlanOperator(store).transition(
+            context=context,
+            plan_id=args.plan_id,
+            action=action,
+        )
+    except Exception:  # noqa: BLE001 - rejection detail is durable and may be sensitive
+        print(json.dumps({"status": "rejected", "action_id": context.recovery_id}))
+        return 1
+    print(
+        json.dumps(
+            {
+                "status": "rearmed" if action == "rearm" else "abandoned",
+                "action_id": audit.action_id,
+                "plan_id": audit.plan_id,
+                "from_state": audit.from_state,
+                "to_state": audit.to_state,
+                "write_phase": audit.write_phase,
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="review-agent-flow")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -301,6 +331,15 @@ def main(argv: list[str] | None = None) -> int:
     resend.add_argument("--reason", required=True)
     resend.add_argument("--recovery-id")
     resend.add_argument("--db")
+    for command, help_text in (
+        ("rearm-autofix-plan", "rearm one blocked Auto-fix Plan using its safe phase"),
+        ("abandon-autofix-plan", "terminally abandon one idle Auto-fix Plan"),
+    ):
+        transition = subparsers.add_parser(command, help=help_text)
+        transition.add_argument("--plan-id", type=int, required=True)
+        transition.add_argument("--reason", required=True)
+        transition.add_argument("--recovery-id")
+        transition.add_argument("--db")
     args = parser.parse_args(argv)
     if args.command == "init":
         return _init_policy(Path(args.path), args.force)
@@ -312,4 +351,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_recover_auto_fix_relation(args)
     if args.command == "resend-autofix-notification":
         return _run_resend_auto_fix_notification(args)
+    if args.command == "rearm-autofix-plan":
+        return _run_transition_auto_fix_plan(args, "rearm")
+    if args.command == "abandon-autofix-plan":
+        return _run_transition_auto_fix_plan(args, "abandon")
     return 0

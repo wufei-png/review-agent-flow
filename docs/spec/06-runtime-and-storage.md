@@ -47,8 +47,9 @@ The pre-release implementation performs a hard cutover to a fresh schema; it doe
 - `review_run_failures`: failure class, retryability, diagnostic claim number and redacted diagnostic;
 - `worktree_cleanup`: workspace path, Run/SHA, attempts, lease and cleanup status;
 - `operator_recoveries`: recovery ID, action, exact supplied identities, reason, principal, host, tool version, result and redacted diagnostic.
+- `operator_plan_actions`: immutable Plan rearm/abandon action ID, Plan digest, prior/resulting state, write phase, reason, principal, host, tool version, result and redacted rejection diagnostic.
 
-Auto-fix retries reuse the active Intent generation and nonce. An explicit re-arm closes the prior generation, creates a new immutable generation/nonce and retains history. A child MR webhook can reference only an existing local Intent or Relation.
+Auto-fix retries reuse the active Intent generation and nonce. Explicit Plan rearm preserves the same immutable payload, digest, generation and nonce: it resets a blocked attempt budget and resumes normal publication only from `preflight`; any Plan that crossed an external-write boundary resumes reconciliation only. New candidate content requires a new Intent rather than rearm. A child MR webhook can reference only an existing local Intent or Relation.
 
 ## Immutable payloads and retention
 

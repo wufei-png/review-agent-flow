@@ -38,7 +38,8 @@ ReviewFlow 使用以下独立 marker 持久化 Note Publication Request：
 ## Program-owned Auto-fix
 
 1. Effective Decision 允许 Auto-fix 时，ReviewFlow 在 Agent 前创建一个 active
-   Intent generation 和不可变 nonce。重试复用它；re-arm 创建新 generation。
+   Intent generation 和不可变 nonce。普通重试和 blocked Plan re-arm 都复用同一
+   个不可变 Plan/generation/nonce；新候选内容才创建新 Intent。
 2. 只有 Agent Result 显式包含 `autofix_proposal` 且 workspace 有非空合法 diff
    时才继续。提议/diff 不一致是 Agent contract mismatch，但有效 Note 仍可发布。
 3. Diff Envelope 只允许有界、常规、非二进制文本文件的新增、修改、

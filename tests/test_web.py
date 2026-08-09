@@ -59,8 +59,17 @@ def _published_relation(
         plan_id=plan.plan_id, project_id="42"
     )
     assert claimed_plan is not None
+    assert store.mark_auto_fix_write_started(
+        plan.plan_id, claimed_plan.claim_token, operation="commit"
+    )
     assert store.record_auto_fix_branch_commit(
         plan.plan_id, claimed_plan.claim_token, "f" * 40
+    )
+    assert store.mark_auto_fix_write_started(
+        plan.plan_id, claimed_plan.claim_token, operation="merge_request"
+    )
+    assert store.record_auto_fix_merge_request(
+        plan.plan_id, claimed_plan.claim_token, child_iid
     )
     completed = store.complete_auto_fix_publication(
         plan.plan_id,

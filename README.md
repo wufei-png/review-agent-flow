@@ -66,11 +66,21 @@ review-agent-flow resend-autofix-notification \
   --project-id 42 --child-mr-iid 9 --operator-config /trusted/path/operator.yml \
   --reason "Operator approved notification resend" \
   --db /trusted/path/reviewflow.db
+
+review-agent-flow rearm-autofix-plan \
+  --plan-id 7 --reason "remote evidence reviewed" \
+  --db /trusted/path/reviewflow.db
+
+review-agent-flow abandon-autofix-plan \
+  --plan-id 8 --reason "pilot cancelled" \
+  --db /trusted/path/reviewflow.db
 ```
 
 GitLab URL/token 和 Review Bot 用户名分别来自命令参数或 `GITLAB_URL`、
 `GITLAB_TOKEN`、`GITLAB_REVIEW_BOT_USERNAME`。每次命令记录 OS principal、
 hostname、tool version、reason、result 和独立 recovery ID。
+Plan rearm/abandon 不访问 GitLab；它们依据持久化 write phase 选择安全发布重试、
+仅对账重试或终止，并记录独立 action ID。
 
 本地测试不访问真实 GitLab、飞书、企微或 Agent Provider。真实 E2E
 需要 Operator 提供受控凭据和运行环境。

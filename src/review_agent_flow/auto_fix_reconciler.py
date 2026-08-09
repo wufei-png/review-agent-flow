@@ -5,13 +5,15 @@ from __future__ import annotations
 import json
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 
 from .failures import classify_exception
-from .gitlab import CreatedMergeRequest, GitLabClient, is_valid_sha
+from .gitlab import GitLabClient, MergeRequest, is_valid_sha
 from .notifications import FanoutNotifier
 from .policy import policy_from_json
 from .security import redact
 from .store import (
+    AUTO_FIX_MR_ABSENCE_CONFIRMATION_SECONDS,
     DEFAULT_AUTO_FIX_RECONCILIATION_LEASE_SECONDS,
     AutoFixPublicationPlan,
     ProgramAutoFixRelation,
@@ -125,7 +127,7 @@ class AutoFixReconciler:
     def _validate_child(
         self,
         plan: AutoFixPublicationPlan,
-        child: CreatedMergeRequest,
+        child: MergeRequest,
         *,
         branch: str,
         target_branch: str,
@@ -136,6 +138,7 @@ class AutoFixReconciler:
             or child.source_branch != branch
             or child.target_branch != target_branch
             or plan.marker not in child.description
+            or child.sha != plan.branch_commit_sha
             or not child.author_username.strip()
             or not child.web_url
         ):
@@ -150,7 +153,7 @@ class AutoFixReconciler:
     def _complete_plan(
         self,
         plan: AutoFixPublicationPlan,
-        child: CreatedMergeRequest,
+        child: MergeRequest,
         *,
         branch: str,
         target_branch: str,
@@ -232,9 +235,17 @@ class AutoFixReconciler:
                 or not parent.author_username.strip()
             ):
                 raise ValueError("Auto-fix parent identity is invalid during reconciliation")
-            child = self.gitlab.find_merge_request_by_source_branch(
-                project_id, branch, target_branch, plan.marker
-            )
+            if plan.external_mr_iid is not None:
+                child = self.gitlab.get_merge_request(project_id, plan.external_mr_iid)
+            else:
+                candidate = self.gitlab.find_merge_request_by_source_branch(
+                    project_id, branch, target_branch, plan.marker
+                )
+                child = (
+                    self.gitlab.get_merge_request(project_id, candidate.iid)
+                    if candidate is not None
+                    else None
+                )
             if child is None:
                 if plan.branch_commit_sha is None:
                     return self._defer_plan(
@@ -257,6 +268,27 @@ class AutoFixReconciler:
                         plan,
                         "parent MR no longer permits recovery of a missing Auto-fix MR",
                     )
+                if plan.write_phase == "mr_write_started":
+                    observed_at = (
+                        datetime.fromisoformat(plan.absence_observed_at)
+                        if plan.absence_observed_at is not None
+                        else None
+                    )
+                    if observed_at is None or observed_at > datetime.now(UTC) - timedelta(
+                        seconds=AUTO_FIX_MR_ABSENCE_CONFIRMATION_SECONDS
+                    ):
+                        return self._defer_plan(
+                            plan,
+                            "Auto-fix MR absence requires the minimum safety interval",
+                        )
+                    if not self.store.confirm_auto_fix_merge_request_absent(
+                        plan.plan_id, plan.claim_token
+                    ):
+                        return AutoFixReconciliationResult(
+                            plan.run_id,
+                            "deferred",
+                            "Auto-fix reconciliation lease was lost while confirming MR absence",
+                        )
                 if not self.store.extend_auto_fix_publication_lease(
                     plan.plan_id, plan.claim_token, self.lease_seconds
                 ):
@@ -264,6 +296,14 @@ class AutoFixReconciler:
                         plan.run_id,
                         "deferred",
                         "Auto-fix reconciliation lease was lost before MR recovery",
+                    )
+                if not self.store.mark_auto_fix_write_started(
+                    plan.plan_id, plan.claim_token, operation="merge_request"
+                ):
+                    return AutoFixReconciliationResult(
+                        plan.run_id,
+                        "deferred",
+                        "Auto-fix reconciliation lease was lost before recording the MR write boundary",
                     )
                 child = self.gitlab.create_merge_request(
                     project_id,
@@ -273,11 +313,20 @@ class AutoFixReconciler:
                     plan.marker,
                     draft=readiness == "draft",
                 )
+                child = self.gitlab.get_merge_request(project_id, child.iid)
             identity_error = self._validate_child(
                 plan, child, branch=branch, target_branch=target_branch
             )
             if identity_error is not None:
                 return self._block_plan(plan, identity_error)
+            if plan.external_mr_iid is None and not self.store.record_auto_fix_merge_request(
+                plan.plan_id, plan.claim_token, child.iid
+            ):
+                return AutoFixReconciliationResult(
+                    plan.run_id,
+                    "deferred",
+                    "Auto-fix reconciliation lease was lost after confirming the MR identity",
+                )
             return self._complete_plan(
                 plan,
                 child,

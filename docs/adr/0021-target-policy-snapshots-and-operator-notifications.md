@@ -24,4 +24,5 @@ durable Note/outbox state as `pending`, `no_effect`, `delivered`, `degraded`,
 `undelivered` or `indeterminate`; Run Lifecycle remains stable.
 
 This is a pre-production hard cutover. Policy v1-v3, Operator v1 and SQLite
-schemas before version 12 are rejected rather than migrated.
+the current development schema version is 13; every other version is rejected
+rather than migrated.

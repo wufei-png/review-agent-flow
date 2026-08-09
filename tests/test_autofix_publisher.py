@@ -1,8 +1,11 @@
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from review_agent_flow.auto_fix_reconciler import AutoFixReconciler
 from review_agent_flow.autofix_publisher import AutoFixPublisher
+from review_agent_flow.autofix_recovery import AutoFixPlanOperator, OperatorContext
 from review_agent_flow.gitlab import (
     CreatedCommit,
     CreatedMergeRequest,
@@ -89,6 +92,18 @@ class FakeGitLab:
         )
         if self.mr_error is not None:
             raise self.mr_error
+        self.child_lookup = MergeRequest(
+            project_id,
+            9,
+            title,
+            "review-bot",
+            source_branch,
+            target_branch,
+            "f" * 40,
+            "https://gitlab/merge_requests/9",
+            description=description,
+            draft=draft,
+        )
         return CreatedMergeRequest(
             project_id,
             9,
@@ -249,6 +264,8 @@ def test_publisher_uses_exact_commit_contract_and_atomically_requests_notificati
     result = _publisher(store, gitlab).process(plan_id=plan_id)
 
     assert result is not None and result.status == "published"
+    plan = store.get_auto_fix_publication_plan(run_id)
+    assert plan is not None and plan.write_phase == "published"
     assert gitlab.commit_payloads == [
         {
             "project_id": "42",
@@ -414,6 +431,7 @@ def test_commit_error_stops_normal_retries_as_uncertain(tmp_path: Path) -> None:
     assert second is None
     plan = store.get_auto_fix_publication_plan(run_id)
     assert plan is not None and plan.write_uncertain is True
+    assert plan.write_phase == "commit_write_started"
     assert store.get_auto_fix_publication_intent(run_id).state == "needs_reconciliation"
     assert store.list_effect_receipts(run_id, "autofix_plan")[0].state == (
         "needs_reconciliation"
@@ -459,9 +477,16 @@ def test_reconciler_recovers_missing_merge_request_after_confirmed_commit(
     )
 
     absence = reconciler.process()
+    too_soon = reconciler.process()
+    with store._connect() as connection:
+        connection.execute(
+            "UPDATE auto_fix_publication_plans SET absence_observed_at = ? WHERE id = ?",
+            ("2000-01-01T00:00:00+00:00", plan_id),
+        )
     results = reconciler.process()
 
     assert absence and absence[0].status == "deferred"
+    assert too_soon and too_soon[0].status == "deferred"
     assert results and results[0].status == "succeeded"
     assert len(gitlab.commit_payloads) == 1
     assert len(gitlab.mr_payloads) == 2
@@ -469,6 +494,147 @@ def test_reconciler_recovers_missing_merge_request_after_confirmed_commit(
     assert plan is not None and plan.state == "published" and plan.plan_json is None
     assert store.get_program_auto_fix_relation(plan_id) is not None
     assert store.list_effect_receipts(run_id, "autofix_plan")[0].state == "published"
+
+
+def test_expired_preflight_lease_is_safely_reclaimed_without_reconciliation(
+    tmp_path: Path,
+) -> None:
+    store, run_id, plan_id, _branch = _frozen_plan(tmp_path)
+    first = store.claim_auto_fix_publication_plan(plan_id=plan_id, lease_seconds=60)
+    assert first is not None and first.write_phase == "preflight"
+    with store._connect() as connection:
+        connection.execute(
+            "UPDATE auto_fix_publication_plans SET lease_until = ? WHERE id = ?",
+            ("2000-01-01T00:00:00+00:00", plan_id),
+        )
+
+    reclaimed = store.claim_auto_fix_publication_plan(plan_id=plan_id, lease_seconds=60)
+
+    assert reclaimed is not None and reclaimed.claim_token != first.claim_token
+    assert reclaimed.write_phase == "preflight"
+    assert reclaimed.write_uncertain is False
+    assert store.get_auto_fix_publication_intent(run_id).state == "plan_frozen"
+
+
+def test_expired_external_write_boundary_requires_reconciliation(tmp_path: Path) -> None:
+    store, run_id, plan_id, _branch = _frozen_plan(tmp_path)
+    claimed = store.claim_auto_fix_publication_plan(plan_id=plan_id, lease_seconds=60)
+    assert claimed is not None
+    assert store.mark_auto_fix_write_started(
+        plan_id, claimed.claim_token, operation="commit"
+    )
+    with store._connect() as connection:
+        connection.execute(
+            "UPDATE auto_fix_publication_plans SET lease_until = ? WHERE id = ?",
+            ("2000-01-01T00:00:00+00:00", plan_id),
+        )
+
+    assert store.claim_auto_fix_publication_plan(plan_id=plan_id) is None
+    plan = store.get_auto_fix_publication_plan(run_id)
+    assert plan is not None and plan.state == "needs_reconciliation"
+    assert plan.write_phase == "commit_write_started"
+    assert plan.write_uncertain is True
+
+
+def test_reconciliation_blocks_if_confirmed_mr_head_advanced(tmp_path: Path) -> None:
+    store, run_id, plan_id, branch = _frozen_plan(tmp_path)
+    claimed = store.claim_auto_fix_publication_plan(plan_id=plan_id, lease_seconds=60)
+    assert claimed is not None
+    assert store.mark_auto_fix_write_started(
+        plan_id, claimed.claim_token, operation="commit"
+    )
+    assert store.record_auto_fix_branch_commit(plan_id, claimed.claim_token, "f" * 40)
+    assert store.mark_auto_fix_write_started(
+        plan_id, claimed.claim_token, operation="merge_request"
+    )
+    assert store.record_auto_fix_merge_request(plan_id, claimed.claim_token, 9)
+    with store._connect() as connection:
+        connection.execute(
+            "UPDATE auto_fix_publication_plans SET lease_until = ? WHERE id = ?",
+            ("2000-01-01T00:00:00+00:00", plan_id),
+        )
+    assert store.claim_auto_fix_publication_plan(plan_id=plan_id) is None
+    plan = store.get_auto_fix_publication_plan(run_id)
+    assert plan is not None
+    gitlab = FakeGitLab(
+        MergeRequest("42", 1, "Parent", "alice", "feature", "main", SHA, "https://parent")
+    )
+    gitlab.child_lookup = MergeRequest(
+        "42",
+        9,
+        "Draft: [ReviewFlow Auto-Fix] Parent",
+        "review-bot",
+        branch,
+        "feature",
+        "e" * 40,
+        "https://gitlab/merge_requests/9",
+        description=plan.marker,
+    )
+
+    result = AutoFixReconciler(
+        store, gitlab, "42", run_lease_seconds=60
+    ).process()
+
+    assert result and result[0].status == "blocked"
+    assert store.get_program_auto_fix_relation(plan_id) is None
+
+
+def test_operator_rearm_uses_write_phase_and_is_idempotently_audited(
+    tmp_path: Path,
+) -> None:
+    store, run_id, plan_id, _branch = _frozen_plan(tmp_path)
+    claimed = store.claim_auto_fix_publication_plan(plan_id=plan_id)
+    assert claimed is not None
+    assert store.mark_auto_fix_write_started(
+        plan_id, claimed.claim_token, operation="commit"
+    )
+    assert store.finish_auto_fix_publication_plan(
+        plan_id,
+        claimed.claim_token,
+        state="blocked",
+        error="manual investigation required",
+        write_uncertain=True,
+    )
+    context = OperatorContext("action-1", "evidence reviewed", "op", "host", "1")
+    operator = AutoFixPlanOperator(store)
+
+    first = operator.transition(context=context, plan_id=plan_id, action="rearm")
+    replay = operator.transition(context=context, plan_id=plan_id, action="rearm")
+
+    assert replay == first
+    assert first.from_state == "blocked" and first.to_state == "needs_reconciliation"
+    plan = store.get_auto_fix_publication_plan(run_id)
+    assert plan is not None and plan.state == "needs_reconciliation"
+    assert plan.write_phase == "commit_write_started"
+    assert len(store.list_operator_plan_actions()) == 1
+
+
+def test_operator_abandon_is_terminal_and_rejected_rearm_is_audited(
+    tmp_path: Path,
+) -> None:
+    store, run_id, plan_id, _branch = _frozen_plan(
+        tmp_path, with_delivered_note=True
+    )
+    operator = AutoFixPlanOperator(store)
+    abandoned = operator.transition(
+        context=OperatorContext("action-2", "cancel pilot", "op", "host", "1"),
+        plan_id=plan_id,
+        action="abandon",
+    )
+
+    assert abandoned.to_state == "abandoned"
+    plan = store.get_auto_fix_publication_plan(run_id)
+    assert plan is not None and plan.state == "abandoned"
+    assert store.list_effect_receipts(run_id, "autofix_plan")[0].state == "abandoned"
+    assert store.project_review_outcome(run_id) == "degraded"
+    with pytest.raises(ValueError, match="cannot rearm"):
+        operator.transition(
+            context=OperatorContext("action-3", "undo", "op", "host", "1"),
+            plan_id=plan_id,
+            action="rearm",
+        )
+    audits = store.list_operator_plan_actions()
+    assert [audit.result for audit in audits] == ["succeeded", "rejected"]
 
 
 def test_reconciler_does_not_reissue_an_uncertain_unrecorded_commit(
@@ -588,6 +754,7 @@ def test_relation_lookup_failure_preserves_webhook_divergence(tmp_path: Path) ->
         description=relation.marker,
         source_sha=relation.published_commit_sha,
     )
+    gitlab.get_failures = 1
     reconciler = AutoFixReconciler(
         store,
         gitlab,

@@ -21,13 +21,14 @@ DEFAULT_NOTIFICATION_LEASE_SECONDS = 30
 DEFAULT_NOTIFICATION_MAX_ATTEMPTS = 3
 DEFAULT_WORKTREE_CLEANUP_LEASE_SECONDS = 60
 DEFAULT_WORKTREE_CLEANUP_MAX_ATTEMPTS = 5
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 DEFAULT_EFFECT_LEASE_SECONDS = 60
 DEFAULT_NOTE_PUBLICATION_LEASE_SECONDS = 60
 DEFAULT_NOTE_PUBLICATION_MAX_ATTEMPTS = 5
 DEFAULT_NOTE_UNCERTAIN_LOOKUP_ATTEMPTS = 3
 DEFAULT_AUTO_FIX_PUBLICATION_LEASE_SECONDS = 60
 DEFAULT_AUTO_FIX_RECONCILIATION_LEASE_SECONDS = 60
+AUTO_FIX_MR_ABSENCE_CONFIRMATION_SECONDS = 5
 
 
 @dataclass(frozen=True)
@@ -179,6 +180,8 @@ class AutoFixPublicationPlan:
     updated_at: str
     attempts: int
     absence_confirmations: int
+    absence_observed_at: str | None
+    write_phase: str
     write_uncertain: bool
     branch_commit_sha: str | None
     external_mr_iid: int | None
@@ -254,6 +257,25 @@ class OperatorRecovery:
 
 
 @dataclass(frozen=True)
+class OperatorPlanAction:
+    audit_id: int
+    action_id: str
+    plan_id: int
+    plan_sha256: str
+    action: str
+    from_state: str
+    to_state: str
+    write_phase: str
+    reason: str
+    principal: str
+    hostname: str
+    tool_version: str
+    result: str
+    diagnostic: str | None
+    created_at: str
+
+
+@dataclass(frozen=True)
 class NotificationDelivery:
     delivery_id: int
     correlation_id: str
@@ -292,7 +314,7 @@ class WorktreeRecord:
 class SQLiteStore:
     """Small SQLite store.
 
-    Version 12 is intentionally a fresh schema.  There is no production database
+    Version 13 is intentionally a fresh schema.  There is no production database
     migration contract for this pre-release implementation; an older database
     must be recreated rather than guessed into a new notification or Auto-fix
     routing model.
@@ -483,6 +505,8 @@ class SQLiteStore:
                     updated_at TEXT NOT NULL,
                     attempts INTEGER NOT NULL DEFAULT 0,
                     absence_confirmations INTEGER NOT NULL DEFAULT 0,
+                    absence_observed_at TEXT,
+                    write_phase TEXT NOT NULL DEFAULT 'preflight',
                     write_uncertain INTEGER NOT NULL DEFAULT 0,
                     branch_commit_sha TEXT,
                     external_mr_iid INTEGER,
@@ -546,6 +570,23 @@ class SQLiteStore:
                     plan_sha256 TEXT NOT NULL,
                     child_project_id TEXT NOT NULL,
                     child_mr_iid INTEGER NOT NULL,
+                    reason TEXT NOT NULL,
+                    principal TEXT NOT NULL,
+                    hostname TEXT NOT NULL,
+                    tool_version TEXT NOT NULL,
+                    result TEXT NOT NULL,
+                    diagnostic TEXT,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS operator_plan_actions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    action_id TEXT NOT NULL UNIQUE,
+                    plan_id INTEGER NOT NULL REFERENCES auto_fix_publication_plans(id),
+                    plan_sha256 TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    from_state TEXT NOT NULL,
+                    to_state TEXT NOT NULL,
+                    write_phase TEXT NOT NULL,
                     reason TEXT NOT NULL,
                     principal TEXT NOT NULL,
                     hostname TEXT NOT NULL,
@@ -639,7 +680,7 @@ class SQLiteStore:
                     last_error TEXT,
                     UNIQUE(run_id, path)
                 );
-                PRAGMA user_version = 12;
+                PRAGMA user_version = 13;
                 """
             )
 
@@ -737,7 +778,9 @@ class SQLiteStore:
         return (
             "id AS plan_id, intent_id, run_id, plan_json, plan_sha256, marker, "
             "candidate_sha256, verification_json, state, created_at, updated_at, "
-            "attempts, absence_confirmations, write_uncertain, branch_commit_sha, external_mr_iid, "
+            "attempts, absence_confirmations, absence_observed_at, write_phase, "
+            "write_uncertain, "
+            "branch_commit_sha, external_mr_iid, "
             "next_attempt_at, lease_until, claim_token, last_error"
         )
 
@@ -2966,12 +3009,26 @@ class SQLiteStore:
             connection.execute(
                 f"""
                 UPDATE auto_fix_publication_plans
+                SET state = 'frozen', lease_until = NULL, claim_token = NULL,
+                    updated_at = ?, next_attempt_at = NULL,
+                    last_error = COALESCE(
+                        last_error, 'publication lease expired before any external write'
+                    )
+                WHERE state = 'running' AND write_phase = 'preflight'
+                  AND (lease_until IS NULL OR lease_until <= ?)
+                  {reclaim_filters}
+                """,
+                tuple(reclaim_parameters),
+            )
+            connection.execute(
+                f"""
+                UPDATE auto_fix_publication_plans
                 SET state = 'needs_reconciliation', write_uncertain = 1,
                     lease_until = NULL, claim_token = NULL, updated_at = ?,
                     last_error = COALESCE(
                         last_error, 'publication lease expired with external result uncertain'
                     )
-                WHERE state = 'running'
+                WHERE state = 'running' AND write_phase != 'preflight'
                   AND (lease_until IS NULL OR lease_until <= ?)
                   {reclaim_filters}
                 """,
@@ -3059,7 +3116,7 @@ class SQLiteStore:
                 """
                 UPDATE auto_fix_publication_plans
                 SET state = 'needs_reconciliation', lease_until = NULL,
-                    claim_token = NULL, updated_at = ?, write_uncertain = 1,
+                    claim_token = NULL, updated_at = ?,
                     last_error = COALESCE(
                         last_error, 'reconciliation lease expired before completion'
                     )
@@ -3144,7 +3201,10 @@ class SQLiteStore:
                 UPDATE auto_fix_publication_plans
                 SET state = ?, next_attempt_at = ?, lease_until = NULL,
                     claim_token = NULL, last_error = ?, updated_at = ?,
-                    absence_confirmations = absence_confirmations + ?
+                    absence_confirmations = absence_confirmations + ?,
+                    absence_observed_at = CASE WHEN ? = 1
+                        THEN COALESCE(absence_observed_at, ?)
+                        ELSE absence_observed_at END
                 WHERE id = ? AND state = 'reconciling' AND claim_token = ?
                 """,
                 (
@@ -3153,6 +3213,8 @@ class SQLiteStore:
                     safe_error,
                     now,
                     int(confirm_absent),
+                    int(confirm_absent),
+                    now,
                     plan_id,
                     claim_token,
                 ),
@@ -3308,7 +3370,7 @@ class SQLiteStore:
                 JOIN auto_fix_publication_intents i ON i.id = p.intent_id
                 WHERE p.id = ? AND p.state = 'running' AND p.claim_token = ?
                   AND p.lease_until IS NOT NULL AND p.lease_until > ?
-                  AND p.branch_commit_sha IS NULL
+                  AND p.write_phase = 'preflight'
                 """,
                 (plan_id, claim_token, now),
             ).fetchone()
@@ -3374,12 +3436,113 @@ class SQLiteStore:
             cursor = connection.execute(
                 """
                 UPDATE auto_fix_publication_plans
-                SET branch_commit_sha = ?, updated_at = ?
+                SET branch_commit_sha = ?, write_phase = 'commit_confirmed',
+                    write_uncertain = 0, updated_at = ?
                 WHERE id = ? AND state = 'running' AND claim_token = ?
                   AND lease_until IS NOT NULL AND lease_until > ?
+                  AND write_phase = 'commit_write_started'
                   AND (branch_commit_sha IS NULL OR branch_commit_sha = ?)
                 """,
                 (commit_sha, now, plan_id, claim_token, now, commit_sha),
+            )
+        return cursor.rowcount == 1
+
+    def mark_auto_fix_write_started(
+        self,
+        plan_id: int,
+        claim_token: str | None,
+        *,
+        operation: str,
+    ) -> bool:
+        """Persist the uncertainty boundary immediately before an external write."""
+
+        transitions = {
+            "commit": ("preflight", "commit_write_started"),
+            "merge_request": ("commit_confirmed", "mr_write_started"),
+        }
+        if operation not in transitions:
+            raise ValueError("invalid Auto-fix external write operation")
+        if not claim_token:
+            return False
+        from_phase, to_phase = transitions[operation]
+        now = self._now().isoformat()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE auto_fix_publication_plans
+                SET write_phase = ?, write_uncertain = 1, updated_at = ?
+                WHERE id = ? AND state IN ('running', 'reconciling')
+                  AND claim_token = ?
+                  AND lease_until IS NOT NULL AND lease_until > ?
+                  AND write_phase = ?
+                """,
+                (to_phase, now, plan_id, claim_token, now, from_phase),
+            )
+        return cursor.rowcount == 1
+
+    def record_auto_fix_merge_request(
+        self,
+        plan_id: int,
+        claim_token: str | None,
+        external_mr_iid: int,
+    ) -> bool:
+        """Persist a confirmed MR identity before Relation materialization."""
+
+        if not claim_token or external_mr_iid <= 0:
+            return False
+        now = self._now().isoformat()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE auto_fix_publication_plans
+                SET external_mr_iid = ?, write_phase = 'mr_confirmed',
+                    write_uncertain = 0, updated_at = ?
+                WHERE id = ? AND state IN ('running', 'reconciling')
+                  AND claim_token = ?
+                  AND lease_until IS NOT NULL AND lease_until > ?
+                  AND write_phase IN ('commit_confirmed', 'mr_write_started')
+                  AND (external_mr_iid IS NULL OR external_mr_iid = ?)
+                """,
+                (
+                    external_mr_iid,
+                    now,
+                    plan_id,
+                    claim_token,
+                    now,
+                    external_mr_iid,
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def confirm_auto_fix_merge_request_absent(
+        self,
+        plan_id: int,
+        claim_token: str | None,
+    ) -> bool:
+        """Clear an uncertain MR boundary after two durable negative observations."""
+
+        if not claim_token:
+            return False
+        now_value = self._now()
+        now = now_value.isoformat()
+        cutoff = (
+            now_value - timedelta(seconds=AUTO_FIX_MR_ABSENCE_CONFIRMATION_SECONDS)
+        ).isoformat()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE auto_fix_publication_plans
+                SET write_phase = 'commit_confirmed', write_uncertain = 0,
+                    updated_at = ?
+                WHERE id = ? AND state = 'reconciling' AND claim_token = ?
+                  AND lease_until IS NOT NULL AND lease_until > ?
+                  AND write_phase = 'mr_write_started'
+                  AND absence_confirmations >= 1
+                  AND absence_observed_at IS NOT NULL
+                  AND absence_observed_at <= ?
+                  AND external_mr_iid IS NULL
+                """,
+                (now, plan_id, claim_token, now, cutoff),
             )
         return cursor.rowcount == 1
 
@@ -3419,8 +3582,10 @@ class SQLiteStore:
                   AND p.claim_token = ?
                   AND p.lease_until IS NOT NULL AND p.lease_until > ?
                   AND p.branch_commit_sha IS NOT NULL
+                  AND p.write_phase = 'mr_confirmed'
+                  AND p.external_mr_iid = ?
                 """,
-                (plan_id, claim_token, now),
+                (plan_id, claim_token, now, auto_fix_mr_iid),
             ).fetchone()
             if row is None:
                 return None
@@ -3546,6 +3711,7 @@ class SQLiteStore:
                 """
                 UPDATE auto_fix_publication_plans
                 SET state = 'published', external_mr_iid = ?, write_uncertain = 0,
+                    write_phase = 'published',
                     updated_at = ?, lease_until = NULL, claim_token = NULL,
                     last_error = NULL, plan_json = NULL
                 WHERE id = ?
@@ -4211,8 +4377,8 @@ class SQLiteStore:
                 INSERT INTO auto_fix_publication_plans(
                     intent_id, run_id, plan_json, plan_sha256, marker,
                     candidate_sha256, verification_json, state, created_at,
-                    updated_at, branch_commit_sha, external_mr_iid
-                ) VALUES (?, ?, NULL, ?, ?, ?, ?, 'published', ?, ?, ?, ?)
+                    updated_at, write_phase, branch_commit_sha, external_mr_iid
+                ) VALUES (?, ?, NULL, ?, ?, ?, ?, 'published', ?, ?, 'published', ?, ?)
                 ON CONFLICT(run_id) DO NOTHING
                 """,
                 (
@@ -4528,6 +4694,181 @@ class SQLiteStore:
                 "FROM operator_recoveries ORDER BY id"
             ).fetchall()
         return tuple(self._operator_recovery_from_row(row) for row in rows)
+
+    @staticmethod
+    def _operator_plan_action_from_row(row: sqlite3.Row) -> OperatorPlanAction:
+        return OperatorPlanAction(**dict(row))
+
+    @staticmethod
+    def _operator_plan_action_columns() -> str:
+        return (
+            "id AS audit_id, action_id, plan_id, plan_sha256, action, "
+            "from_state, to_state, write_phase, reason, principal, hostname, "
+            "tool_version, result, diagnostic, created_at"
+        )
+
+    def transition_auto_fix_publication_plan(
+        self,
+        plan_id: int,
+        *,
+        action_id: str,
+        action: str,
+        reason: str,
+        principal: str,
+        hostname: str,
+        tool_version: str,
+    ) -> OperatorPlanAction:
+        """Apply an idempotent, audited Operator rearm or abandon decision."""
+
+        if plan_id <= 0 or action not in {"rearm", "abandon"}:
+            raise ValueError("invalid Operator Auto-fix Plan action")
+        text_values = (action_id, reason, principal, hostname, tool_version)
+        if any(not value.strip() for value in text_values):
+            raise ValueError("Operator Auto-fix Plan action fields cannot be empty")
+        now = self._now().isoformat()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                f"SELECT {self._operator_plan_action_columns()} "
+                "FROM operator_plan_actions WHERE action_id = ?",
+                (action_id,),
+            ).fetchone()
+            if existing is not None:
+                audit = self._operator_plan_action_from_row(existing)
+                if (
+                    audit.plan_id != plan_id
+                    or audit.action != action
+                    or audit.reason != reason
+                    or audit.principal != principal
+                    or audit.hostname != hostname
+                    or audit.tool_version != tool_version
+                ):
+                    raise ValueError("Operator action ID is already bound to another action")
+                return audit
+            row = connection.execute(
+                """
+                SELECT p.id, p.run_id, p.intent_id, p.plan_sha256, p.state,
+                       p.write_phase, i.nonce
+                FROM auto_fix_publication_plans p
+                JOIN auto_fix_publication_intents i ON i.id = p.intent_id
+                WHERE p.id = ?
+                """,
+                (plan_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("Auto-fix Publication Plan does not exist")
+            from_state = str(row["state"])
+            write_phase = str(row["write_phase"])
+            allowed = (
+                from_state == "blocked"
+                if action == "rearm"
+                else from_state in {"frozen", "blocked", "needs_reconciliation"}
+            )
+            if action == "rearm":
+                to_state = (
+                    "frozen" if write_phase == "preflight" else "needs_reconciliation"
+                )
+            else:
+                to_state = "abandoned"
+            result = "succeeded" if allowed else "rejected"
+            diagnostic = None if allowed else self._redact(
+                f"cannot {action} Auto-fix Plan from state {from_state}"
+            )
+            if allowed:
+                connection.execute(
+                    """
+                    UPDATE auto_fix_publication_plans
+                    SET state = ?, attempts = CASE WHEN ? = 'rearm' THEN 0 ELSE attempts END,
+                        absence_confirmations = CASE WHEN ? = 'rearm' THEN 0
+                                                     ELSE absence_confirmations END,
+                        absence_observed_at = CASE WHEN ? = 'rearm' THEN NULL
+                                                   ELSE absence_observed_at END,
+                        next_attempt_at = NULL, lease_until = NULL, claim_token = NULL,
+                        last_error = CASE WHEN ? = 'rearm' THEN NULL ELSE ? END,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        to_state,
+                        action,
+                        action,
+                        action,
+                        action,
+                        self._redact(f"abandoned by Operator: {reason}"),
+                        now,
+                        plan_id,
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE auto_fix_publication_intents
+                    SET state = ?, updated_at = ?, last_error = ? WHERE id = ?
+                    """,
+                    (
+                        "plan_frozen" if to_state == "frozen" else to_state,
+                        now,
+                        None if action == "rearm" else self._redact(reason),
+                        row["intent_id"],
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE effect_receipts
+                    SET state = ?, detail = ?, error = ?, updated_at = ?
+                    WHERE run_id = ? AND effect_kind = 'autofix_plan'
+                      AND dedupe_key = ?
+                    """,
+                    (
+                        "plan_frozen" if to_state == "frozen" else to_state,
+                        "Auto-fix publication rearmed by Operator"
+                        if action == "rearm"
+                        else "Auto-fix publication abandoned by Operator",
+                        None if action == "rearm" else self._redact(reason),
+                        now,
+                        row["run_id"],
+                        f"autofix-intent:{row['nonce']}",
+                    ),
+                )
+            connection.execute(
+                """
+                INSERT INTO operator_plan_actions(
+                    action_id, plan_id, plan_sha256, action, from_state, to_state,
+                    write_phase, reason, principal, hostname, tool_version,
+                    result, diagnostic, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    action_id,
+                    plan_id,
+                    row["plan_sha256"],
+                    action,
+                    from_state,
+                    to_state,
+                    write_phase,
+                    reason,
+                    principal,
+                    hostname,
+                    tool_version,
+                    result,
+                    diagnostic,
+                    now,
+                ),
+            )
+            saved = connection.execute(
+                f"SELECT {self._operator_plan_action_columns()} "
+                "FROM operator_plan_actions WHERE action_id = ?",
+                (action_id,),
+            ).fetchone()
+        assert saved is not None
+        return self._operator_plan_action_from_row(saved)
+
+    def list_operator_plan_actions(self) -> tuple[OperatorPlanAction, ...]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT {self._operator_plan_action_columns()} "
+                "FROM operator_plan_actions ORDER BY id"
+            ).fetchall()
+        return tuple(self._operator_plan_action_from_row(row) for row in rows)
 
     def is_suppressed_parent_sha(self, project_id: str, mr_iid: int, sha: str) -> bool:
         with self._connect() as connection:

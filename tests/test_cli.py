@@ -259,3 +259,24 @@ def test_cli_routes_separate_notification_resend(monkeypatch) -> None:
     assert result == 8
     assert captured["args"].operator_config == "/trusted/operator.yml"
     assert captured["args"].reason == "resend approved"
+
+
+def test_cli_routes_operator_plan_transitions(monkeypatch) -> None:
+    captured = []
+
+    def run(args, action):
+        captured.append((args.plan_id, args.reason, action))
+        return 9
+
+    monkeypatch.setattr(cli, "_run_transition_auto_fix_plan", run)
+
+    assert cli.main(
+        ["rearm-autofix-plan", "--plan-id", "7", "--reason", "evidence checked"]
+    ) == 9
+    assert cli.main(
+        ["abandon-autofix-plan", "--plan-id", "8", "--reason", "pilot cancelled"]
+    ) == 9
+    assert captured == [
+        (7, "evidence checked", "rearm"),
+        (8, "pilot cancelled", "abandon"),
+    ]

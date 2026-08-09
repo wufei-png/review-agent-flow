@@ -95,6 +95,22 @@ class FakeGitLab:
         self.created_auto_fix_mrs: list[CreatedMergeRequest] = []
 
     def get_merge_request(self, project_id: str, mr_iid: int) -> MergeRequest:
+        for child in self.created_auto_fix_mrs:
+            if child.project_id == project_id and child.iid == mr_iid:
+                return MergeRequest(
+                    child.project_id,
+                    child.iid,
+                    child.title,
+                    child.author_username,
+                    child.source_branch,
+                    child.target_branch,
+                    "f" * 40,
+                    child.web_url,
+                    draft=child.draft,
+                    description=child.description,
+                    state=child.state,
+                    merged_sha=child.merged_sha,
+                )
         return self.mr
 
     def get_latest_pipeline(self, project_id: str, sha: str) -> Pipeline:

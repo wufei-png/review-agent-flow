@@ -203,6 +203,15 @@ class AutoFixPublisher:
                 "deferred",
                 "publication lease was lost before the Auto-fix commit write",
             )
+        if not self.store.mark_auto_fix_write_started(
+            plan.plan_id, plan.claim_token, operation="commit"
+        ):
+            return AutoFixPublicationResult(
+                plan.plan_id,
+                plan.run_id,
+                "deferred",
+                "publication lease was lost before recording the commit write boundary",
+            )
 
         try:
             commit = self.gitlab.create_repository_commit(
@@ -274,6 +283,15 @@ class AutoFixPublisher:
                 "deferred",
                 "publication lease was lost before the Auto-fix Merge Request write",
             )
+        if not self.store.mark_auto_fix_write_started(
+            plan.plan_id, plan.claim_token, operation="merge_request"
+        ):
+            return AutoFixPublicationResult(
+                plan.plan_id,
+                plan.run_id,
+                "deferred",
+                "publication lease was lost before recording the Merge Request write boundary",
+            )
 
         try:
             child = self.gitlab.create_merge_request(
@@ -308,6 +326,40 @@ class AutoFixPublisher:
                 "needs_reconciliation",
                 "GitLab returned a conflicting Auto-fix Merge Request identity",
                 uncertain=True,
+            )
+        try:
+            observed_child = self.gitlab.get_merge_request(project_id, child.iid)
+        except Exception as exc:  # noqa: BLE001 - the MR write already succeeded
+            return self._finish(
+                plan,
+                "needs_reconciliation",
+                f"unable to verify the Auto-fix Merge Request head: {exc}",
+                uncertain=True,
+            )
+        if (
+            observed_child.project_id != project_id
+            or observed_child.iid != child.iid
+            or observed_child.source_project_id != project_id
+            or observed_child.source_branch != branch
+            or observed_child.target_branch != target_branch
+            or observed_child.sha != commit.sha
+            or plan.marker not in observed_child.description
+            or not observed_child.author_username.strip()
+        ):
+            return self._finish(
+                plan,
+                "needs_reconciliation",
+                "Auto-fix Merge Request head conflicts with the confirmed commit",
+                uncertain=True,
+            )
+        if not self.store.record_auto_fix_merge_request(
+            plan.plan_id, plan.claim_token, child.iid
+        ):
+            return AutoFixPublicationResult(
+                plan.plan_id,
+                plan.run_id,
+                "deferred",
+                "publication lease was lost after the Auto-fix Merge Request write",
             )
         completed = self.store.complete_auto_fix_publication(
             plan.plan_id,

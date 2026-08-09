@@ -11,7 +11,12 @@ from pathlib import PurePosixPath
 from .autofix_planner import canonical_json
 from .events import parse_auto_fix_branch, parse_auto_fix_marker
 from .gitlab import GitLabClient, is_valid_sha
-from .store import NotificationRequest, ProgramAutoFixRelation, SQLiteStore
+from .store import (
+    NotificationRequest,
+    OperatorPlanAction,
+    ProgramAutoFixRelation,
+    SQLiteStore,
+)
 
 _NONCE_RE = re.compile(r"^[0-9a-f]{32}$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -44,6 +49,34 @@ class OperatorContext:
 
 class AutoFixRecoveryError(ValueError):
     """Raised when explicit recovery evidence is incomplete or conflicting."""
+
+
+class AutoFixPlanOperator:
+    """Apply explicit local Plan lifecycle decisions with immutable audit."""
+
+    def __init__(self, store: SQLiteStore) -> None:
+        self.store = store
+
+    def transition(
+        self,
+        *,
+        context: OperatorContext,
+        plan_id: int,
+        action: str,
+    ) -> OperatorPlanAction:
+        AutoFixRecoveryService._operator_context(context)
+        audit = self.store.transition_auto_fix_publication_plan(
+            plan_id,
+            action_id=context.recovery_id,
+            action=action,
+            reason=context.reason,
+            principal=context.principal,
+            hostname=context.hostname,
+            tool_version=context.tool_version,
+        )
+        if audit.result != "succeeded":
+            raise AutoFixRecoveryError(audit.diagnostic or "Operator Plan action rejected")
+        return audit
 
 
 class AutoFixRecoveryService:
