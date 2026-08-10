@@ -174,7 +174,11 @@ def test_runner_parses_optional_autofix_proposal(tmp_path: Path) -> None:
 
 
 def test_runner_environment_is_allowlist_plus_controlled_context(tmp_path: Path) -> None:
-    code = _success_code(
+    code = (
+        "import json, os, pathlib; "
+        "pathlib.Path(os.environ['REVIEW_AGENT_FLOW_RESULT_PATH']).write_text("
+        "json.dumps({'version': 1, 'review_markdown': "
+        "'GITLAB_TOKEN_PRESENT=' + str('GITLAB_TOKEN' in os.environ)})); "
         "print('ALLOWED=' + os.environ['MODEL_TOKEN']); "
         "print('GITLAB_TOKEN=' + str('GITLAB_TOKEN' in os.environ)); "
         "print('NOTE_MARKER=' + str('REVIEW_AGENT_FLOW_NOTE_MARKER' in os.environ))"
@@ -182,6 +186,8 @@ def test_runner_environment_is_allowlist_plus_controlled_context(tmp_path: Path)
     result = LocalCliAgentRunner([sys.executable, "-c", code], timeout_seconds=5).run(
         _context(tmp_path), extra_env={"MODEL_TOKEN": "allowed"}
     )
+    assert result.output is not None
+    assert result.output.review_markdown == "GITLAB_TOKEN_PRESENT=False"
     assert result.stdout.splitlines() == [
         "ALLOWED=[REDACTED]",
         "GITLAB_TOKEN=[REDACTED]",
