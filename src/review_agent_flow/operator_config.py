@@ -182,6 +182,57 @@ def _projects(value: Any, field: str) -> frozenset[str]:
     return projects
 
 
+def _parse_backend_profiles(
+    value: Any,
+    backend_name: str,
+    adapter: str,
+) -> dict[str, BackendProfile]:
+    profile_values = _mapping(value, f"backends.{backend_name}.profiles")
+    profiles: dict[str, BackendProfile] = {}
+    for profile_name, profile_value in profile_values.items():
+        profile_name = _name(profile_name, "profile name")
+        profile = _mapping(profile_value, f"profiles.{profile_name}")
+        _reject_unknown(
+            profile,
+            {"timeout_seconds", "environment", "verification", "model"},
+            f"profiles.{profile_name}",
+        )
+        timeout = profile.get("timeout_seconds", 1800)
+        if type(timeout) is not int or timeout <= 0 or timeout > MAX_BACKEND_TIMEOUT_SECONDS:
+            raise OperatorConfigError(
+                f"profiles.{profile_name}.timeout_seconds must be between 1 and "
+                f"{MAX_BACKEND_TIMEOUT_SECONDS}"
+            )
+        environment_value = profile.get("environment", [])
+        if not isinstance(environment_value, list):
+            raise OperatorConfigError(f"profiles.{profile_name}.environment must be a list")
+        environment = tuple(_environment_name(item) for item in environment_value)
+        if len(set(environment)) != len(environment):
+            raise OperatorConfigError(f"profiles.{profile_name}.environment has duplicates")
+        verification_value = profile.get("verification")
+        model_value = profile.get("model")
+        model = (
+            _name(model_value, f"profiles.{profile_name}.model")
+            if model_value is not None
+            else None
+        )
+        if model is not None and adapter != OPENCODE_ADAPTER:
+            raise OperatorConfigError(
+                f"profiles.{profile_name}.model is supported only by the OpenCode adapter"
+            )
+        verification = None
+        if verification_value is not None:
+            verification_map = _mapping(verification_value, "verification")
+            _reject_unknown(verification_map, {"command"}, "verification")
+            verification = VerificationProfile(
+                _command(verification_map.get("command"), "verification.command")
+            )
+        profiles[profile_name] = BackendProfile(timeout, environment, verification, model)
+    if not profiles:
+        raise OperatorConfigError(f"backends.{backend_name}.profiles cannot be empty")
+    return profiles
+
+
 def load_operator_config(path: str | Path) -> OperatorConfig:
     config_path = Path(path).expanduser().resolve()
     if not config_path.is_file():
@@ -227,49 +278,7 @@ def load_operator_config(path: str | Path) -> OperatorConfig:
             raise OperatorConfigError(
                 f"backends.{backend_name}.command must contain only the OpenCode executable"
             )
-        profile_values = _mapping(backend.get("profiles"), f"backends.{backend_name}.profiles")
-        profiles: dict[str, BackendProfile] = {}
-        for profile_name, profile_value in profile_values.items():
-            profile_name = _name(profile_name, "profile name")
-            profile = _mapping(profile_value, f"profiles.{profile_name}")
-            _reject_unknown(
-                profile,
-                {"timeout_seconds", "environment", "verification", "model"},
-                f"profiles.{profile_name}",
-            )
-            timeout = profile.get("timeout_seconds", 1800)
-            if type(timeout) is not int or timeout <= 0 or timeout > MAX_BACKEND_TIMEOUT_SECONDS:
-                raise OperatorConfigError(
-                    f"profiles.{profile_name}.timeout_seconds must be between 1 and "
-                    f"{MAX_BACKEND_TIMEOUT_SECONDS}"
-                )
-            environment_value = profile.get("environment", [])
-            if not isinstance(environment_value, list):
-                raise OperatorConfigError(f"profiles.{profile_name}.environment must be a list")
-            environment = tuple(_environment_name(item) for item in environment_value)
-            if len(set(environment)) != len(environment):
-                raise OperatorConfigError(f"profiles.{profile_name}.environment has duplicates")
-            verification_value = profile.get("verification")
-            model_value = profile.get("model")
-            model = (
-                _name(model_value, f"profiles.{profile_name}.model")
-                if model_value is not None
-                else None
-            )
-            if model is not None and adapter != OPENCODE_ADAPTER:
-                raise OperatorConfigError(
-                    f"profiles.{profile_name}.model is supported only by the OpenCode adapter"
-                )
-            verification = None
-            if verification_value is not None:
-                verification_map = _mapping(verification_value, "verification")
-                _reject_unknown(verification_map, {"command"}, "verification")
-                verification = VerificationProfile(
-                    _command(verification_map.get("command"), "verification.command")
-                )
-            profiles[profile_name] = BackendProfile(timeout, environment, verification, model)
-        if not profiles:
-            raise OperatorConfigError(f"backends.{backend_name}.profiles cannot be empty")
+        profiles = _parse_backend_profiles(backend.get("profiles"), backend_name, adapter)
         backends[backend_name] = AgentBackend(
             backend_enabled,
             adapter,
