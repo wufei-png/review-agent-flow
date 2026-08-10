@@ -13,7 +13,11 @@ The core does not ship vendor-specific model SDKs. LiteLLM may be used as an ext
 
 ## Invocation
 
-The Worker invokes the selected Operator command with `shell=False` and the exact-SHA Trusted Workspace as `cwd`. It creates `REVIEW_AGENT_FLOW_RESULT_PATH` outside that workspace with restrictive permissions and supplies only these ReviewFlow variables, the profile's explicit environment allowlist, and the Operator-owned execution `PATH`:
+Before execution, ReviewFlow freezes `AgentTaskV1` once per Review Run. The task contains the ReviewKey, untrusted MR title and branch presentation, exact GitLab `base_sha`, `start_sha` and `head_sha`, the selected Skill path, Auto-fix authorization and the controlled absolute Result Path. The canonical prompt labels MR data as untrusted, requires review of `base_sha...head_sha`, and reserves every GitLab, notification, commit and push effect to ReviewFlow.
+
+All Backend adapters consume that same canonical task. An adapter may map it to its CLI's native non-interactive invocation, but cannot add domain authority or change the Result contract. The generic Operator-command adapter receives a private task file; the OpenCode reference adapter passes the canonical prompt to `opencode run`. Codex and Claude Code may be added later as peer adapters without changing the core task.
+
+The Worker invokes the selected Operator command with `shell=False` and the exact-SHA Trusted Workspace as `cwd`. It creates `REVIEW_AGENT_FLOW_RESULT_PATH` outside that workspace with restrictive permissions. The generic command compatibility surface supplies these ReviewFlow variables, the profile's explicit environment allowlist, and the Operator-owned execution `PATH`:
 
 | Variable | Meaning |
 | --- | --- |
@@ -25,7 +29,7 @@ The Worker invokes the selected Operator command with `shell=False` and the exac
 | `REVIEW_AGENT_FLOW_AUTO_FIX_ENABLED` | `true` only when Project request and Operator authorization both allow a proposal |
 | `REVIEW_AGENT_FLOW_RESULT_PATH` | Controlled path for the single structured result |
 
-ReviewFlow does not expose the GitLab token, publication marker, branch, title, target branch, commit message or readiness to the Agent. Stdout and stderr are bounded diagnostics only and never carry the authoritative result.
+ReviewFlow does not expose the GitLab token, publication marker, commit message or readiness to the Agent. Title and branch fields are untrusted review context only and convey no executable or publication authority. Stdout and stderr are bounded diagnostics only and never carry the authoritative result.
 
 ## Structured result v1
 

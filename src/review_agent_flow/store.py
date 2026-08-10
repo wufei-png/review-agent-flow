@@ -12,6 +12,7 @@ from pathlib import Path
 from urllib.parse import quote
 from uuid import uuid4
 
+from .agent_task import MAX_MR_TITLE_CHARS, AgentTaskSnapshot
 from .gitlab import canonical_note_marker, has_exact_note_marker, is_valid_sha, normalize_sha
 from .publication_plan import PublicationPlanV1
 from .security import redact
@@ -22,7 +23,7 @@ DEFAULT_NOTIFICATION_LEASE_SECONDS = 30
 DEFAULT_NOTIFICATION_MAX_ATTEMPTS = 3
 DEFAULT_WORKTREE_CLEANUP_LEASE_SECONDS = 60
 DEFAULT_WORKTREE_CLEANUP_MAX_ATTEMPTS = 5
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 DEFAULT_EFFECT_LEASE_SECONDS = 60
 DEFAULT_NOTE_PUBLICATION_LEASE_SECONDS = 60
 DEFAULT_NOTE_PUBLICATION_MAX_ATTEMPTS = 5
@@ -288,6 +289,7 @@ class SensitivePayloadPurgeResult:
     purge_id: int
     cutoff_at: str
     plan_payloads: int
+    agent_task_payloads: int
     note_payloads: int
     notification_payloads: int
     diagnostic_payloads: int
@@ -333,7 +335,7 @@ class WorktreeRecord:
 class SQLiteStore:
     """Small SQLite store.
 
-    Version 14 is intentionally a fresh schema.  There is no production database
+    Version 15 is intentionally a fresh schema.  There is no production database
     migration contract for this pre-release implementation; an older database
     must be recreated rather than guessed into a new notification or Auto-fix
     routing model.
@@ -465,6 +467,20 @@ class SQLiteStore:
                     policy_json TEXT NOT NULL,
                     policy_sha256 TEXT NOT NULL,
                     created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS agent_task_snapshots (
+                    run_id INTEGER PRIMARY KEY REFERENCES review_runs(id),
+                    project_id TEXT NOT NULL,
+                    mr_iid INTEGER NOT NULL,
+                    title TEXT NOT NULL,
+                    source_project_id TEXT NOT NULL,
+                    source_branch TEXT NOT NULL,
+                    target_branch TEXT NOT NULL,
+                    base_sha TEXT NOT NULL,
+                    start_sha TEXT NOT NULL,
+                    head_sha TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    payload_purged_at TEXT
                 );
                 CREATE TABLE IF NOT EXISTS requested_outputs (
                     run_id INTEGER PRIMARY KEY REFERENCES review_runs(id),
@@ -714,12 +730,13 @@ class SQLiteStore:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     cutoff_at TEXT NOT NULL,
                     plan_payloads INTEGER NOT NULL,
+                    agent_task_payloads INTEGER NOT NULL,
                     note_payloads INTEGER NOT NULL,
                     notification_payloads INTEGER NOT NULL,
                     diagnostic_payloads INTEGER NOT NULL,
                     created_at TEXT NOT NULL
                 );
-                PRAGMA user_version = 14;
+                PRAGMA user_version = 15;
                 """
             )
 
@@ -925,6 +942,99 @@ class SQLiteStore:
                 (run_id,),
             ).fetchone()
         return PolicySnapshot(**dict(row)) if row is not None else None
+
+    def get_agent_task_snapshot(self, run_id: int) -> AgentTaskSnapshot | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM agent_task_snapshots WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        return AgentTaskSnapshot(**dict(row)) if row is not None else None
+
+    def freeze_agent_task_snapshot(
+        self,
+        run_id: int,
+        claim_token: str | None,
+        *,
+        project_id: str,
+        mr_iid: int,
+        title: str,
+        source_project_id: str,
+        source_branch: str,
+        target_branch: str,
+        base_sha: str,
+        start_sha: str,
+        head_sha: str,
+    ) -> AgentTaskSnapshot | None:
+        """Get or freeze exact MR context once, fenced by the active Run lease."""
+
+        if not claim_token:
+            return None
+        existing = self.get_agent_task_snapshot(run_id)
+        if existing is None:
+            if not project_id or project_id.strip() != project_id:
+                raise ValueError("Agent task project_id must be a non-empty trimmed string")
+            if type(mr_iid) is not int or mr_iid <= 0:
+                raise ValueError("Agent task mr_iid must be a positive integer")
+            if not title or len(title) > MAX_MR_TITLE_CHARS:
+                raise ValueError(
+                    f"Agent task title must contain 1-{MAX_MR_TITLE_CHARS} characters"
+                )
+            strings = {
+                "source_project_id": source_project_id,
+                "source_branch": source_branch,
+                "target_branch": target_branch,
+            }
+            for field, value in strings.items():
+                if not value or value.strip() != value:
+                    raise ValueError(f"Agent task {field} must be a non-empty trimmed string")
+            base_sha = normalize_sha(base_sha)
+            start_sha = normalize_sha(start_sha)
+            head_sha = normalize_sha(head_sha)
+        now = self._now().isoformat()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            active = connection.execute(
+                """
+                SELECT 1 FROM review_runs
+                WHERE id = ? AND status = 'running' AND claim_token = ?
+                  AND lease_until IS NOT NULL AND lease_until > ?
+                """,
+                (run_id, claim_token, now),
+            ).fetchone()
+            if active is None:
+                return None
+            row = connection.execute(
+                "SELECT * FROM agent_task_snapshots WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if row is not None:
+                return AgentTaskSnapshot(**dict(row))
+            connection.execute(
+                """
+                INSERT INTO agent_task_snapshots(
+                    run_id, project_id, mr_iid, title, source_project_id, source_branch,
+                    target_branch, base_sha, start_sha, head_sha, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id) DO NOTHING
+                """,
+                (
+                    run_id,
+                    project_id,
+                    mr_iid,
+                    title,
+                    source_project_id,
+                    source_branch,
+                    target_branch,
+                    base_sha,
+                    start_sha,
+                    head_sha,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM agent_task_snapshots WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        assert row is not None
+        return AgentTaskSnapshot(**dict(row))
 
     def freeze_policy_snapshot(
         self,
@@ -4997,6 +5107,20 @@ class SQLiteStore:
                 """,
                 (now, cutoff_at),
             ).rowcount
+            agent_tasks = connection.execute(
+                """
+                UPDATE agent_task_snapshots
+                SET title = '', source_branch = '', target_branch = '',
+                    payload_purged_at = ?
+                WHERE created_at <= ? AND payload_purged_at IS NULL
+                  AND EXISTS (
+                      SELECT 1 FROM review_runs r
+                      WHERE r.id = agent_task_snapshots.run_id
+                        AND r.status NOT IN ('pending', 'running')
+                  )
+                """,
+                (now, cutoff_at),
+            ).rowcount
             notes = connection.execute(
                 """
                 UPDATE note_publication_requests
@@ -5089,16 +5213,24 @@ class SQLiteStore:
             connection.execute(
                 """
                 INSERT INTO sensitive_payload_purges(
-                    cutoff_at, plan_payloads, note_payloads,
+                    cutoff_at, plan_payloads, agent_task_payloads, note_payloads,
                     notification_payloads, diagnostic_payloads, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (cutoff_at, plans, notes, outbox + requests, diagnostics, now),
+                (
+                    cutoff_at,
+                    plans,
+                    agent_tasks,
+                    notes,
+                    outbox + requests,
+                    diagnostics,
+                    now,
+                ),
             )
             row = connection.execute(
                 """
-                SELECT id AS purge_id, cutoff_at, plan_payloads, note_payloads,
-                       notification_payloads, diagnostic_payloads, created_at
+                SELECT id AS purge_id, cutoff_at, plan_payloads, agent_task_payloads,
+                       note_payloads, notification_payloads, diagnostic_payloads, created_at
                 FROM sensitive_payload_purges WHERE id = last_insert_rowid()
                 """
             ).fetchone()
@@ -5109,8 +5241,8 @@ class SQLiteStore:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT id AS purge_id, cutoff_at, plan_payloads, note_payloads,
-                       notification_payloads, diagnostic_payloads, created_at
+                SELECT id AS purge_id, cutoff_at, plan_payloads, agent_task_payloads,
+                       note_payloads, notification_payloads, diagnostic_payloads, created_at
                 FROM sensitive_payload_purges ORDER BY id
                 """
             ).fetchall()

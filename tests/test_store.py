@@ -88,6 +88,44 @@ def test_policy_snapshot_is_exact_and_immutable_per_run(tmp_path) -> None:
         )
 
 
+def test_agent_task_snapshot_is_exact_and_immutable_per_run(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "review.db")
+    run = store.enqueue("42", 1, SHA)
+    claimed = store.claim_next()
+    assert claimed is not None
+
+    values = {
+        "project_id": "42",
+        "mr_iid": 1,
+        "title": "Review exact diff",
+        "source_project_id": "42",
+        "source_branch": "feature",
+        "target_branch": "main",
+        "base_sha": OLD_SHA,
+        "start_sha": NEW_SHA,
+        "head_sha": SHA,
+    }
+    snapshot = store.freeze_agent_task_snapshot(
+        run.run_id, claimed.claim_token, **values
+    )
+
+    assert snapshot is not None and snapshot.base_sha == OLD_SHA
+    assert store.freeze_agent_task_snapshot(
+        run.run_id, claimed.claim_token, **values
+    ) == snapshot
+    assert store.requeue(
+        run.run_id, "transient worktree failure", claim_token=claimed.claim_token
+    )
+    retried_claim = store.claim_next()
+    assert retried_claim is not None
+    retried = store.freeze_agent_task_snapshot(
+        run.run_id,
+        retried_claim.claim_token,
+        **{**values, "title": "Edited title", "base_sha": LATER_SHA},
+    )
+    assert retried == snapshot
+
+
 def test_review_outcome_tracks_durable_notification_delivery(tmp_path) -> None:
     store = SQLiteStore(tmp_path / "review.db")
     run = store.enqueue("42", 1, SHA)

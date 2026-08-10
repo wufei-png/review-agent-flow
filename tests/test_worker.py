@@ -1,6 +1,7 @@
 import sqlite3
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 from threading import Event, Thread
 
@@ -112,6 +113,12 @@ class FakeGitLab:
                     state=child.state,
                     merged_sha=child.merged_sha,
                 )
+        if self.mr.base_sha is None or self.mr.start_sha is None:
+            return replace(
+                self.mr,
+                base_sha=self.mr.base_sha or self.mr.sha,
+                start_sha=self.mr.start_sha or self.mr.sha,
+            )
         return self.mr
 
     def get_latest_pipeline(self, project_id: str, sha: str) -> Pipeline:
@@ -343,6 +350,10 @@ def test_worker_runs_agent_in_exact_sha_worktree_and_cleans_it(tmp_path: Path) -
     assert result.status == "succeeded"
     assert result.agent_result is not None
     assert result.agent_result.stdout.strip() == "reviewed"
+    snapshot = store.get_agent_task_snapshot(1)
+    assert snapshot is not None
+    assert (snapshot.base_sha, snapshot.start_sha, snapshot.head_sha) == (sha, sha, sha)
+    assert snapshot.title == "Improve validation"
     assert not (tmp_path / "worktrees" / "run-1").exists()
     assert notifier.events == []
     queued_notification = store.get_notification_delivery(1)
@@ -356,6 +367,46 @@ def test_worker_runs_agent_in_exact_sha_worktree_and_cleans_it(tmp_path: Path) -
     assert gitlab.created_note_bodies == [
         f"{canonical_note_marker('42', 1, sha)}\nreviewed"
     ]
+
+
+def test_worker_defers_new_ai_run_while_gitlab_diff_refs_are_preparing(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    sha = _git_repository(repository)
+    mr = MergeRequest(
+        "42", 1, "Diff is preparing", "alice", "feature", "main", sha, "https://mr"
+    )
+    store = SQLiteStore(tmp_path / "review.db")
+    run = store.enqueue("42", 1, sha)
+
+    class PreparingDiffGitLab(FakeGitLab):
+        def get_merge_request(self, project_id: str, mr_iid: int) -> MergeRequest:
+            return self.mr
+
+    worker = ReviewWorker(
+        store,
+        PreparingDiffGitLab(mr),
+        GitWorktreeManager(repository, tmp_path / "worktrees"),
+        ReviewPolicy(
+            ai=AIPolicy(enabled=True, command=(sys.executable, "-c", "raise AssertionError"))
+        ),
+        repository,
+        "https://gitlab",
+        project_id="42",
+        retry_delay_seconds=0,
+    )
+
+    result = worker.process_one()
+
+    assert result is not None and result.status == "deferred"
+    assert result.detail == "waiting for GitLab Merge Request diff refs"
+    persisted = store.get_review_run(run.run_id)
+    assert persisted is not None and persisted.status == "pending"
+    assert persisted.failure_attempts == 0
+    assert store.get_agent_task_snapshot(run.run_id) is None
+    assert not store.list_effect_receipts(run.run_id)
 
 
 def test_expired_run_resumes_frozen_note_without_rerunning_agent_or_stranding_intent(

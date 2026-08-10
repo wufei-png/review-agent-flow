@@ -101,7 +101,7 @@ def test_merge_request_preserves_source_project_identity() -> None:
         source_branch="feature",
         target_branch="main",
         source_project_id=99,
-        diff_refs={"head_sha": SHA},
+        diff_refs={"base_sha": "b" * 40, "start_sha": "c" * 40, "head_sha": SHA},
         web_url="https://mr",
         draft=False,
         work_in_progress=False,
@@ -118,6 +118,8 @@ def test_merge_request_preserves_source_project_identity() -> None:
     merge_request = _client(project).get_merge_request("42", 1)
 
     assert merge_request.source_project_id == "99"
+    assert merge_request.base_sha == "b" * 40
+    assert merge_request.start_sha == "c" * 40
 
 
 def test_autofix_commit_uses_start_sha_and_never_forces() -> None:

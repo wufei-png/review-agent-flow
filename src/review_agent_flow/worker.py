@@ -546,6 +546,25 @@ class ReviewWorker:
             self._freeze_effective_decision(run)
             effective_decision = self.store.get_effective_run_decision(run.run_id)
             assert effective_decision is not None
+            frozen_snapshot = self.store.get_agent_task_snapshot(run.run_id)
+            if (
+                effective_decision.ai_review
+                and frozen_snapshot is None
+                and (not merge_request.base_sha or not merge_request.start_sha)
+            ):
+                detail = "waiting for GitLab Merge Request diff refs"
+                requeued = self.store.requeue(
+                    run.run_id,
+                    detail,
+                    delay_seconds=self.retry_delay_seconds,
+                    claim_token=run.claim_token,
+                )
+                if not requeued:
+                    return self._lease_recovery_result(
+                        run, "Review Run lease lost before diff refs requeue"
+                    )
+                self._log_run(run, status="deferred", diagnostic=detail)
+                return WorkerResult(run.run_id, "deferred", detail=detail)
             self._notify_humans(run, merge_request)
             if not effective_decision.ai_review:
                 if not self.store.finish(run.run_id, "succeeded", claim_token=run.claim_token):
@@ -563,7 +582,27 @@ class ReviewWorker:
                     frozen_note.request_id,
                 )
 
-            self.sha_ensurer.ensure_sha(run.sha)
+            snapshot = self.store.freeze_agent_task_snapshot(
+                run.run_id,
+                run.claim_token,
+                project_id=merge_request.project_id,
+                mr_iid=merge_request.iid,
+                title=merge_request.title,
+                source_project_id=str(merge_request.source_project_id or ""),
+                source_branch=merge_request.source_branch,
+                target_branch=merge_request.target_branch,
+                base_sha=str(merge_request.base_sha or ""),
+                start_sha=str(merge_request.start_sha or ""),
+                head_sha=merge_request.sha,
+            )
+            if snapshot is None:
+                raise LeaseLostError(
+                    "Review Run lease was lost before freezing the Agent Task Snapshot"
+                )
+            for required_sha in dict.fromkeys(
+                (snapshot.base_sha, snapshot.start_sha, snapshot.head_sha)
+            ):
+                self.sha_ensurer.ensure_sha(required_sha)
             if self.auto_fix_enabled:
                 auto_fix_intent = self.store.create_auto_fix_publication_intent(
                     run.run_id, run.claim_token

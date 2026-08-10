@@ -29,6 +29,20 @@ def _terminal_payloads(tmp_path: Path) -> tuple[SQLiteStore, int, int, str]:
         claimed.claim_token,
     )
     assert note is not None
+    snapshot = store.freeze_agent_task_snapshot(
+        run.run_id,
+        claimed.claim_token,
+        project_id="42",
+        mr_iid=1,
+        title="Sensitive MR title",
+        source_project_id="42",
+        source_branch="secret-feature",
+        target_branch="main",
+        base_sha=SHA,
+        start_sha=SHA,
+        head_sha=SHA,
+    )
+    assert snapshot is not None
     intent = store.create_auto_fix_publication_intent(run.run_id, claimed.claim_token)
     assert intent is not None
     plan_receipt = store.create_effect_receipt(
@@ -58,6 +72,10 @@ def _terminal_payloads(tmp_path: Path) -> tuple[SQLiteStore, int, int, str]:
     assert plan is not None
     assert store.finish(run.run_id, "succeeded", claim_token=claimed.claim_token)
     with store._connect() as connection:
+        connection.execute(
+            "UPDATE agent_task_snapshots SET created_at = ? WHERE run_id = ?",
+            (OLD, run.run_id),
+        )
         connection.execute(
             "UPDATE auto_fix_publication_plans SET state = 'published', "
             "write_phase = 'published', updated_at = ? WHERE id = ?",
@@ -147,6 +165,7 @@ def test_retention_requires_plan_backup_but_purges_other_expired_payloads(
 
     assert first.backed_up_plans == 0
     assert first.purge.plan_payloads == 0
+    assert first.purge.agent_task_payloads == 1
     assert store.get_auto_fix_publication_plan(run_id).plan_json is not None
     with store._connect() as connection:
         note = connection.execute(
@@ -158,10 +177,16 @@ def test_retention_requires_plan_backup_but_purges_other_expired_payloads(
         request = connection.execute(
             "SELECT correlation_id, title, body, url, recipients_json FROM notification_requests"
         ).fetchone()
+        agent_task = connection.execute(
+            "SELECT title, source_branch, target_branch, base_sha, head_sha, "
+            "payload_purged_at FROM agent_task_snapshots"
+        ).fetchone()
     assert tuple(note) == (marker, note["payload_purged_at"])
     assert note["payload_purged_at"] is not None
     assert tuple(delivery) == ("autofix:retention", "", "", None, "[]")
     assert tuple(request) == ("autofix:retention", "", "", None, "[]")
+    assert tuple(agent_task) == ("", "", "", SHA, SHA, agent_task["payload_purged_at"])
+    assert agent_task["payload_purged_at"] is not None
     assert store.claim_published_note_reconciliation(request_id=1) is None
     assert store.get_auto_fix_publication_plan(run_id).plan_id == plan_id
 

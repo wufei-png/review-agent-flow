@@ -73,6 +73,8 @@ class MergeRequest:
     state: str = "opened"
     merged_sha: str | None = None
     source_project_id: str | None = None
+    base_sha: str | None = None
+    start_sha: str | None = None
 
     def __post_init__(self) -> None:
         if self.source_project_id is None:

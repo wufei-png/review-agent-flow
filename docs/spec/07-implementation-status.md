@@ -35,5 +35,6 @@ This is evidence for the old Agent-owned path only. It does not verify strict RE
 - Review Outcome is derived from immutable expectations and durable receipts as `pending`, `no_effect`, `delivered`, `degraded`, `undelivered` or `indeterminate`.
 - Full unit/integration tests cover crash windows, idempotent retries, stale heads, duplicate markers, invalid diffs, verifier failure and recovery validation.
 - Retention tests prove backup-before-purge, immutable backup conflicts, terminal payload purge and graceful Worker shutdown.
+- The Worker now freezes `AgentTaskV1` context and exact GitLab diff refs; the legacy environment-variable command runner remains active until the thin-adapter stage wires this canonical task into Backend invocation.
 
 Live GitLab verification of the target path remains required after the implementation and local integration gates pass.
