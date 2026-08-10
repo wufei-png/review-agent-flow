@@ -1288,6 +1288,7 @@ class ReviewWorker:
             self.agent_backend.command,
             self.agent_timeout_seconds,
             adapter=self.agent_backend.adapter,
+            model=self.agent_backend.model,
         )
         skill_path = DEFAULT_REVIEW_AGENT_SKILL
         if self.policy.ai.skill_path:

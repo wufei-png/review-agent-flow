@@ -16,6 +16,7 @@ from uuid import uuid4
 
 from . import __version__
 from .autofix_recovery import AutoFixPlanOperator, AutoFixRecoveryService, OperatorContext
+from .gitlab import canonical_note_marker, is_valid_sha, normalize_sha
 from .gitlab_client import PythonGitLabClient
 from .notifications import notifiers_from_operator
 from .operator_config import (
@@ -176,6 +177,51 @@ def _run_status(args: argparse.Namespace) -> int:
         print(json.dumps({"status": "not_found"}, sort_keys=True))
         return 1
     print(json.dumps(snapshot, sort_keys=True))
+    return 0
+
+
+def _run_review_mr(args: argparse.Namespace) -> int:
+    """Idempotently enqueue the current head of one bound-Project Merge Request."""
+
+    gitlab_url = _required(args.gitlab_url, "GITLAB_URL")
+    gitlab_token = _required(args.gitlab_token, "GITLAB_TOKEN")
+    project_id = _required(args.project_id, "REVIEW_AGENT_FLOW_PROJECT_ID")
+    if type(args.mr_iid) is not int or args.mr_iid <= 0:
+        raise SystemExit("--mr-iid must be a positive integer")
+    gitlab = PythonGitLabClient(gitlab_url, gitlab_token)
+    merge_request = gitlab.get_merge_request(project_id, args.mr_iid)
+    if merge_request.project_id != project_id or merge_request.iid != args.mr_iid:
+        raise SystemExit("GitLab Merge Request identity does not match the bound Project")
+    state = str(merge_request.state or "opened").lower()
+    if state != "opened":
+        raise SystemExit(f"Merge Request must be opened, not {state}")
+    if not is_valid_sha(merge_request.sha):
+        raise SystemExit("GitLab returned an invalid current Merge Request head SHA")
+    sha = normalize_sha(merge_request.sha)
+    try:
+        canonical_note_marker(project_id, args.mr_iid, sha)
+    except ValueError as exc:
+        raise SystemExit(f"invalid ReviewKey: {exc}") from exc
+    store = SQLiteStore(
+        args.db or os.getenv("REVIEW_AGENT_FLOW_DB", "review-agent-flow.sqlite3")
+    )
+    store.add_redaction_secret(gitlab_token)
+    run, created = store.enqueue_with_status(project_id, args.mr_iid, sha)
+    current = store.wake_run(project_id, args.mr_iid, sha) or run
+    print(
+        json.dumps(
+            {
+                "status": "enqueued" if created else "existing",
+                "project_id": project_id,
+                "mr_iid": args.mr_iid,
+                "sha": sha,
+                "run_id": current.run_id,
+                "run_status": current.status,
+                "merge_request_url": merge_request.web_url,
+            },
+            sort_keys=True,
+        )
+    )
     return 0
 
 
@@ -342,6 +388,15 @@ def main(argv: list[str] | None = None) -> int:
     status.add_argument("--run-id", type=int, required=True)
     status.add_argument("--project-id")
     status.add_argument("--db")
+    review_mr = subparsers.add_parser(
+        "review-mr",
+        help="idempotently enqueue the current head of one bound-Project Merge Request",
+    )
+    review_mr.add_argument("--mr-iid", type=int, required=True)
+    review_mr.add_argument("--gitlab-url")
+    review_mr.add_argument("--gitlab-token")
+    review_mr.add_argument("--project-id")
+    review_mr.add_argument("--db")
     recover = subparsers.add_parser(
         "recover-autofix-relation",
         help="explicitly validate and recover one lost Auto-fix Relation",
@@ -388,6 +443,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_api(args)
     if args.command == "status":
         return _run_status(args)
+    if args.command == "review-mr":
+        return _run_review_mr(args)
     if args.command == "recover-autofix-relation":
         return _run_recover_auto_fix_relation(args)
     if args.command == "resend-autofix-notification":

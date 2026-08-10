@@ -206,6 +206,7 @@ class LocalCliAgentRunner:
         timeout_seconds: int = 1800,
         *,
         adapter: str | None = None,
+        model: str | None = None,
     ) -> None:
         if not command:
             raise ValueError("Agent command cannot be empty")
@@ -214,6 +215,7 @@ class LocalCliAgentRunner:
         self.command = tuple(command)
         self.timeout_seconds = timeout_seconds
         self.adapter = adapter
+        self.model = model
 
     def run(
         self,
@@ -262,6 +264,7 @@ class LocalCliAgentRunner:
                 self.command,
                 context.task,
                 task_path,
+                self.model,
             )
             command = invocation.command
             env.update(invocation.environment)

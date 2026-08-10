@@ -48,6 +48,12 @@ class PythonGitLabClient(GitLabClient):
 
     def get_merge_request(self, project_id: str, mr_iid: int) -> MergeRequest:
         mr = self._project(project_id).mergerequests.get(mr_iid)
+        native_project_id = getattr(mr, "project_id", None)
+        native_iid = getattr(mr, "iid", None)
+        if str(native_project_id) != str(project_id) or native_iid != mr_iid:
+            raise GitLabIdentityConflict(
+                "GitLab returned a Merge Request outside the requested identity"
+            )
         diff_refs = getattr(mr, "diff_refs", {}) or {}
         author = getattr(mr, "author", {}) or {}
         state = str(getattr(mr, "state", "opened") or "opened")

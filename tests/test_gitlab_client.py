@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from review_agent_flow.gitlab import (
+    GitLabIdentityConflict,
     Note,
     NoteMarkerLookup,
     RepositoryAction,
@@ -96,6 +97,8 @@ def _client(value: FakeNotes | SimpleNamespace, username: str | None = "review-b
 
 def test_merge_request_preserves_source_project_identity() -> None:
     resource = SimpleNamespace(
+        project_id=42,
+        iid=1,
         title="Fork contribution",
         author={"username": "alice"},
         source_branch="feature",
@@ -120,6 +123,25 @@ def test_merge_request_preserves_source_project_identity() -> None:
     assert merge_request.source_project_id == "99"
     assert merge_request.base_sha == "b" * 40
     assert merge_request.start_sha == "c" * 40
+
+
+@pytest.mark.parametrize(
+    ("native_project_id", "native_iid"),
+    [(99, 1), (42, 9), (None, 1), (42, None)],
+)
+def test_merge_request_rejects_native_identity_mismatch(
+    native_project_id: int | None, native_iid: int | None
+) -> None:
+    resource = SimpleNamespace(project_id=native_project_id, iid=native_iid)
+    project = SimpleNamespace(
+        mergerequests=SimpleNamespace(get=lambda _iid: resource)
+    )
+
+    with pytest.raises(
+        GitLabIdentityConflict,
+        match="outside the requested identity",
+    ):
+        _client(project).get_merge_request("42", 1)
 
 
 def test_autofix_commit_uses_start_sha_and_never_forces() -> None:

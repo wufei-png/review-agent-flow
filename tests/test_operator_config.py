@@ -99,6 +99,39 @@ def test_operator_config_resolves_generic_command_adapter(tmp_path) -> None:
     assert resolved.command == ("custom-agent", "--batch")
 
 
+def test_operator_config_resolves_opencode_model_from_profile(tmp_path) -> None:
+    path = _write_config(tmp_path / "operator.yml")
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            "timeout_seconds: 120", "timeout_seconds: 120\n        model: openai/review-model"
+        ),
+        encoding="utf-8",
+    )
+
+    resolved = resolve_backend(
+        load_operator_config(path),
+        AIPolicy(enabled=True, backend="local-agent", profile="default"),
+        "42",
+        {},
+    )
+
+    assert resolved is not None and resolved.model == "openai/review-model"
+
+
+def test_operator_config_rejects_model_for_generic_command_adapter(tmp_path) -> None:
+    path = _write_config(tmp_path / "operator.yml")
+    path.write_text(
+        path.read_text(encoding="utf-8")
+        .replace("adapter: opencode", "adapter: command")
+        .replace("command: [opencode]", "command: [custom-agent]")
+        .replace("timeout_seconds: 120", "timeout_seconds: 120\n        model: provider/model"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(OperatorConfigError, match="only by the OpenCode adapter"):
+        load_operator_config(path)
+
+
 def test_operator_config_rejects_opencode_subcommand_in_operator_argv(tmp_path) -> None:
     path = _write_config(tmp_path / "operator.yml")
     path.write_text(

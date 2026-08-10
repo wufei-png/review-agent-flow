@@ -69,6 +69,7 @@ class BackendProfile:
     timeout_seconds: int
     environment: tuple[str, ...]
     verification: VerificationProfile | None = None
+    model: str | None = None
 
 
 @dataclass(frozen=True)
@@ -128,6 +129,7 @@ class ResolvedBackend:
     timeout_seconds: int
     environment: Mapping[str, str]
     verification: VerificationProfile | None
+    model: str | None = None
 
 
 def _mapping(value: Any, name: str) -> dict[str, Any]:
@@ -231,7 +233,7 @@ def load_operator_config(path: str | Path) -> OperatorConfig:
             profile = _mapping(profile_value, f"profiles.{profile_name}")
             _reject_unknown(
                 profile,
-                {"timeout_seconds", "environment", "verification"},
+                {"timeout_seconds", "environment", "verification", "model"},
                 f"profiles.{profile_name}",
             )
             timeout = profile.get("timeout_seconds", 1800)
@@ -247,6 +249,16 @@ def load_operator_config(path: str | Path) -> OperatorConfig:
             if len(set(environment)) != len(environment):
                 raise OperatorConfigError(f"profiles.{profile_name}.environment has duplicates")
             verification_value = profile.get("verification")
+            model_value = profile.get("model")
+            model = (
+                _name(model_value, f"profiles.{profile_name}.model")
+                if model_value is not None
+                else None
+            )
+            if model is not None and adapter != OPENCODE_ADAPTER:
+                raise OperatorConfigError(
+                    f"profiles.{profile_name}.model is supported only by the OpenCode adapter"
+                )
             verification = None
             if verification_value is not None:
                 verification_map = _mapping(verification_value, "verification")
@@ -254,7 +266,7 @@ def load_operator_config(path: str | Path) -> OperatorConfig:
                 verification = VerificationProfile(
                     _command(verification_map.get("command"), "verification.command")
                 )
-            profiles[profile_name] = BackendProfile(timeout, environment, verification)
+            profiles[profile_name] = BackendProfile(timeout, environment, verification, model)
         if not profiles:
             raise OperatorConfigError(f"backends.{backend_name}.profiles cannot be empty")
         backends[backend_name] = AgentBackend(
@@ -454,4 +466,5 @@ def resolve_backend(
         profile.timeout_seconds,
         allowed_environment,
         profile.verification,
+        profile.model,
     )

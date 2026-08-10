@@ -54,6 +54,9 @@ implementation-status 为准。
 
 Linux + systemd 的 API/Worker 分进程、最小凭据、优雅停机和 30 天默认保留
 参考部署见 [docs/deployment-linux-systemd.md](docs/deployment-linux-systemd.md)。
+无需 Docker Compose 的单机 OpenCode 试用流程见
+[docs/quickstart-host-native.md](docs/quickstart-host-native.md)，其中 `review-mr`
+只负责绑定 Project 的幂等手动入队，外部发布仍由 Worker 执行。
 
 Store 丢失后的 Auto-fix Relation 只能通过显式 Operator 命令恢复。命令还需
 提供发布前保存的规范 Publication Plan JSON，以便重新核对远端 commit 的父

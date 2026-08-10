@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from review_agent_flow import cli
+from review_agent_flow.gitlab import MergeRequest
 from review_agent_flow.worker import WorkerResult
 
 
@@ -213,6 +214,144 @@ def test_status_does_not_create_missing_database(tmp_path: Path, capsys) -> None
     assert cli._run_status(args) == 1
     assert json.loads(capsys.readouterr().out) == {"status": "not_found"}
     assert not database.exists()
+
+
+def test_review_mr_is_project_bound_and_idempotent(monkeypatch, tmp_path: Path, capsys) -> None:
+    sha = "a" * 40
+    merge_request = MergeRequest(
+        "42",
+        7,
+        "Review me",
+        "alice",
+        "feature",
+        "main",
+        sha,
+        "https://gitlab.example/group/project/-/merge_requests/7",
+    )
+
+    class FakeGitLab:
+        def get_merge_request(self, project_id, mr_iid):
+            assert (project_id, mr_iid) == ("42", 7)
+            return merge_request
+
+    monkeypatch.setattr(cli, "PythonGitLabClient", lambda url, token: FakeGitLab())
+    args = SimpleNamespace(
+        gitlab_url="https://gitlab.example",
+        gitlab_token="token",
+        project_id="42",
+        mr_iid=7,
+        db=str(tmp_path / "review.db"),
+    )
+
+    assert cli._run_review_mr(args) == 0
+    first = json.loads(capsys.readouterr().out)
+    assert cli._run_review_mr(args) == 0
+    duplicate = json.loads(capsys.readouterr().out)
+
+    assert first["status"] == "enqueued"
+    assert duplicate["status"] == "existing"
+    assert duplicate["run_id"] == first["run_id"]
+    assert duplicate["sha"] == sha
+    assert duplicate["run_status"] == "pending"
+
+
+@pytest.mark.parametrize(
+    ("merge_request", "message"),
+    [
+        (
+            MergeRequest(
+                "99", 7, "Wrong Project", "alice", "feature", "main", "a" * 40, "url"
+            ),
+            "bound Project",
+        ),
+        (
+            MergeRequest(
+                "42",
+                7,
+                "Closed",
+                "alice",
+                "feature",
+                "main",
+                "a" * 40,
+                "url",
+                state="closed",
+            ),
+            "must be opened",
+        ),
+        (
+            MergeRequest("42", 7, "Bad SHA", "alice", "feature", "main", "bad", "url"),
+            "invalid current",
+        ),
+    ],
+)
+def test_review_mr_rejects_unbound_or_ineligible_resource(
+    monkeypatch,
+    tmp_path: Path,
+    merge_request: MergeRequest,
+    message: str,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "PythonGitLabClient",
+        lambda url, token: SimpleNamespace(
+            get_merge_request=lambda project_id, mr_iid: merge_request
+        ),
+    )
+    args = SimpleNamespace(
+        gitlab_url="https://gitlab.example",
+        gitlab_token="token",
+        project_id="42",
+        mr_iid=7,
+        db=str(tmp_path / "review.db"),
+    )
+
+    with pytest.raises(SystemExit, match=message):
+        cli._run_review_mr(args)
+
+
+def test_cli_routes_manual_review_mr_trigger(monkeypatch) -> None:
+    captured = {}
+
+    def run(args):
+        captured["mr_iid"] = args.mr_iid
+        return 5
+
+    monkeypatch.setattr(cli, "_run_review_mr", run)
+
+    assert cli.main(["review-mr", "--mr-iid", "7"]) == 5
+    assert captured == {"mr_iid": 7}
+
+
+def test_review_mr_rejects_project_id_outside_review_key_contract(
+    monkeypatch, tmp_path: Path
+) -> None:
+    merge_request = MergeRequest(
+        "group/project",
+        7,
+        "Title",
+        "alice",
+        "feature",
+        "main",
+        "a" * 40,
+        "url",
+    )
+    monkeypatch.setattr(
+        cli,
+        "PythonGitLabClient",
+        lambda url, token: SimpleNamespace(
+            get_merge_request=lambda project_id, mr_iid: merge_request
+        ),
+    )
+    args = SimpleNamespace(
+        gitlab_url="https://gitlab.example",
+        gitlab_token="token",
+        project_id="group/project",
+        mr_iid=7,
+        db=str(tmp_path / "review.db"),
+    )
+
+    with pytest.raises(SystemExit, match="invalid ReviewKey"):
+        cli._run_review_mr(args)
 
 
 def test_cli_routes_explicit_relation_recovery(monkeypatch) -> None:

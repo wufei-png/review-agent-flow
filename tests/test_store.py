@@ -27,6 +27,17 @@ def test_enqueue_is_idempotent_and_claimable(tmp_path) -> None:
     assert store.claim_next() is None
 
 
+def test_enqueue_reports_creation_disposition(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "review.db")
+
+    first, first_created = store.enqueue_with_status("42", 1, SHA)
+    duplicate, duplicate_created = store.enqueue_with_status("42", 1, SHA)
+
+    assert first_created is True
+    assert duplicate_created is False
+    assert duplicate.run_id == first.run_id
+
+
 def test_sha_identity_is_case_insensitive(tmp_path) -> None:
     store = SQLiteStore(tmp_path / "review.db")
     uppercase_sha = "ABCDEF" * 6 + "ABCD"

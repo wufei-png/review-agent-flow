@@ -61,10 +61,13 @@ def build_backend_invocation(
     command: tuple[str, ...],
     task: AgentTaskV1,
     task_path: Path | None,
+    model: str | None = None,
 ) -> BackendInvocation:
     """Translate one canonical task without changing its domain contract."""
 
     if adapter == COMMAND_ADAPTER:
+        if model is not None:
+            raise ValueError("command adapter does not accept an OpenCode model")
         if task_path is None:
             raise ValueError("command adapter requires a private Agent Task path")
         return BackendInvocation(
@@ -92,8 +95,17 @@ def build_backend_invocation(
             "permission": permissions,
             "share": "disabled",
         }
+        model_arguments = ("--model", model) if model is not None else ()
         return BackendInvocation(
-            (*command, "run", "--pure", "--agent", "reviewflow", task.render_prompt()),
+            (
+                *command,
+                "run",
+                "--pure",
+                "--agent",
+                "reviewflow",
+                *model_arguments,
+                task.render_prompt(),
+            ),
             {
                 "OPENCODE_CONFIG_CONTENT": json.dumps(
                     config, ensure_ascii=False, sort_keys=True, separators=(",", ":")

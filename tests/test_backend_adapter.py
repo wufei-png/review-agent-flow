@@ -80,3 +80,32 @@ def test_command_adapter_preserves_operator_argv_and_supplies_task_path(tmp_path
 
     assert invocation.command == ("custom-agent", "--batch")
     assert invocation.environment == {"REVIEW_AGENT_FLOW_TASK_PATH": str(task_path)}
+
+
+def test_opencode_adapter_passes_operator_profile_model(tmp_path: Path) -> None:
+    skill = (tmp_path / "SKILL.md").resolve()
+    skill.write_text("# Review\n", encoding="utf-8")
+    snapshot = AgentTaskSnapshot(
+        1,
+        "42",
+        7,
+        "Review",
+        "42",
+        "feature",
+        "main",
+        "a" * 40,
+        "b" * 40,
+        "c" * 40,
+        "2026-08-10T00:00:00+00:00",
+    )
+    task = AgentTaskV1(snapshot, skill, (tmp_path / "result.json").resolve(), False)
+
+    invocation = build_backend_invocation(
+        "opencode", ("opencode",), task, None, "openai/review-model"
+    )
+
+    assert invocation.command[-3:] == (
+        "--model",
+        "openai/review-model",
+        task.render_prompt(),
+    )

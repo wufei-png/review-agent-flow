@@ -881,26 +881,33 @@ class SQLiteStore:
         return ProgramAutoFixRelation(**values)
 
     def enqueue(self, project_id: str, mr_iid: int, sha: str) -> ReviewRun:
+        return self.enqueue_with_status(project_id, mr_iid, sha)[0]
+
+    def enqueue_with_status(
+        self, project_id: str, mr_iid: int, sha: str
+    ) -> tuple[ReviewRun, bool]:
+        """Return the stable Review Run and whether this call created it."""
+
         if not project_id or not str(project_id).strip():
             raise ValueError("project_id cannot be empty")
         sha = normalize_sha(sha)
         created_at = datetime.now(UTC).isoformat()
         with self._connect() as connection:
-            connection.execute(
+            inserted = connection.execute(
                 """
                 INSERT INTO review_runs(project_id, mr_iid, sha, created_at, next_attempt_at)
                 VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(project_id, mr_iid, sha) DO NOTHING
                 """,
                 (project_id, mr_iid, sha, created_at, created_at),
-            )
+            ).rowcount
             row = connection.execute(
                 f"SELECT {self._review_run_columns()} FROM review_runs "
                 "WHERE project_id = ? AND mr_iid = ? AND sha = ?",
                 (project_id, mr_iid, sha),
             ).fetchone()
         assert row is not None
-        return self._review_run_from_row(row)
+        return self._review_run_from_row(row), inserted == 1
 
     def wake_run(self, project_id: str, mr_iid: int, sha: str) -> ReviewRun | None:
         """Make a deferred Review Run immediately eligible after a green Pipeline."""
