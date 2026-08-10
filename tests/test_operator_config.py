@@ -261,6 +261,7 @@ def test_operator_retention_rejects_relative_backup_directory(tmp_path) -> None:
         "GITLAB_TOKEN",
         "REVIEW_AGENT_FLOW_SHA",
         "OPENCODE_CONFIG_CONTENT",
+        "OPENCODE_CONFIG_DIR",
         "bad-name",
     ],
 )

@@ -1,3 +1,4 @@
+import hashlib
 import sqlite3
 
 import pytest
@@ -115,12 +116,16 @@ def test_agent_task_snapshot_is_exact_and_immutable_per_run(tmp_path) -> None:
         "base_sha": OLD_SHA,
         "start_sha": NEW_SHA,
         "head_sha": SHA,
+        "skill_source_path": f"{NEW_SHA}:.reviewflow/SKILL.md",
+        "skill_content": "# Frozen Skill\n",
     }
     snapshot = store.freeze_agent_task_snapshot(
         run.run_id, claimed.claim_token, **values
     )
 
     assert snapshot is not None and snapshot.base_sha == OLD_SHA
+    assert snapshot.skill_content == "# Frozen Skill\n"
+    assert snapshot.skill_sha256 == hashlib.sha256(b"# Frozen Skill\n").hexdigest()
     assert store.freeze_agent_task_snapshot(
         run.run_id, claimed.claim_token, **values
     ) == snapshot
@@ -132,7 +137,12 @@ def test_agent_task_snapshot_is_exact_and_immutable_per_run(tmp_path) -> None:
     retried = store.freeze_agent_task_snapshot(
         run.run_id,
         retried_claim.claim_token,
-        **{**values, "title": "Edited title", "base_sha": LATER_SHA},
+        **{
+            **values,
+            "title": "Edited title",
+            "base_sha": LATER_SHA,
+            "skill_content": "# Changed after retry\n",
+        },
     )
     assert retried == snapshot
 

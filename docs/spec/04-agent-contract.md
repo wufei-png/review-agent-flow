@@ -13,7 +13,9 @@ The core does not ship vendor-specific model SDKs. LiteLLM may be used as an ext
 
 ## Invocation
 
-Before execution, ReviewFlow freezes `AgentTaskV1` once per Review Run. The task contains the ReviewKey, untrusted MR title and branch presentation, exact GitLab `base_sha`, `start_sha` and `head_sha`, the selected Skill path, Auto-fix authorization and the controlled absolute Result Path. When rendered, the canonical prompt embeds the complete selected Skill and keeps its path as provenance; it labels MR data as untrusted, requires review of `base_sha...head_sha`, and reserves every GitLab, notification, commit and push effect to ReviewFlow.
+Before execution, ReviewFlow freezes the instruction-bearing `AgentTaskV1` snapshot once per Review Run. The durable snapshot contains the ReviewKey, untrusted MR title and branch presentation, exact GitLab `base_sha`, `start_sha` and `head_sha`, and the selected Skill's source path, bounded content and SHA-256 digest. A Project Skill is read only as a regular Git blob from the already-frozen target-branch commit; it is never read from the MR-head worktree. The packaged default is an Operator-owned regular file. Both sources are strict UTF-8, reject symlinks/NUL bytes and are limited to 64 KiB. Retries reuse these exact bytes.
+
+Each attempt materializes those frozen Skill bytes and the controlled Result Path under a private mode-`0700` Run directory. The canonical prompt embeds the complete Skill, records its source/digest and labels MR data as untrusted; it requires review of `base_sha...head_sha` and reserves every GitLab, notification, commit and push effect to ReviewFlow. The bounded prompt remains below the per-argument limit required by the reference CLI invocation.
 
 All Backend adapters consume that same canonical task. An adapter may map it to its CLI's native non-interactive invocation, but cannot add domain authority or change the Result contract. The generic Operator-command adapter receives a private task file; the OpenCode reference adapter passes the canonical prompt to `opencode run`. Codex and Claude Code may be added later as peer adapters without changing the core task.
 
@@ -25,7 +27,7 @@ The Worker invokes the selected Operator command with `shell=False` and the exac
 | `REVIEW_AGENT_FLOW_MR_IID` | Parent Merge Request IID |
 | `REVIEW_AGENT_FLOW_RUN_ID` | Local trace identifier; not publication identity |
 | `REVIEW_AGENT_FLOW_SHA` | Exact reviewed commit and required unchanged `HEAD` |
-| `REVIEW_AGENT_FLOW_SKILL` | Project Skill path when valid, otherwise the packaged default Skill |
+| `REVIEW_AGENT_FLOW_SKILL` | Private mode-`0600` materialization of the frozen Skill bytes |
 | `REVIEW_AGENT_FLOW_AUTO_FIX_ENABLED` | `true` only when Project request and Operator authorization both allow a proposal |
 | `REVIEW_AGENT_FLOW_RESULT_PATH` | Controlled path for the single structured result |
 | `REVIEW_AGENT_FLOW_TASK_PATH` | Mode-`0600` file containing the canonical `AgentTaskV1` prompt |
@@ -70,4 +72,4 @@ The packaged Skill tells an Agent to:
 4. optionally make only safe proposal edits when Auto-fix is enabled;
 5. leave `HEAD` unchanged and never commit, push, publish, notify, approve or block.
 
-A valid Project `.gitlab/review-agent/SKILL.md` replaces the packaged review instructions but cannot replace the runtime or publication authority.
+A valid regular Project `.gitlab/review-agent/SKILL.md` at the frozen target commit replaces the packaged review instructions but cannot replace the runtime or publication authority. Missing configured paths fall back to the packaged Skill; invalid or oversized objects fail closed.

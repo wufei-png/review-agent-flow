@@ -77,7 +77,7 @@ Keep this file outside the reviewed repository and mode `0600`:
 chmod 0600 "$HOME/.local/state/reviewflow-quickstart/operator.yml"
 ```
 
-The OpenCode adapter uses `run --pure --agent reviewflow`, embeds the selected Skill in the canonical task prompt, disables general file reads and ambient Skill lookup, disables Project-owned OpenCode configuration and sharing, isolates OpenCode state per Run, and never passes `--auto`. Exact review-range Git diff plus grep/LSP remain the source-inspection surface. The Agent receives no GitLab token. The Trusted Workspace is still not an OS sandbox; use a dedicated host identity or stronger host isolation for untrusted deployments.
+The OpenCode adapter uses `run --pure --agent reviewflow`, embeds the Skill frozen from the target-branch commit in the canonical task prompt, disables general file reads and ambient Skill lookup, disables Project-owned OpenCode configuration and sharing, isolates OpenCode state per Run, and never passes `--auto`. Exact review-range Git diff plus grep/LSP remain the source-inspection surface. The Agent receives no GitLab token. The Trusted Workspace is still not an OS sandbox; use a dedicated host identity or stronger host isolation for untrusted deployments.
 
 ## 4. Export the bound deployment settings
 
@@ -113,7 +113,7 @@ review-agent-flow worker --once
 
 The Worker fetches the frozen base/start/head commits, runs OpenCode in a detached worktree, parses the strict Result JSON, and publishes the ReviewFlow-owned MR Note. If GitLab is still preparing `diff_refs`, the Run is deferred without consuming its failure budget; run `worker --once` again later. Repeating `review-mr` or retrying the Worker does not create a second Review Run or duplicate Note for the same ReviewKey.
 
-Auto-fix captures every tracked or untracked workspace change. Ensure normal
+Auto-fix captures every tracked or non-ignored untracked workspace change. Ensure normal
 tool-generated files such as Python `__pycache__/` or build output are covered
 by the Project's committed ignore rules; otherwise binary or unrelated output
 is deliberately rejected rather than silently omitted from the candidate.

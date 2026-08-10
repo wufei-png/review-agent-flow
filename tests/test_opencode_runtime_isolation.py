@@ -1,3 +1,4 @@
+import hashlib
 import json
 import shutil
 import subprocess
@@ -55,6 +56,9 @@ def test_real_opencode_denies_nested_instructions_and_ambient_skills(
         "a" * 40,
         "b" * 40,
         "c" * 40,
+        str(skill.resolve()),
+        "# Trusted review skill\n",
+        hashlib.sha256(b"# Trusted review skill\n").hexdigest(),
         "2026-08-10T00:00:00+00:00",
     )
     task = AgentTaskV1(snapshot, skill.resolve(), result.resolve(), False)
@@ -93,3 +97,29 @@ def test_real_opencode_denies_nested_instructions_and_ambient_skills(
     assert "Tool skill is disabled for agent reviewflow" in (
         denied_skill.stdout + denied_skill.stderr
     )
+
+    review_command = (
+        "git --no-pager diff --no-ext-diff "
+        f"{snapshot.base_sha}...{snapshot.head_sha}"
+    )
+    escaped = tmp_path / "escaped.txt"
+    dangerous_commands = (
+        f"{review_command} -- README.md > {escaped}",
+        f"{review_command} | cat",
+        f"{review_command} $(printf README.md)",
+        f"{review_command} & touch {escaped}",
+    )
+    for command in dangerous_commands:
+        denied_bash = _run_debug(
+            executable,
+            worktree,
+            invocation.environment,
+            "--tool",
+            "bash",
+            "--params",
+            json.dumps({"command": command}),
+        )
+        denied_bash_output = denied_bash.stdout + denied_bash.stderr
+        assert denied_bash.returncode != 0
+        assert "prevents you from using this specific tool call" in denied_bash_output
+    assert not escaped.exists()

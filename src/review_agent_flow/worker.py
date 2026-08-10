@@ -40,6 +40,7 @@ from .runner import (
     LocalCliAgentRunner,
 )
 from .security import redact
+from .skill_source import load_operator_skill, load_project_skill
 from .store import (
     DEFAULT_LEASE_SECONDS,
     DEFAULT_MAX_ATTEMPTS,
@@ -583,27 +584,43 @@ class ReviewWorker:
                     frozen_note.request_id,
                 )
 
-            snapshot = self.store.freeze_agent_task_snapshot(
-                run.run_id,
-                run.claim_token,
-                project_id=merge_request.project_id,
-                mr_iid=merge_request.iid,
-                title=merge_request.title,
-                source_project_id=str(merge_request.source_project_id or ""),
-                source_branch=merge_request.source_branch,
-                target_branch=merge_request.target_branch,
-                base_sha=str(merge_request.base_sha or ""),
-                start_sha=str(merge_request.start_sha or ""),
-                head_sha=merge_request.sha,
-            )
-            if snapshot is None:
-                raise LeaseLostError(
-                    "Review Run lease was lost before freezing the Agent Task Snapshot"
+            if frozen_snapshot is None:
+                for required_sha in dict.fromkeys(
+                    (
+                        str(merge_request.base_sha or ""),
+                        str(merge_request.start_sha or ""),
+                        merge_request.sha,
+                    )
+                ):
+                    self.sha_ensurer.ensure_sha(required_sha)
+                skill_source_path, skill_content = self._load_skill_for_new_task(
+                    run, str(merge_request.start_sha or "")
                 )
-            for required_sha in dict.fromkeys(
-                (snapshot.base_sha, snapshot.start_sha, snapshot.head_sha)
-            ):
-                self.sha_ensurer.ensure_sha(required_sha)
+                snapshot = self.store.freeze_agent_task_snapshot(
+                    run.run_id,
+                    run.claim_token,
+                    project_id=merge_request.project_id,
+                    mr_iid=merge_request.iid,
+                    title=merge_request.title,
+                    source_project_id=str(merge_request.source_project_id or ""),
+                    source_branch=merge_request.source_branch,
+                    target_branch=merge_request.target_branch,
+                    base_sha=str(merge_request.base_sha or ""),
+                    start_sha=str(merge_request.start_sha or ""),
+                    head_sha=merge_request.sha,
+                    skill_source_path=skill_source_path,
+                    skill_content=skill_content,
+                )
+                if snapshot is None:
+                    raise LeaseLostError(
+                        "Review Run lease was lost before freezing the Agent Task Snapshot"
+                    )
+            else:
+                snapshot = frozen_snapshot
+                for required_sha in dict.fromkeys(
+                    (snapshot.base_sha, snapshot.start_sha, snapshot.head_sha)
+                ):
+                    self.sha_ensurer.ensure_sha(required_sha)
             if self.auto_fix_enabled:
                 auto_fix_intent = self.store.create_auto_fix_publication_intent(
                     run.run_id, run.claim_token
@@ -1290,12 +1307,6 @@ class ReviewWorker:
             adapter=self.agent_backend.adapter,
             model=self.agent_backend.model,
         )
-        skill_path = DEFAULT_REVIEW_AGENT_SKILL
-        if self.policy.ai.skill_path:
-            configured = Path(self.policy.ai.skill_path)
-            configured_path = configured if configured.is_absolute() else worktree / configured
-            if configured_path.is_file():
-                skill_path = configured_path
         if not self._heartbeat(run):
             raise LeaseLostError("Review Run lease could not be extended before Agent execution")
         result_root = self.worktrees.root / "agent-results"
@@ -1303,12 +1314,29 @@ class ReviewWorker:
         os.chmod(result_root, 0o700)
         with tempfile.TemporaryDirectory(prefix=f"run-{run.run_id}-", dir=result_root) as directory:
             os.chmod(directory, 0o700)
-            result_path = (Path(directory) / "result.json").resolve()
             snapshot = self.store.get_agent_task_snapshot(run.run_id)
             if snapshot is None:
                 raise ValueError("Review Run has no frozen Agent Task Snapshot")
+            if snapshot.skill_content is None:
+                raise ValueError("Review Run Agent Skill payload has been purged")
+            private_root = Path(directory).resolve()
+            result_path = private_root / "result.json"
+            skill_path = private_root / "SKILL.md"
+            descriptor = os.open(
+                skill_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            try:
+                with os.fdopen(descriptor, "wb", closefd=True) as stream:
+                    stream.write(snapshot.skill_content.encode("utf-8"))
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            except Exception:
+                skill_path.unlink(missing_ok=True)
+                raise
             enabled = self.auto_fix_enabled if auto_fix_enabled is None else auto_fix_enabled
-            task = AgentTaskV1(snapshot, skill_path.resolve(), result_path, enabled)
+            task = AgentTaskV1(snapshot, skill_path, result_path, enabled)
             return runner.run(
                 AgentContext(
                     project_id=run.project_id,
@@ -1327,6 +1355,27 @@ class ReviewWorker:
                 ),
                 extra_env=self.agent_backend.environment,
             )
+
+    def _load_skill_for_new_task(
+        self, run: ReviewRun, merge_request_start_sha: str
+    ) -> tuple[str, str]:
+        """Resolve trusted Skill bytes outside the untrusted MR-head worktree."""
+
+        configured = self.policy.ai.skill_path
+        if configured:
+            policy_snapshot = self.store.get_policy_snapshot(run.run_id)
+            revision = (
+                policy_snapshot.target_sha
+                if policy_snapshot is not None
+                else merge_request_start_sha
+            )
+            self.sha_ensurer.ensure_sha(revision)
+            content = load_project_skill(self.repository, revision, configured)
+            if content is not None:
+                return f"{revision}:{configured}", content
+        return str(DEFAULT_REVIEW_AGENT_SKILL), load_operator_skill(
+            DEFAULT_REVIEW_AGENT_SKILL
+        )
 
     def _notify_humans(self, run: ReviewRun, merge_request) -> None:
         if not self.policy.human.enabled:

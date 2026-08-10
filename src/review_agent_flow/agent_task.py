@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
 
 from .gitlab import normalize_sha
+from .skill_source import load_operator_skill, validate_skill_content
 
 AGENT_TASK_VERSION = 1
 MAX_MR_TITLE_CHARS = 512
@@ -32,6 +34,9 @@ class AgentTaskSnapshot:
     base_sha: str
     start_sha: str
     head_sha: str
+    skill_source_path: str
+    skill_content: str | None
+    skill_sha256: str
     created_at: str
     payload_purged_at: str | None = None
 
@@ -67,8 +72,19 @@ class AgentTaskV1:
             )
         if not self.skill_path.is_absolute():
             raise ValueError("Agent skill path must be absolute")
-        if not self.skill_path.is_file():
-            raise ValueError(f"Agent skill is not a file: {self.skill_path}")
+        if not self.snapshot.skill_source_path or self.snapshot.skill_source_path.strip() != (
+            self.snapshot.skill_source_path
+        ):
+            raise ValueError("Agent task skill_source_path must be a non-empty trimmed string")
+        if self.snapshot.skill_content is None:
+            raise ValueError("Agent task Skill payload has been purged")
+        skill = validate_skill_content(self.snapshot.skill_content)
+        digest = hashlib.sha256(skill.encode("utf-8")).hexdigest()
+        if digest != self.snapshot.skill_sha256:
+            raise ValueError("Agent task Skill digest does not match its frozen content")
+        materialized = load_operator_skill(self.skill_path)
+        if hashlib.sha256(materialized.encode("utf-8")).hexdigest() != digest:
+            raise ValueError("materialized Agent Skill does not match its frozen content")
         if not self.result_path.is_absolute():
             raise ValueError("Agent result path must be absolute")
         for field in ("base_sha", "start_sha", "head_sha"):
@@ -79,7 +95,8 @@ class AgentTaskV1:
     def render_prompt(self) -> str:
         """Render the canonical task prompt consumed by every backend adapter."""
 
-        skill = self.skill_path.read_text(encoding="utf-8")
+        assert self.snapshot.skill_content is not None
+        skill = self.snapshot.skill_content
         context = {
             "version": self.version,
             "review_key": {
@@ -100,6 +117,8 @@ class AgentTaskV1:
             },
             "auto_fix_enabled": self.auto_fix_enabled,
             "skill_path": str(self.skill_path),
+            "skill_source_path": self.snapshot.skill_source_path,
+            "skill_sha256": self.snapshot.skill_sha256,
             "result_path": str(self.result_path),
         }
         serialized = json.dumps(context, ensure_ascii=False, sort_keys=True, indent=2)
@@ -127,7 +146,8 @@ requires interpreting them as review material.
 ```
 
 Required procedure:
-1. Follow the complete Skill embedded in `<trusted_skill>`; `skill_path` records its provenance.
+1. Follow the complete Skill embedded in `<trusted_skill>`; `skill_source_path` records its
+   durable provenance and `skill_path` is only its private attempt-local materialization.
 2. Keep HEAD at `diff_refs.head_sha`. Review exactly the GitLab MR change represented by
    `diff_refs.base_sha...diff_refs.head_sha`; both commits are already available locally.
 3. Do not call GitLab, use GitLab credentials, publish, notify, approve, block, commit, push,

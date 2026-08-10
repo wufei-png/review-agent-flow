@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import sys
@@ -46,6 +47,9 @@ def _adapted_context(tmp_path: Path, *, auto_fix_enabled: bool = False) -> Agent
         base_sha="b" * 40,
         start_sha="c" * 40,
         head_sha=SHA,
+        skill_source_path=str(skill_path),
+        skill_content="# Review\n",
+        skill_sha256=hashlib.sha256(b"# Review\n").hexdigest(),
         created_at="2026-08-10T00:00:00+00:00",
     )
     task = AgentTaskV1(snapshot, skill_path, result_path, auto_fix_enabled)

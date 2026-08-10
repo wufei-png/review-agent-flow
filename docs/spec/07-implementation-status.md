@@ -13,7 +13,7 @@ Implemented foundations that remain useful include exact-SHA worktrees, bound-Pr
 The current OpenCode adapter canary evidence is recorded in
 [JiHuLab/OpenCode A1 canary evidence — 2026-08-10](../evidence/jihulab-opencode-a1-2026-08-10.md).
 It is intentionally a partial verdict: Note publication succeeded, while
-the final nested-instruction isolation hardening, Auto-fix commit/MR and durable
+the final target-frozen Skill and nested-instruction isolation hardening, Auto-fix commit/MR and durable
 notification delivery remain unverified.
 
 On 2026-08-03 a JiHuLab canary in Project `358268` completed Review Run `2`, parent MR `!3`, Auto-fix MR `!4` and Agent-owned Note `8733889`. Project `358268` was later marked for deletion.
@@ -41,6 +41,6 @@ This is evidence for the old Agent-owned path only. It does not verify strict RE
 - Review Outcome is derived from immutable expectations and durable receipts as `pending`, `no_effect`, `delivered`, `degraded`, `undelivered` or `indeterminate`.
 - Full unit/integration tests cover crash windows, idempotent retries, stale heads, duplicate markers, invalid diffs, verifier failure and recovery validation.
 - Retention tests prove backup-before-purge, immutable backup conflicts, terminal payload purge and graceful Worker shutdown.
-- `command` and OpenCode thin adapters now consume the same frozen `AgentTaskV1`; OpenCode uses an isolated adapter-owned Agent through native non-interactive `run --pure --agent reviewflow` without `--auto`, while the shared Runner retains lifecycle, heartbeat and strict Result parsing.
+- `command` and OpenCode thin adapters now consume the same frozen `AgentTaskV1`; its bounded Skill bytes/digest come from the frozen target commit or Operator-owned default and are privately materialized per attempt. OpenCode uses an isolated adapter-owned Agent through native non-interactive `run --pure --agent reviewflow` without `--auto`, while the shared Runner retains lifecycle, heartbeat and strict Result parsing.
 
 Live JiHuLab verification of the remaining Program-owned Auto-fix and durable notification path is still required. The successful Note receipts establish only the OpenCode composition and must not be extrapolated to other Backend adapters.

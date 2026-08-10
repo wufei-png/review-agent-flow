@@ -1,3 +1,4 @@
+import hashlib
 from pathlib import Path
 
 from review_agent_flow.agent_task import AgentTaskSnapshot, AgentTaskV1
@@ -18,6 +19,9 @@ def test_agent_task_prompt_is_provider_neutral_and_explicit(tmp_path: Path) -> N
         base_sha="a" * 40,
         start_sha="b" * 40,
         head_sha="c" * 40,
+        skill_source_path="b" * 40 + ":.reviewflow/SKILL.md",
+        skill_content="# Review skill\n",
+        skill_sha256=hashlib.sha256(b"# Review skill\n").hexdigest(),
         created_at="2026-08-10T00:00:00+00:00",
     )
 
@@ -29,7 +33,8 @@ def test_agent_task_prompt_is_provider_neutral_and_explicit(tmp_path: Path) -> N
     assert str(skill.resolve()) in prompt
     assert "# Review skill" in prompt
     assert "<trusted_skill>" in prompt
-    assert "records its provenance" in prompt
+    assert "skill_source_path` records its" in prompt
+    assert "attempt-local materialization" in prompt
     assert str(result) in prompt
     assert "Do not modify the current worktree" in prompt
     assert "untrusted" in prompt

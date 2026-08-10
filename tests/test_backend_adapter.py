@@ -1,3 +1,4 @@
+import hashlib
 import json
 from pathlib import Path
 
@@ -27,6 +28,9 @@ def test_opencode_adapter_maps_autofix_to_task_scoped_edit_permission(
         "a" * 40,
         "b" * 40,
         "c" * 40,
+        str(skill),
+        "# Review\n",
+        hashlib.sha256(b"# Review\n").hexdigest(),
         "2026-08-10T00:00:00+00:00",
     )
     task = AgentTaskV1(snapshot, skill, result, auto_fix_enabled)
@@ -49,10 +53,14 @@ def test_opencode_adapter_maps_autofix_to_task_scoped_edit_permission(
         config["permission"]["bash"][f"git diff --no-ext-diff {'a' * 40}...{'c' * 40}"]
         == "allow"
     )
+    assert all(not pattern.endswith("-- *") for pattern in config["permission"]["bash"])
     assert config["agent"]["reviewflow"]["permission"] == config["permission"]
     assert config["share"] == "disabled"
     assert invocation.environment["OPENCODE_DISABLE_PROJECT_CONFIG"] == "1"
     assert invocation.environment["OPENCODE_DISABLE_SHARE"] == "1"
+    assert invocation.environment["OPENCODE_CONFIG_DIR"] == str(
+        result.parent / "opencode-config"
+    )
     assert invocation.environment["XDG_DATA_HOME"] == str(result.parent / "opencode-data")
 
 
@@ -71,6 +79,9 @@ def test_command_adapter_preserves_operator_argv_and_supplies_task_path(tmp_path
         "a" * 40,
         "b" * 40,
         "c" * 40,
+        str(skill),
+        "# Review\n",
+        hashlib.sha256(b"# Review\n").hexdigest(),
         "2026-08-10T00:00:00+00:00",
     )
     task = AgentTaskV1(snapshot, skill, result, False)
@@ -98,6 +109,9 @@ def test_opencode_adapter_passes_operator_profile_model(tmp_path: Path) -> None:
         "a" * 40,
         "b" * 40,
         "c" * 40,
+        str(skill),
+        "# Review\n",
+        hashlib.sha256(b"# Review\n").hexdigest(),
         "2026-08-10T00:00:00+00:00",
     )
     task = AgentTaskV1(snapshot, skill, (tmp_path / "result.json").resolve(), False)

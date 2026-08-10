@@ -1341,7 +1341,10 @@ def test_worker_uses_packaged_skill_when_project_skill_is_missing(tmp_path: Path
             command=(
                 sys.executable,
                 "-c",
-                "import os; print(os.environ['REVIEW_AGENT_FLOW_SKILL'])",
+                (
+                    "import os, pathlib; print(pathlib.Path("
+                    "os.environ['REVIEW_AGENT_FLOW_SKILL']).read_text().splitlines()[0])"
+                ),
             ),
             skill_path=".gitlab/review-agent/missing.md",
         )
@@ -1359,10 +1362,13 @@ def test_worker_uses_packaged_skill_when_project_skill_is_missing(tmp_path: Path
     assert result is not None
     assert result.status == "succeeded"
     assert result.agent_result is not None
-    assert result.agent_result.stdout.strip().endswith("defaults/review-agent/SKILL.md")
+    assert result.agent_result.stdout.strip() == "# review-agent-flow default review skill"
+    snapshot = store.get_agent_task_snapshot(1)
+    assert snapshot is not None
+    assert snapshot.skill_source_path.endswith("defaults/review-agent/SKILL.md")
 
 
-def test_worker_canonicalizes_project_skill_path_across_symlinked_worktree_root(
+def test_worker_freezes_project_skill_from_target_commit_not_mr_head(
     tmp_path: Path,
 ) -> None:
     repository = tmp_path / "repo"
@@ -1370,14 +1376,24 @@ def test_worker_canonicalizes_project_skill_path_across_symlinked_worktree_root(
     _git_repository(repository)
     skill = repository / ".reviewflow" / "review-skill.md"
     skill.parent.mkdir()
-    skill.write_text("# Review\n", encoding="utf-8")
+    skill.write_text("# Target Review\n", encoding="utf-8")
     subprocess.run(["git", "-C", str(repository), "add", ".reviewflow"], check=True)
     subprocess.run(
         ["git", "-C", str(repository), "commit", "-m", "add skill"],
         check=True,
         capture_output=True,
     )
-    sha = subprocess.check_output(
+    target_sha = subprocess.check_output(
+        ["git", "-C", str(repository), "rev-parse", "HEAD"], text=True
+    ).strip()
+    skill.write_text("# MR-controlled instruction\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repository), "add", ".reviewflow"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repository), "commit", "-m", "replace skill in MR"],
+        check=True,
+        capture_output=True,
+    )
+    head_sha = subprocess.check_output(
         ["git", "-C", str(repository), "rev-parse", "HEAD"], text=True
     ).strip()
     actual_root = tmp_path / "actual-worktrees"
@@ -1385,17 +1401,29 @@ def test_worker_canonicalizes_project_skill_path_across_symlinked_worktree_root(
     linked_root = tmp_path / "linked-worktrees"
     linked_root.symlink_to(actual_root, target_is_directory=True)
     mr = MergeRequest(
-        "42", 1, "Review configured skill", "alice", "feature", "main", sha, "https://mr"
+        "42",
+        1,
+        "Review configured skill",
+        "alice",
+        "feature",
+        "main",
+        head_sha,
+        "https://mr",
+        base_sha=target_sha,
+        start_sha=target_sha,
     )
     store = SQLiteStore(tmp_path / "review.db")
-    store.enqueue("42", 1, sha)
+    store.enqueue("42", 1, head_sha)
     policy = ReviewPolicy(
         ai=AIPolicy(
             enabled=True,
             command=(
                 sys.executable,
                 "-c",
-                "import os; print(os.environ['REVIEW_AGENT_FLOW_SKILL'])",
+                (
+                    "import os, pathlib; print(pathlib.Path("
+                    "os.environ['REVIEW_AGENT_FLOW_SKILL']).read_text())"
+                ),
             ),
             skill_path=".reviewflow/review-skill.md",
         )
@@ -1414,7 +1442,11 @@ def test_worker_canonicalizes_project_skill_path_across_symlinked_worktree_root(
 
     assert result is not None and result.status == "succeeded"
     assert result.agent_result is not None
-    assert str(actual_root.resolve()) in result.agent_result.stdout
+    assert result.agent_result.stdout.strip() == "# Target Review"
+    snapshot = store.get_agent_task_snapshot(1)
+    assert snapshot is not None
+    assert snapshot.skill_source_path == f"{target_sha}:.reviewflow/review-skill.md"
+    assert snapshot.skill_content == "# Target Review\n"
 
 
 def test_worker_requeues_draft_mr_before_human_or_ai_paths(tmp_path: Path) -> None:

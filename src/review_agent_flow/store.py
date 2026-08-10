@@ -16,6 +16,7 @@ from .agent_task import MAX_MR_TITLE_CHARS, AgentTaskSnapshot
 from .gitlab import canonical_note_marker, has_exact_note_marker, is_valid_sha, normalize_sha
 from .publication_plan import PublicationPlanV1
 from .security import redact
+from .skill_source import validate_skill_content
 
 DEFAULT_LEASE_SECONDS = 1860
 DEFAULT_MAX_ATTEMPTS = 3
@@ -23,7 +24,7 @@ DEFAULT_NOTIFICATION_LEASE_SECONDS = 30
 DEFAULT_NOTIFICATION_MAX_ATTEMPTS = 3
 DEFAULT_WORKTREE_CLEANUP_LEASE_SECONDS = 60
 DEFAULT_WORKTREE_CLEANUP_MAX_ATTEMPTS = 5
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 DEFAULT_EFFECT_LEASE_SECONDS = 60
 DEFAULT_NOTE_PUBLICATION_LEASE_SECONDS = 60
 DEFAULT_NOTE_PUBLICATION_MAX_ATTEMPTS = 5
@@ -335,7 +336,7 @@ class WorktreeRecord:
 class SQLiteStore:
     """Small SQLite store.
 
-    Version 15 is intentionally a fresh schema.  There is no production database
+    Version 16 is intentionally a fresh schema.  There is no production database
     migration contract for this pre-release implementation; an older database
     must be recreated rather than guessed into a new notification or Auto-fix
     routing model.
@@ -479,6 +480,9 @@ class SQLiteStore:
                     base_sha TEXT NOT NULL,
                     start_sha TEXT NOT NULL,
                     head_sha TEXT NOT NULL,
+                    skill_source_path TEXT NOT NULL,
+                    skill_content TEXT,
+                    skill_sha256 TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     payload_purged_at TEXT
                 );
@@ -736,7 +740,7 @@ class SQLiteStore:
                     diagnostic_payloads INTEGER NOT NULL,
                     created_at TEXT NOT NULL
                 );
-                PRAGMA user_version = 15;
+                PRAGMA user_version = 16;
                 """
             )
 
@@ -971,6 +975,8 @@ class SQLiteStore:
         base_sha: str,
         start_sha: str,
         head_sha: str,
+        skill_source_path: str,
+        skill_content: str,
     ) -> AgentTaskSnapshot | None:
         """Get or freeze exact MR context once, fenced by the active Run lease."""
 
@@ -997,6 +1003,12 @@ class SQLiteStore:
             base_sha = normalize_sha(base_sha)
             start_sha = normalize_sha(start_sha)
             head_sha = normalize_sha(head_sha)
+            if not skill_source_path or skill_source_path.strip() != skill_source_path:
+                raise ValueError(
+                    "Agent task skill_source_path must be a non-empty trimmed string"
+                )
+            skill_content = validate_skill_content(skill_content)
+            skill_sha256 = hashlib.sha256(skill_content.encode("utf-8")).hexdigest()
         now = self._now().isoformat()
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -1019,8 +1031,9 @@ class SQLiteStore:
                 """
                 INSERT INTO agent_task_snapshots(
                     run_id, project_id, mr_iid, title, source_project_id, source_branch,
-                    target_branch, base_sha, start_sha, head_sha, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    target_branch, base_sha, start_sha, head_sha, skill_source_path,
+                    skill_content, skill_sha256, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(run_id) DO NOTHING
                 """,
                 (
@@ -1034,6 +1047,9 @@ class SQLiteStore:
                     base_sha,
                     start_sha,
                     head_sha,
+                    skill_source_path,
+                    skill_content,
+                    skill_sha256,
                     now,
                 ),
             )
@@ -5118,6 +5134,7 @@ class SQLiteStore:
                 """
                 UPDATE agent_task_snapshots
                 SET title = '', source_branch = '', target_branch = '',
+                    skill_content = NULL,
                     payload_purged_at = ?
                 WHERE created_at <= ? AND payload_purged_at IS NULL
                   AND EXISTS (

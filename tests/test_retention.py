@@ -1,3 +1,4 @@
+import hashlib
 import json
 from datetime import UTC, datetime
 from pathlib import Path
@@ -41,6 +42,8 @@ def _terminal_payloads(tmp_path: Path) -> tuple[SQLiteStore, int, int, str]:
         base_sha=SHA,
         start_sha=SHA,
         head_sha=SHA,
+        skill_source_path=f"{SHA}:.reviewflow/SKILL.md",
+        skill_content="# Frozen Skill\n",
     )
     assert snapshot is not None
     intent = store.create_auto_fix_publication_intent(run.run_id, claimed.claim_token)
@@ -179,13 +182,22 @@ def test_retention_requires_plan_backup_but_purges_other_expired_payloads(
         ).fetchone()
         agent_task = connection.execute(
             "SELECT title, source_branch, target_branch, base_sha, head_sha, "
-            "payload_purged_at FROM agent_task_snapshots"
+            "skill_content, skill_sha256, payload_purged_at FROM agent_task_snapshots"
         ).fetchone()
     assert tuple(note) == (marker, note["payload_purged_at"])
     assert note["payload_purged_at"] is not None
     assert tuple(delivery) == ("autofix:retention", "", "", None, "[]")
     assert tuple(request) == ("autofix:retention", "", "", None, "[]")
-    assert tuple(agent_task) == ("", "", "", SHA, SHA, agent_task["payload_purged_at"])
+    assert tuple(agent_task) == (
+        "",
+        "",
+        "",
+        SHA,
+        SHA,
+        None,
+        hashlib.sha256(b"# Frozen Skill\n").hexdigest(),
+        agent_task["payload_purged_at"],
+    )
     assert agent_task["payload_purged_at"] is not None
     assert store.claim_published_note_reconciliation(request_id=1) is None
     assert store.get_auto_fix_publication_plan(run_id).plan_id == plan_id

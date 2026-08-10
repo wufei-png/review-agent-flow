@@ -67,7 +67,7 @@ Note, Auto-fix and notification state is independent from process success. Reque
 The pre-release implementation performs a hard cutover to a fresh schema; it does not migrate or read legacy ReviewRun kinds, Run-ID markers or Agent-owned publication state. The schema retains at least:
 
 - `review_runs`: ReviewKey, status, claim/failure/lease-recovery counters, lease/token, timestamps and redacted diagnostics;
-- `agent_task_snapshots`: immutable per-Run MR presentation and exact GitLab base/start/head diff refs used to render `AgentTaskV1`;
+- `agent_task_snapshots`: immutable per-Run MR presentation, exact GitLab base/start/head diff refs, and frozen bounded Skill source/content/digest used to render `AgentTaskV1`;
 - `requested_outputs`, `effective_run_decisions` and `output_expectations`: immutable decisions used by the Outcome projection;
 - `note_publication_requests` and effect receipts: canonical marker, state, attempt, trusted external identity and deletion observation;
 - `auto_fix_publication_intents`: immutable generation and nonce, with at most one active generation per ReviewKey;
