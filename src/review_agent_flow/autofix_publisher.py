@@ -110,6 +110,13 @@ class AutoFixPublisher:
         )
 
     @staticmethod
+    def _deferred(
+        plan: AutoFixPublicationPlan,
+        detail: str,
+    ) -> AutoFixPublicationResult:
+        return AutoFixPublicationResult(plan.plan_id, plan.run_id, "deferred", detail)
+
+    @staticmethod
     def _payload(plan: AutoFixPublicationPlan) -> PublicationPlanV1:
         if plan.plan_json is None:
             raise ValueError("frozen Auto-fix Publication Plan payload was purged")
@@ -181,19 +188,15 @@ class AutoFixPublisher:
         if not self.store.extend_auto_fix_publication_lease(
             plan.plan_id, plan.claim_token, self.lease_seconds
         ):
-            return AutoFixPublicationResult(
-                plan.plan_id,
-                plan.run_id,
-                "deferred",
+            return self._deferred(
+                plan,
                 "publication lease was lost before the Auto-fix commit write",
             )
         if not self.store.mark_auto_fix_write_started(
             plan.plan_id, plan.claim_token, operation="commit"
         ):
-            return AutoFixPublicationResult(
-                plan.plan_id,
-                plan.run_id,
-                "deferred",
+            return self._deferred(
+                plan,
                 "publication lease was lost before recording the commit write boundary",
             )
 
@@ -227,10 +230,8 @@ class AutoFixPublisher:
         if not self.store.record_auto_fix_branch_commit(
             plan.plan_id, plan.claim_token, commit.sha
         ):
-            return AutoFixPublicationResult(
-                plan.plan_id,
-                plan.run_id,
-                "deferred",
+            return self._deferred(
+                plan,
                 "publication lease was lost after the Auto-fix commit write",
             )
 
@@ -261,19 +262,15 @@ class AutoFixPublisher:
         if not self.store.extend_auto_fix_publication_lease(
             plan.plan_id, plan.claim_token, self.lease_seconds
         ):
-            return AutoFixPublicationResult(
-                plan.plan_id,
-                plan.run_id,
-                "deferred",
+            return self._deferred(
+                plan,
                 "publication lease was lost before the Auto-fix Merge Request write",
             )
         if not self.store.mark_auto_fix_write_started(
             plan.plan_id, plan.claim_token, operation="merge_request"
         ):
-            return AutoFixPublicationResult(
-                plan.plan_id,
-                plan.run_id,
-                "deferred",
+            return self._deferred(
+                plan,
                 "publication lease was lost before recording the Merge Request write boundary",
             )
 
@@ -339,10 +336,8 @@ class AutoFixPublisher:
         if not self.store.record_auto_fix_merge_request(
             plan.plan_id, plan.claim_token, child.iid
         ):
-            return AutoFixPublicationResult(
-                plan.plan_id,
-                plan.run_id,
-                "deferred",
+            return self._deferred(
+                plan,
                 "publication lease was lost after the Auto-fix Merge Request write",
             )
         completed = self.store.complete_auto_fix_publication(
@@ -360,10 +355,8 @@ class AutoFixPublisher:
             channels=channel_specs,
         )
         if completed is None:
-            return AutoFixPublicationResult(
-                plan.plan_id,
-                plan.run_id,
-                "deferred",
+            return self._deferred(
+                plan,
                 "publication lease was lost after the Auto-fix Merge Request write",
             )
         return AutoFixPublicationResult(
