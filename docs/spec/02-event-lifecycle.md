@@ -2,6 +2,66 @@
 
 ## Parent Review
 
+下图说明一次父 MR Review 的持久化顺序与权限边界。Agent 执行后的两个分支
+保持独立：Auto-fix 提议被拒绝不会压制有效 Note，且本地 Publication Request
+或 Plan 持久化前不会尝试对应外部副作用。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant GL as GitLab
+    participant API as Webhook API
+    participant Store as SQLite Store
+    participant Review as Review/Publication loop
+    participant Agent as Agent Backend
+    participant Notify as Notification loop
+    participant Channels as Feishu/WeCom
+
+    GL->>API: Parent MR or Pipeline Hook
+    API->>API: Verify secret, bound Project, and exact SHA
+    API->>Store: Idempotently create or wake Review Run by ReviewKey
+    API-->>GL: Acknowledge without running the Agent
+
+    Review->>Store: Claim Run with token and lease
+    Review->>GL: Re-read parent MR and target-branch Policy commit
+    Review->>Store: Freeze Policy Snapshot and Requested Outputs
+    Review->>Store: Freeze Effective Decision and Output Expectations
+
+    opt Human notification requested
+        Review->>Store: Persist Notification Request and deliveries
+        Notify->>Store: Claim delivery independently
+        Notify->>Channels: Deliver with provider-specific success check
+        Notify->>Store: Persist delivery receipt or retry state
+    end
+
+    opt AI Review authorized
+        Review->>Store: Persist Auto-fix Intent before Agent when enabled
+        Review->>Review: Ensure exact SHA and create Trusted Workspace and Result Path
+        Review->>Agent: Invoke authorized Backend/Profile without publication token
+        Agent-->>Review: Write strict Result v1 and optional workspace diff
+        Review->>Review: Validate Result, HEAD, and bounded candidate
+        Review->>Store: Persist Note Publication Request
+        opt Valid Auto-fix proposal and verifier success
+            Review->>Store: Freeze immutable Publication Plan and digest
+        end
+    end
+
+    opt Note Publication Request is frozen
+        Review->>GL: Exact-marker lookup and stale-head gate before create
+        GL-->>Review: Trusted identity, create result, or stale outcome
+        Review->>Store: Persist published, superseded, retry, or blocked receipt
+    end
+    opt Auto-fix Publication Plan is frozen
+        Review->>GL: Head-gated and fenced commit then child MR writes
+        GL-->>Review: Exact identities, superseded, or uncertain result
+        Review->>Store: Persist Relation plus Notification or reconciliation state
+    end
+
+```
+
+异常 Auto-fix 发布与恢复继续遵循
+[05-integrations.md](./05-integrations.md#auto-fix-publication) 中的精确写阶段状态机。
+
 1. GitLab Merge Request Hook 通过 webhook secret 和单 Project 绑定校验。
 2. 只接受父 MR IID 与 `last_commit.id|last_commit_id` 的精确 head SHA。Draft
    或非法事件不入队。

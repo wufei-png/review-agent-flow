@@ -50,6 +50,46 @@ Before each GitLab write, the Publisher durably moves the Plan from `preflight` 
 
 The Reconciler searches only when an external result is uncertain, a process may have crashed, relation state may have changed or an Operator requested recovery. The normal path does not search for Agent-created artifacts because the Agent cannot create them. After an ambiguous create-MR result it requires two unique zero-candidate observations separated by at least five seconds, independent of polling/retry configuration, before clearing the uncertain boundary and recreating the MR. Recreation is allowed only when the branch commit identity is already durable and the parent still matches the frozen exact SHA. A discovered or persisted-IID child is re-fetched and its exact source head must equal that durable commit before Relation persistence. An ambiguous commit without a durable commit identity is never reissued automatically.
 
+```mermaid
+stateDiagram-v2
+    direction TB
+    [*] --> Preflight: immutable Plan frozen
+    Preflight --> CommitWriteStarted: persist phase, then call Commits API
+    CommitWriteStarted --> CommitConfirmed: persist exact commit identity
+    CommitConfirmed --> MRWriteStarted: persist phase, then call create MR
+    MRWriteStarted --> MRConfirmed: persist exact child MR identity
+    MRConfirmed --> Published: persist Relation and Notification Request atomically
+    Published --> [*]
+
+    Preflight --> Preflight: lease expiry, normal reclaim is safe
+    CommitWriteStarted --> Reconciliation: uncertain response, crash, or lease expiry
+    CommitConfirmed --> Reconciliation: crash or lease expiry
+    MRWriteStarted --> Reconciliation: uncertain response, crash, or lease expiry
+    MRConfirmed --> Reconciliation: incomplete local transaction
+
+    Reconciliation --> Published: exact evidence confirms completion
+    Reconciliation --> Blocked: conflict, ambiguity, or exhausted attempts
+
+    Blocked --> Preflight: Operator rearm at preflight only
+    Blocked --> Reconciliation: Operator rearm after external-write boundary
+    Preflight --> Abandoned: audited Operator abandon
+    Reconciliation --> Abandoned: audited Operator abandon while idle
+    Blocked --> Abandoned: audited Operator abandon
+    Abandoned --> [*]
+
+    note right of Reconciliation
+        Safe continuation requires exact persisted and remote evidence.
+        An ambiguous commit without a durable identity is never reissued.
+        MR recreation requires a durable commit and two separated
+        absence observations before the Reconciler continues the write.
+    end note
+
+    note right of Blocked
+        Rearm resets only the attempt budget. The Plan,
+        digest, Intent generation, and nonce stay immutable.
+    end note
+```
+
 ## Human notifications
 
 The first release supports Feishu and WeCom. A Project may configure both. Each channel has a stable unique ID; outbox routing uses that ID rather than list position. Normal human review may notify configured reviewers; an Auto-fix MR notification targets only the original parent MR creator.

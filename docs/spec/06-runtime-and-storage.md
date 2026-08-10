@@ -2,18 +2,47 @@
 
 ## Components
 
-```text
-GitLab Webhook
-       |
-       v
-FastAPI API -------- SQLite Store
-                           ^
-                           |
-                 supervised Worker process
-                    |       |       |
-                    |       |       +-- Reconciliation/Cleanup loop (+ Retention sweep)
-                    |       +---------- Notification loop
-                    +------------------ Review/Publication loop
+```mermaid
+flowchart LR
+    GitLab["GitLab Webhooks and API"]
+    Supervisor["Process supervisor"]
+    Store[("SQLite Store<br/>only shared directory")]
+
+    subgraph APIService["FastAPI service - separate OS process and user"]
+        API["Validate and acknowledge Webhooks"]
+    end
+
+    subgraph WorkerService["Supervised Worker - one OS process and separate user"]
+        Worker["Fail-fast Worker process"]
+        Review["Review/Publication loop<br/>Agent, Note, and Auto-fix"]
+        Notify["Notification loop<br/>Feishu and WeCom deliveries"]
+        Reconcile["Reconciliation/Cleanup loop<br/>remote recovery and worktrees"]
+        Retention["Retention sweep<br/>at startup and hourly"]
+        Worker -->|"independent loop"| Review
+        Worker -->|"independent loop"| Notify
+        Worker -->|"independent loop"| Reconcile
+        Reconcile --> Retention
+    end
+
+    Private["Worker-private repository, worktrees,<br/>Plan backups, and credentials"]
+    Agent["Agent child process<br/>no GitLab publication token"]
+    Providers["Feishu and WeCom"]
+
+    Supervisor --> API
+    Supervisor -->|"restart after any loop exits unexpectedly"| Worker
+    GitLab -->|"bound-Project Webhook"| API
+    API -->|"enqueue or wake only"| Store
+
+    Store <-->|"independent claim, lease, and backoff"| Review
+    Store <-->|"independent claim, lease, and backoff"| Notify
+    Store <-->|"independent claim, lease, and backoff"| Reconcile
+
+    Review <--> Private
+    Review --> Agent
+    Agent -->|"strict Result Path and optional diff"| Private
+    Review -->|"Program-owned Note, commit, and child MR"| GitLab
+    Reconcile -->|"exact-identity observation only"| GitLab
+    Notify --> Providers
 ```
 
 The API acknowledges Webhooks quickly. One supervised Worker OS process runs three independent loops: Review/Publication, Notification and Reconciliation/Cleanup. The third loop also runs the startup/hourly Retention sweep. Each loop isolates per-item errors and uses independent claims/backoff so a stuck notification does not block reviews. Unexpected death of any loop terminates the Worker process; the process supervisor restarts the whole Worker. The Agent remains a child process. Separate Dispatcher/Reconciler OS processes are deferred until operational evidence requires them.
