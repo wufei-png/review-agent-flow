@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -224,6 +225,40 @@ def test_retention_backs_up_exact_plan_before_purge_and_preserves_audit(
     purged = store.get_auto_fix_publication_plan(run_id)
     assert purged is not None and purged.plan_id == plan_id and purged.plan_json is None
     assert store.list_sensitive_payload_purges()[-1] == result.purge
+
+
+@pytest.mark.parametrize("failed_fsync_call", [1, 3])
+def test_retention_keeps_plan_when_backup_fsync_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_fsync_call: int,
+) -> None:
+    store, run_id, _plan_id, _marker = _terminal_payloads(tmp_path)
+    backup_dir = tmp_path / "backups"
+    real_fsync = os.fsync
+    fsync_calls = 0
+
+    def fail_selected_fsync(descriptor: int) -> None:
+        nonlocal fsync_calls
+        fsync_calls += 1
+        if fsync_calls == failed_fsync_call:
+            raise OSError("simulated fsync failure")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fail_selected_fsync)
+
+    with pytest.raises(OSError, match="simulated fsync failure"):
+        RetentionManager(store, RetentionConfig(1, backup_dir)).sweep(
+            now=datetime(2026, 1, 1, tzinfo=UTC)
+        )
+
+    plan = store.get_auto_fix_publication_plan(run_id)
+    assert plan is not None and plan.plan_json is not None
+    with store._connect() as connection:
+        backup_receipts = connection.execute(
+            "SELECT COUNT(*) FROM publication_plan_backups"
+        ).fetchone()[0]
+    assert backup_receipts == 0
 
 
 def test_retention_rejects_conflicting_existing_digest_backup(tmp_path: Path) -> None:
