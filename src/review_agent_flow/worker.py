@@ -548,6 +548,7 @@ class ReviewWorker:
             self._freeze_effective_decision(run)
             effective_decision = self.store.get_effective_run_decision(run.run_id)
             assert effective_decision is not None
+            self._notify_humans(run, merge_request)
             frozen_snapshot = self.store.get_agent_task_snapshot(run.run_id)
             if (
                 effective_decision.ai_review
@@ -567,7 +568,6 @@ class ReviewWorker:
                     )
                 self._log_run(run, status="deferred", diagnostic=detail)
                 return WorkerResult(run.run_id, "deferred", detail=detail)
-            self._notify_humans(run, merge_request)
             if not effective_decision.ai_review:
                 if not self.store.finish(run.run_id, "succeeded", claim_token=run.claim_token):
                     return self._lease_recovery_result(

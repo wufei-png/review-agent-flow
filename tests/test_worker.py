@@ -381,6 +381,7 @@ def test_worker_defers_new_ai_run_while_gitlab_diff_refs_are_preparing(
     )
     store = SQLiteStore(tmp_path / "review.db")
     run = store.enqueue("42", 1, sha)
+    notifier = RecordingNotifier()
 
     class PreparingDiffGitLab(FakeGitLab):
         def get_merge_request(self, project_id: str, mr_iid: int) -> MergeRequest:
@@ -391,12 +392,14 @@ def test_worker_defers_new_ai_run_while_gitlab_diff_refs_are_preparing(
         PreparingDiffGitLab(mr),
         GitWorktreeManager(repository, tmp_path / "worktrees"),
         ReviewPolicy(
+            human=HumanPolicy(enabled=True, reviewers=("alice",)),
             ai=AIPolicy(enabled=True, command=(sys.executable, "-c", "raise AssertionError"))
         ),
         repository,
         "https://gitlab",
         project_id="42",
         retry_delay_seconds=0,
+        notifier=notifier,
     )
 
     result = worker.process_one()
@@ -408,6 +411,20 @@ def test_worker_defers_new_ai_run_while_gitlab_diff_refs_are_preparing(
     assert persisted.failure_attempts == 0
     assert store.get_agent_task_snapshot(run.run_id) is None
     assert not store.list_effect_receipts(run.run_id)
+    delivery = store.get_notification_delivery(1)
+    assert delivery is not None
+    assert delivery.correlation_id == f"review-run:{run.run_id}:human"
+    assert delivery.recipients == ("alice",)
+
+    repeated = worker.process_one()
+    assert repeated is not None and repeated.status == "deferred"
+    with store._connect() as connection:
+        count = connection.execute(
+            "SELECT COUNT(*) FROM notification_outbox WHERE correlation_id = ?",
+            (f"review-run:{run.run_id}:human",),
+        ).fetchone()[0]
+    assert count == 1
+    assert store.get_review_run(run.run_id).failure_attempts == 0
 
 
 def test_expired_run_resumes_frozen_note_without_rerunning_agent_or_stranding_intent(
