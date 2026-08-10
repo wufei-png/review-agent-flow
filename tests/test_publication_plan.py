@@ -4,6 +4,8 @@ import json
 import pytest
 
 from review_agent_flow.publication_plan import (
+    MAX_PUBLICATION_ACTIONS,
+    MAX_PUBLICATION_FILE_BYTES,
     PublicationPlanError,
     PublicationPlanV1,
     canonical_json,
@@ -80,6 +82,92 @@ def test_publication_plan_v1_rejects_duplicate_action_paths() -> None:
     value["actions"] = [*actions, *actions]
 
     with pytest.raises(PublicationPlanError, match="unique sorted paths"):
+        PublicationPlanV1.from_value(value)
+
+
+@pytest.mark.parametrize("path", ["../escape", "/absolute", "dir\\file"])
+def test_publication_plan_v1_rejects_noncanonical_action_paths(path: str) -> None:
+    value = _plan_value()
+    value["actions"] = [
+        {
+            "action": "update",
+            "file_path": path,
+            "content": "fixed\n",
+            "execute_filemode": False,
+        }
+    ]
+
+    with pytest.raises(PublicationPlanError, match="path is not canonical"):
+        PublicationPlanV1.from_value(value)
+
+
+@pytest.mark.parametrize(
+    ("action", "message"),
+    [
+        ({"action": "rename", "file_path": "README.md"}, "type is unsupported"),
+        (
+            {"action": "delete", "file_path": "README.md", "content": ""},
+            "fields are not canonical",
+        ),
+        (
+            {"action": "chmod", "file_path": "README.md", "execute_filemode": 1},
+            "requires an executable mode",
+        ),
+        (
+            {
+                "action": "update",
+                "file_path": "README.md",
+                "content": "nul\0content",
+                "execute_filemode": False,
+            },
+            "exceeds the text envelope",
+        ),
+    ],
+)
+def test_publication_plan_v1_rejects_malformed_actions(
+    action: dict[str, object], message: str
+) -> None:
+    value = _plan_value()
+    value["actions"] = [action]
+
+    with pytest.raises(PublicationPlanError, match=message):
+        PublicationPlanV1.from_value(value)
+
+
+def test_publication_plan_v1_enforces_action_and_content_bounds() -> None:
+    value = _plan_value()
+    value["actions"] = []
+    with pytest.raises(PublicationPlanError, match="outside the bounded envelope"):
+        PublicationPlanV1.from_value(value)
+
+    value["actions"] = [
+        {"action": "delete", "file_path": f"file-{index:03d}.txt"}
+        for index in range(MAX_PUBLICATION_ACTIONS + 1)
+    ]
+    with pytest.raises(PublicationPlanError, match="outside the bounded envelope"):
+        PublicationPlanV1.from_value(value)
+
+    value["actions"] = [
+        {
+            "action": "update",
+            "file_path": "oversized.txt",
+            "content": "x" * (MAX_PUBLICATION_FILE_BYTES + 1),
+            "execute_filemode": False,
+        }
+    ]
+    with pytest.raises(PublicationPlanError, match="exceeds the text envelope"):
+        PublicationPlanV1.from_value(value)
+
+    value["actions"] = [
+        {
+            "action": "update",
+            "file_path": f"file-{index}.txt",
+            "content": "x" * MAX_PUBLICATION_FILE_BYTES,
+            "execute_filemode": False,
+        }
+        for index in range(6)
+    ]
+    with pytest.raises(PublicationPlanError, match="aggregate text bound"):
         PublicationPlanV1.from_value(value)
 
 
