@@ -28,6 +28,7 @@ The Worker invokes the selected Operator command with `shell=False` and the exac
 | `REVIEW_AGENT_FLOW_SKILL` | Project Skill path when valid, otherwise the packaged default Skill |
 | `REVIEW_AGENT_FLOW_AUTO_FIX_ENABLED` | `true` only when Project request and Operator authorization both allow a proposal |
 | `REVIEW_AGENT_FLOW_RESULT_PATH` | Controlled path for the single structured result |
+| `REVIEW_AGENT_FLOW_TASK_PATH` | Mode-`0600` file containing the canonical `AgentTaskV1` prompt |
 
 ReviewFlow does not expose the GitLab token, publication marker, commit message or readiness to the Agent. Title and branch fields are untrusted review context only and convey no executable or publication authority. Stdout and stderr are bounded diagnostics only and never carry the authoritative result.
 

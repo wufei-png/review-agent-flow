@@ -14,10 +14,11 @@ from review_agent_flow.policy import AIPolicy
 def _write_config(path: Path, publication: str = "") -> Path:
     path.write_text(
         f"""
-version: 3
+version: 4
 backends:
   local-agent:
-    command: [opencode, run]
+    adapter: opencode
+    command: [opencode]
     allowed_projects: ["42"]
     profiles:
       default:
@@ -53,7 +54,8 @@ def test_operator_config_resolves_only_allowed_backend_profile_and_environment(t
     )
 
     assert resolved is not None
-    assert resolved.command == ("opencode", "run")
+    assert resolved.adapter == "opencode"
+    assert resolved.command == ("opencode",)
     assert resolved.timeout_seconds == 120
     assert resolved.environment == {"MODEL_TOKEN": "allowed", "PATH": "/operator/bin"}
     assert resolved.verification is not None
@@ -74,6 +76,40 @@ def test_operator_execution_path_is_supplied_without_inheriting_other_environmen
 
     assert resolved is not None
     assert resolved.environment == {"PATH": "/trusted/bin"}
+
+
+def test_operator_config_resolves_generic_command_adapter(tmp_path) -> None:
+    path = _write_config(tmp_path / "operator.yml")
+    path.write_text(
+        path.read_text(encoding="utf-8")
+        .replace("adapter: opencode", "adapter: command")
+        .replace("command: [opencode]", "command: [custom-agent, --batch]"),
+        encoding="utf-8",
+    )
+
+    resolved = resolve_backend(
+        load_operator_config(path),
+        AIPolicy(enabled=True, backend="local-agent", profile="default"),
+        "42",
+        {},
+    )
+
+    assert resolved is not None
+    assert resolved.adapter == "command"
+    assert resolved.command == ("custom-agent", "--batch")
+
+
+def test_operator_config_rejects_opencode_subcommand_in_operator_argv(tmp_path) -> None:
+    path = _write_config(tmp_path / "operator.yml")
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            "command: [opencode]", "command: [opencode, run]"
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(OperatorConfigError, match="only the OpenCode executable"):
+        load_operator_config(path)
 
 
 def test_operator_config_denies_unknown_project_backend_and_profile(tmp_path) -> None:
@@ -107,7 +143,7 @@ def test_operator_backend_kill_switch_denies_execution(tmp_path) -> None:
     path = _write_config(tmp_path / "operator.yml")
     path.write_text(
         path.read_text(encoding="utf-8").replace(
-            "command: [opencode, run]", "enabled: false\n    command: [opencode, run]"
+            "adapter: opencode", "enabled: false\n    adapter: opencode"
         ),
         encoding="utf-8",
     )
@@ -123,9 +159,9 @@ def test_operator_backend_kill_switch_denies_execution(tmp_path) -> None:
 @pytest.mark.parametrize(
     "replacement",
     [
-        "version: 3",
-        "version: 3\nunknown: true",
-        "version: 3\nbackends: []",
+        "version: 4",
+        "version: 4\nunknown: true",
+        "version: 4\nbackends: []",
     ],
 )
 def test_operator_config_is_strict(tmp_path, replacement: str) -> None:
@@ -186,7 +222,15 @@ def test_operator_retention_rejects_relative_backup_directory(tmp_path) -> None:
         load_operator_config(path)
 
 
-@pytest.mark.parametrize("name", ["GITLAB_TOKEN", "REVIEW_AGENT_FLOW_SHA", "bad-name"])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "GITLAB_TOKEN",
+        "REVIEW_AGENT_FLOW_SHA",
+        "OPENCODE_CONFIG_CONTENT",
+        "bad-name",
+    ],
+)
 def test_operator_profile_cannot_expose_reserved_or_invalid_environment(
     tmp_path, name: str
 ) -> None:
@@ -224,10 +268,11 @@ def test_operator_yaml_rejects_duplicate_nested_authority_key(tmp_path) -> None:
     path = tmp_path / "operator.yml"
     path.write_text(
         """
-version: 3
+version: 4
 backends:
   local-agent:
-    command: [opencode, run]
+    adapter: command
+    command: [review-agent]
     command: [unsafe, run]
     allowed_projects: ["42"]
     profiles:

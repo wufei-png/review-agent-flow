@@ -66,6 +66,7 @@ def ReviewWorker(*args, **kwargs):
         kwargs["agent_backend"] = ResolvedBackend(
             "test-agent",
             "default",
+            "command",
             command,
             1800,
             {},

@@ -12,9 +12,10 @@ from typing import Any
 
 import yaml
 
+from .backend_adapter import OPENCODE_ADAPTER, SUPPORTED_BACKEND_ADAPTERS
 from .policy import AIPolicy
 
-OPERATOR_CONFIG_VERSION = 3
+OPERATOR_CONFIG_VERSION = 4
 MAX_BACKEND_TIMEOUT_SECONDS = 1800
 _ENVIRONMENT_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _FORBIDDEN_AGENT_ENVIRONMENT = {
@@ -23,6 +24,8 @@ _FORBIDDEN_AGENT_ENVIRONMENT = {
     "GITLAB_REVIEW_BOT_USERNAME",
     "FEISHU_WEBHOOK",
     "WECOM_WEBHOOK",
+    "OPENCODE_CONFIG",
+    "OPENCODE_CONFIG_CONTENT",
 }
 
 
@@ -71,6 +74,7 @@ class BackendProfile:
 @dataclass(frozen=True)
 class AgentBackend:
     enabled: bool
+    adapter: str
     command: tuple[str, ...]
     allowed_projects: frozenset[str]
     profiles: Mapping[str, BackendProfile]
@@ -119,6 +123,7 @@ class OperatorConfig:
 class ResolvedBackend:
     name: str
     profile_name: str
+    adapter: str
     command: tuple[str, ...]
     timeout_seconds: int
     environment: Mapping[str, str]
@@ -202,12 +207,23 @@ def load_operator_config(path: str | Path) -> OperatorConfig:
         backend = _mapping(backend_value, f"backends.{backend_name}")
         _reject_unknown(
             backend,
-            {"enabled", "command", "allowed_projects", "profiles"},
+            {"enabled", "adapter", "command", "allowed_projects", "profiles"},
             f"backends.{backend_name}",
         )
         backend_enabled = backend.get("enabled", True)
         if not isinstance(backend_enabled, bool):
             raise OperatorConfigError(f"backends.{backend_name}.enabled must be a boolean")
+        adapter = backend.get("adapter")
+        if adapter not in SUPPORTED_BACKEND_ADAPTERS:
+            raise OperatorConfigError(
+                f"backends.{backend_name}.adapter must be one of: "
+                + ", ".join(sorted(SUPPORTED_BACKEND_ADAPTERS))
+            )
+        command = _command(backend.get("command"), f"backends.{backend_name}.command")
+        if adapter == OPENCODE_ADAPTER and len(command) != 1:
+            raise OperatorConfigError(
+                f"backends.{backend_name}.command must contain only the OpenCode executable"
+            )
         profile_values = _mapping(backend.get("profiles"), f"backends.{backend_name}.profiles")
         profiles: dict[str, BackendProfile] = {}
         for profile_name, profile_value in profile_values.items():
@@ -243,7 +259,8 @@ def load_operator_config(path: str | Path) -> OperatorConfig:
             raise OperatorConfigError(f"backends.{backend_name}.profiles cannot be empty")
         backends[backend_name] = AgentBackend(
             backend_enabled,
-            _command(backend.get("command"), f"backends.{backend_name}.command"),
+            adapter,
+            command,
             _projects(backend.get("allowed_projects"), f"backends.{backend_name}.allowed_projects"),
             MappingProxyType(profiles),
         )
@@ -432,6 +449,7 @@ def resolve_backend(
     return ResolvedBackend(
         policy.backend,
         policy.profile,
+        backend.adapter,
         backend.command,
         profile.timeout_seconds,
         allowed_environment,

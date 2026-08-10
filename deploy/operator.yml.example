@@ -1,9 +1,10 @@
-version: 3
+version: 4
 
 backends:
   local-agent:
     enabled: true
-    command: [opencode, run]
+    adapter: opencode
+    command: [opencode]
     allowed_projects: ["42"]
     profiles:
       default:

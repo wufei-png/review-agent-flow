@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
+from .agent_task import AgentTaskV1
+from .backend_adapter import COMMAND_ADAPTER, build_backend_invocation
 from .security import redact
 
 MAX_AGENT_RESULT_BYTES = 1024 * 1024
@@ -86,6 +88,7 @@ class AgentContext:
     result_path: Path
     skill_path: Path | None = None
     auto_fix_enabled: bool = False
+    task: AgentTaskV1 | None = None
 
 
 @dataclass(frozen=True)
@@ -195,15 +198,22 @@ def _finish_diagnostics(
 
 
 class LocalCliAgentRunner:
-    """Run a configured Agent command without requiring a provider-specific adapter."""
+    """Run one adapted Agent command with shared lifecycle and Result parsing."""
 
-    def __init__(self, command: Sequence[str], timeout_seconds: int = 1800) -> None:
+    def __init__(
+        self,
+        command: Sequence[str],
+        timeout_seconds: int = 1800,
+        *,
+        adapter: str | None = None,
+    ) -> None:
         if not command:
             raise ValueError("Agent command cannot be empty")
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
         self.command = tuple(command)
         self.timeout_seconds = timeout_seconds
+        self.adapter = adapter
 
     def run(
         self,
@@ -215,6 +225,46 @@ class LocalCliAgentRunner:
         if heartbeat_interval_seconds <= 0:
             raise ValueError("heartbeat_interval_seconds must be positive")
         env = dict(extra_env or {})
+        command = self.command
+        if self.adapter is not None:
+            if context.task is None:
+                raise ValueError("adapted Agent execution requires AgentTaskV1")
+            snapshot = context.task.snapshot
+            if (
+                snapshot.project_id != context.project_id
+                or snapshot.mr_iid != context.mr_iid
+                or snapshot.run_id != context.run_id
+                or snapshot.head_sha != context.sha
+                or context.task.result_path != context.result_path
+                or context.task.skill_path != context.skill_path
+                or context.task.auto_fix_enabled != context.auto_fix_enabled
+            ):
+                raise ValueError("Agent context does not match its frozen AgentTaskV1")
+            task_path = None
+            if self.adapter == COMMAND_ADAPTER:
+                task_path = context.result_path.with_suffix(".task.md")
+                descriptor = os.open(
+                    task_path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+                try:
+                    payload = context.task.render_prompt().encode("utf-8")
+                    with os.fdopen(descriptor, "wb", closefd=True) as stream:
+                        stream.write(payload)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                except Exception:
+                    task_path.unlink(missing_ok=True)
+                    raise
+            invocation = build_backend_invocation(
+                self.adapter,
+                self.command,
+                context.task,
+                task_path,
+            )
+            command = invocation.command
+            env.update(invocation.environment)
         env.update(
             {
                 "REVIEW_AGENT_FLOW_PROJECT_ID": context.project_id,
@@ -232,7 +282,7 @@ class LocalCliAgentRunner:
         )
 
         process = subprocess.Popen(
-            list(self.command),
+            list(command),
             cwd=context.worktree,
             env=env,
             stdout=subprocess.PIPE,

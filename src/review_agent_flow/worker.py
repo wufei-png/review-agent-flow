@@ -12,6 +12,7 @@ from queue import Empty, Queue
 from threading import Event, Thread
 from time import monotonic
 
+from .agent_task import AgentTaskV1
 from .auto_fix_reconciler import AutoFixReconciler
 from .autofix_planner import (
     DiffEnvelopeError,
@@ -1283,7 +1284,11 @@ class ReviewWorker:
     ) -> AgentResult:
         if self.agent_backend is None:
             raise ValueError("AI Review has no Operator-authorized Agent Backend/Profile")
-        runner = LocalCliAgentRunner(self.agent_backend.command, self.agent_timeout_seconds)
+        runner = LocalCliAgentRunner(
+            self.agent_backend.command,
+            self.agent_timeout_seconds,
+            adapter=self.agent_backend.adapter,
+        )
         skill_path = DEFAULT_REVIEW_AGENT_SKILL
         if self.policy.ai.skill_path:
             configured = Path(self.policy.ai.skill_path)
@@ -1297,6 +1302,12 @@ class ReviewWorker:
         os.chmod(result_root, 0o700)
         with tempfile.TemporaryDirectory(prefix=f"run-{run.run_id}-", dir=result_root) as directory:
             os.chmod(directory, 0o700)
+            result_path = (Path(directory) / "result.json").resolve()
+            snapshot = self.store.get_agent_task_snapshot(run.run_id)
+            if snapshot is None:
+                raise ValueError("Review Run has no frozen Agent Task Snapshot")
+            enabled = self.auto_fix_enabled if auto_fix_enabled is None else auto_fix_enabled
+            task = AgentTaskV1(snapshot, skill_path.resolve(), result_path, enabled)
             return runner.run(
                 AgentContext(
                     project_id=run.project_id,
@@ -1304,13 +1315,10 @@ class ReviewWorker:
                     run_id=run.run_id,
                     sha=run.sha,
                     worktree=worktree,
-                    result_path=Path(directory) / "result.json",
+                    result_path=result_path,
                     skill_path=skill_path,
-                    auto_fix_enabled=(
-                        self.auto_fix_enabled
-                        if auto_fix_enabled is None
-                        else auto_fix_enabled
-                    ),
+                    auto_fix_enabled=enabled,
+                    task=task,
                 ),
                 heartbeat=lambda: self._heartbeat(run),
                 heartbeat_interval_seconds=max(

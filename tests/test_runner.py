@@ -1,9 +1,11 @@
+import json
 import os
 import sys
 from pathlib import Path
 
 import pytest
 
+from review_agent_flow.agent_task import AgentTaskSnapshot, AgentTaskV1
 from review_agent_flow.runner import (
     MAX_AGENT_DIAGNOSTIC_BYTES,
     MAX_AGENT_DIAGNOSTIC_CHARS,
@@ -29,6 +31,37 @@ def _context(tmp_path: Path, **values) -> AgentContext:
     )
 
 
+def _adapted_context(tmp_path: Path, *, auto_fix_enabled: bool = False) -> AgentContext:
+    skill_path = (tmp_path.parent / f"{tmp_path.name}-SKILL.md").resolve()
+    skill_path.write_text("# Review\n", encoding="utf-8")
+    result_path = (tmp_path.parent / f"{tmp_path.name}-result.json").resolve()
+    snapshot = AgentTaskSnapshot(
+        run_id=11,
+        project_id="42",
+        mr_iid=7,
+        title="Review exact change",
+        source_project_id="42",
+        source_branch="feature",
+        target_branch="main",
+        base_sha="b" * 40,
+        start_sha="c" * 40,
+        head_sha=SHA,
+        created_at="2026-08-10T00:00:00+00:00",
+    )
+    task = AgentTaskV1(snapshot, skill_path, result_path, auto_fix_enabled)
+    return AgentContext(
+        project_id="42",
+        mr_iid=7,
+        run_id=11,
+        sha=SHA,
+        worktree=tmp_path,
+        result_path=result_path,
+        skill_path=skill_path,
+        auto_fix_enabled=auto_fix_enabled,
+        task=task,
+    )
+
+
 def _success_code(diagnostic: str = "") -> str:
     return (
         "import json, os, pathlib; "
@@ -48,6 +81,74 @@ def test_runner_passes_controlled_context_and_parses_result(tmp_path: Path) -> N
     assert result.stdout.strip() == "7"
     assert result.output is not None
     assert result.output.review_markdown == "reviewed"
+
+
+def test_command_adapter_receives_private_canonical_task_file(tmp_path: Path) -> None:
+    code = _success_code(
+        "task = pathlib.Path(os.environ['REVIEW_AGENT_FLOW_TASK_PATH']); "
+        "print(task.read_text()); print(oct(task.stat().st_mode & 0o777))"
+    )
+
+    result = LocalCliAgentRunner(
+        [sys.executable, "-c", code],
+        timeout_seconds=5,
+        adapter="command",
+    ).run(_adapted_context(tmp_path))
+
+    assert result.returncode == 0
+    assert '"base_sha": "' + "b" * 40 + '"' in result.stdout
+    assert "AgentTask v1" in result.stdout
+    assert result.stdout.rstrip().endswith("0o600")
+
+
+def test_opencode_adapter_uses_native_noninteractive_prompt_and_task_permissions(
+    tmp_path: Path,
+) -> None:
+    executable = tmp_path / "fake-opencode"
+    capture = tmp_path / "argv.txt"
+    config_capture = tmp_path / "config.json"
+    executable.write_text(
+        "#!/bin/sh\n"
+        'printf "%s\\n" "$@" > "$CAPTURE_PATH"\n'
+        'printf "%s" "$OPENCODE_CONFIG_CONTENT" > "$CONFIG_CAPTURE_PATH"\n'
+        "printf '%s' '{\"version\":1,\"review_markdown\":\"reviewed\"}' "
+        '> "$REVIEW_AGENT_FLOW_RESULT_PATH"\n',
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+
+    context = _adapted_context(tmp_path)
+    result = LocalCliAgentRunner(
+        [str(executable)],
+        timeout_seconds=5,
+        adapter="opencode",
+    ).run(
+        context,
+        extra_env={
+            "PATH": os.environ.get("PATH", os.defpath),
+            "CAPTURE_PATH": str(capture),
+            "CONFIG_CAPTURE_PATH": str(config_capture),
+        },
+    )
+
+    assert result.returncode == 0
+    argv = capture.read_text(encoding="utf-8")
+    assert argv.startswith(
+        "run\n--pure\n--agent\nreviewflow\nYou are executing ReviewFlow AgentTask v1."
+    )
+    assert "--auto" not in argv
+    assert context.task is not None and str(context.task.skill_path) in argv
+    assert '"auto_fix_enabled": false' in argv
+    config = json.loads(config_capture.read_text(encoding="utf-8"))
+    permission = config["permission"]
+    assert permission["edit"]["*"] == "deny"
+    assert permission["bash"]["*"] == "deny"
+    review_range = "b" * 40 + "..." + SHA
+    assert permission["bash"][f"git diff --no-ext-diff {review_range}"] == "allow"
+    assert permission["task"] == "deny"
+    assert permission["webfetch"] == "deny"
+    assert config["share"] == "disabled"
+    assert config["agent"]["reviewflow"]["permission"] == permission
 
 
 def test_runner_parses_optional_autofix_proposal(tmp_path: Path) -> None:

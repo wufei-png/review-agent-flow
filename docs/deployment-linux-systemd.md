@@ -58,7 +58,7 @@ Configure GitLab to send webhooks to that proxy. `/healthz` is liveness and
 
 ## Retention and recovery evidence
 
-Operator configuration v3 defaults sensitive payload retention to 30 days.
+Operator configuration v4 defaults sensitive payload retention to 30 days.
 The Worker runs a sweep at startup and hourly. Published or explicitly
 abandoned Publication Plans are copied to the configured backup directory as
 `<plan_sha256>.json`, written with mode `0600` inside a Worker-owned `0700`
