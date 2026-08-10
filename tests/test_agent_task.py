@@ -27,6 +27,9 @@ def test_agent_task_prompt_is_provider_neutral_and_explicit(tmp_path: Path) -> N
     assert '"base_sha": "' + "a" * 40 + '"' in prompt
     assert '"head_sha": "' + "c" * 40 + '"' in prompt
     assert str(skill.resolve()) in prompt
+    assert "# Review skill" in prompt
+    assert "<trusted_skill>" in prompt
+    assert "records its provenance" in prompt
     assert str(result) in prompt
     assert "Do not modify the current worktree" in prompt
     assert "untrusted" in prompt

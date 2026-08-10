@@ -13,7 +13,8 @@ Implemented foundations that remain useful include exact-SHA worktrees, bound-Pr
 The current OpenCode adapter canary evidence is recorded in
 [JiHuLab/OpenCode A1 canary evidence — 2026-08-10](../evidence/jihulab-opencode-a1-2026-08-10.md).
 It is intentionally a partial verdict: Note publication succeeded, while
-Auto-fix commit/MR and durable notification delivery remain unverified.
+the final nested-instruction isolation hardening, Auto-fix commit/MR and durable
+notification delivery remain unverified.
 
 On 2026-08-03 a JiHuLab canary in Project `358268` completed Review Run `2`, parent MR `!3`, Auto-fix MR `!4` and Agent-owned Note `8733889`. Project `358268` was later marked for deletion.
 

@@ -142,10 +142,12 @@ def test_opencode_adapter_uses_native_noninteractive_prompt_and_task_permissions
     config = json.loads(config_capture.read_text(encoding="utf-8"))
     permission = config["permission"]
     assert permission["edit"]["*"] == "deny"
+    assert permission["read"] == "deny"
     assert permission["bash"]["*"] == "deny"
     review_range = "b" * 40 + "..." + SHA
     assert permission["bash"][f"git diff --no-ext-diff {review_range}"] == "allow"
     assert permission["task"] == "deny"
+    assert permission["skill"] == "deny"
     assert permission["webfetch"] == "deny"
     assert config["share"] == "disabled"
     assert config["agent"]["reviewflow"]["permission"] == permission

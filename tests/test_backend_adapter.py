@@ -42,6 +42,8 @@ def test_opencode_adapter_maps_autofix_to_task_scoped_edit_permission(
     config = json.loads(invocation.environment["OPENCODE_CONFIG_CONTENT"])
     assert config["permission"]["edit"]["*"] == edit_default
     assert config["permission"]["edit"][str(result.parent / "**")] == "allow"
+    assert config["permission"]["read"] == "deny"
+    assert config["permission"]["skill"] == "deny"
     assert config["permission"]["bash"]["*"] == "deny"
     assert (
         config["permission"]["bash"][f"git diff --no-ext-diff {'a' * 40}...{'c' * 40}"]

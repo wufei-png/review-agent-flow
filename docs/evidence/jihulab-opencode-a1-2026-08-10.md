@@ -63,6 +63,11 @@ original and recovery worktree records ended `cleaned`.
 This proves reclaim and cleanup behavior, but not successful post-crash effect
 publication.
 
+The successful Note runs also predate the final hardening that embeds the trusted
+Skill and disables OpenCode's general repository `read` and ambient `skill`
+tools. They therefore do not prove the nested-instruction isolation of the final
+adapter configuration; that configuration still needs a live canary.
+
 ## Unmet A1 evidence
 
 - No Program-owned Auto-fix commit or child MR exists. Runs 3–5 correctly
@@ -71,6 +76,9 @@ publication.
   when the OpenAI provider returned repeat `Unexpected server error` responses.
 - No durable notification request/outbox delivery exists because no Auto-fix
   Relation was established.
+- The final adapter's embedded trusted Skill and disabled repository `read` and
+  ambient `skill` tools were added after these live runs and have only local
+  runtime configuration/permission evidence.
 - A separate live call through ReviewFlow's Feishu adapter was attempted and
   explicitly labeled as a transport canary. Feishu rejected the stored webhook
   with business code `19001` (`incoming webhook access token invalid`), so it is

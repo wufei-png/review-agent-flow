@@ -77,7 +77,7 @@ Keep this file outside the reviewed repository and mode `0600`:
 chmod 0600 "$HOME/.local/state/reviewflow-quickstart/operator.yml"
 ```
 
-The OpenCode adapter uses `run --pure --agent reviewflow`, disables Project-owned OpenCode configuration and sharing, isolates OpenCode state per Run, and never passes `--auto`. The Agent receives no GitLab token. The Trusted Workspace is still not an OS sandbox; use a dedicated host identity or stronger host isolation for untrusted deployments.
+The OpenCode adapter uses `run --pure --agent reviewflow`, embeds the selected Skill in the canonical task prompt, disables general file reads and ambient Skill lookup, disables Project-owned OpenCode configuration and sharing, isolates OpenCode state per Run, and never passes `--auto`. Exact review-range Git diff plus grep/LSP remain the source-inspection surface. The Agent receives no GitLab token. The Trusted Workspace is still not an OS sandbox; use a dedicated host identity or stronger host isolation for untrusted deployments.
 
 ## 4. Export the bound deployment settings
 

@@ -13,7 +13,7 @@ The core does not ship vendor-specific model SDKs. LiteLLM may be used as an ext
 
 ## Invocation
 
-Before execution, ReviewFlow freezes `AgentTaskV1` once per Review Run. The task contains the ReviewKey, untrusted MR title and branch presentation, exact GitLab `base_sha`, `start_sha` and `head_sha`, the selected Skill path, Auto-fix authorization and the controlled absolute Result Path. The canonical prompt labels MR data as untrusted, requires review of `base_sha...head_sha`, and reserves every GitLab, notification, commit and push effect to ReviewFlow.
+Before execution, ReviewFlow freezes `AgentTaskV1` once per Review Run. The task contains the ReviewKey, untrusted MR title and branch presentation, exact GitLab `base_sha`, `start_sha` and `head_sha`, the selected Skill path, Auto-fix authorization and the controlled absolute Result Path. When rendered, the canonical prompt embeds the complete selected Skill and keeps its path as provenance; it labels MR data as untrusted, requires review of `base_sha...head_sha`, and reserves every GitLab, notification, commit and push effect to ReviewFlow.
 
 All Backend adapters consume that same canonical task. An adapter may map it to its CLI's native non-interactive invocation, but cannot add domain authority or change the Result contract. The generic Operator-command adapter receives a private task file; the OpenCode reference adapter passes the canonical prompt to `opencode run`. Codex and Claude Code may be added later as peer adapters without changing the core task.
 
