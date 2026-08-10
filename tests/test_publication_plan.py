@@ -51,6 +51,31 @@ def _plan_value() -> dict[str, object]:
     }
 
 
+def test_publication_candidate_has_literal_canonical_digest_oracle() -> None:
+    value = {
+        "version": 1,
+        "base_sha": SHA,
+        "actions": [
+            {
+                "action": "update",
+                "file_path": "说明.md",
+                "content": "修复\n",
+                "execute_filemode": False,
+            }
+        ],
+    }
+    expected = (
+        '{"actions":[{"action":"update","content":"修复\\n",'
+        '"execute_filemode":false,"file_path":"说明.md"}],'
+        f'"base_sha":"{SHA}","version":1}}'
+    )
+
+    assert canonical_json(value) == expected
+    assert hashlib.sha256(expected.encode("utf-8")).hexdigest() == (
+        "401c1cbd55208c2b3e24cb423cb3c5a874b57006e0a313bfac3255f9649b31db"
+    )
+
+
 def test_publication_plan_v1_parses_one_canonical_typed_contract() -> None:
     plan_json = canonical_json(_plan_value())
     digest = hashlib.sha256(plan_json.encode()).hexdigest()
