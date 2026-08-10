@@ -432,6 +432,26 @@ class ReviewWorker:
             **fields,
         )
 
+    def _defer_eligibility(
+        self,
+        run: ReviewRun,
+        detail: str,
+        lease_lost_detail: str,
+        *,
+        diagnostic: str | None = None,
+    ) -> WorkerResult:
+        requeued = self.store.requeue(
+            run.run_id,
+            detail,
+            delay_seconds=self.retry_delay_seconds,
+            claim_token=run.claim_token,
+        )
+        if not requeued:
+            return self._lease_recovery_result(run, lease_lost_detail)
+        result_detail = diagnostic or detail
+        self._log_run(run, status="deferred", diagnostic=result_detail)
+        return WorkerResult(run.run_id, "deferred", detail=result_detail)
+
     def process_one(self) -> WorkerResult | None:
         publication = self._process_publication_backlog()
         if publication is not None:
@@ -519,31 +539,20 @@ class ReviewWorker:
                 return WorkerResult(run.run_id, "cancelled", detail=detail)
 
             if merge_request.draft:
-                requeued = self.store.requeue(
-                    run.run_id,
+                return self._defer_eligibility(
+                    run,
                     "draft merge request",
-                    delay_seconds=self.retry_delay_seconds,
-                    claim_token=run.claim_token,
+                    "Review Run lease lost before draft requeue",
                 )
-                if not requeued:
-                    return self._lease_recovery_result(run, "Review Run lease lost before draft requeue")
-                self._log_run(run, status="deferred", diagnostic="draft merge request")
-                return WorkerResult(run.run_id, "deferred", detail="draft merge request")
             if self.policy.pipeline_gate:
                 pipeline = self.gitlab.get_latest_pipeline(run.project_id, run.sha)
                 if pipeline is None or pipeline.status != "success":
-                    requeued = self.store.requeue(
-                        run.run_id,
+                    return self._defer_eligibility(
+                        run,
                         "waiting for successful pipeline",
-                        delay_seconds=self.retry_delay_seconds,
-                        claim_token=run.claim_token,
+                        "Review Run lease lost before pipeline requeue",
+                        diagnostic="pipeline gate",
                     )
-                    if not requeued:
-                        return self._lease_recovery_result(
-                            run, "Review Run lease lost before pipeline requeue"
-                        )
-                    self._log_run(run, status="deferred", diagnostic="pipeline gate")
-                    return WorkerResult(run.run_id, "deferred", detail="pipeline gate")
 
             self._freeze_effective_decision(run)
             effective_decision = self.store.get_effective_run_decision(run.run_id)
@@ -556,18 +565,11 @@ class ReviewWorker:
                 and (not merge_request.base_sha or not merge_request.start_sha)
             ):
                 detail = "waiting for GitLab Merge Request diff refs"
-                requeued = self.store.requeue(
-                    run.run_id,
+                return self._defer_eligibility(
+                    run,
                     detail,
-                    delay_seconds=self.retry_delay_seconds,
-                    claim_token=run.claim_token,
+                    "Review Run lease lost before diff refs requeue",
                 )
-                if not requeued:
-                    return self._lease_recovery_result(
-                        run, "Review Run lease lost before diff refs requeue"
-                    )
-                self._log_run(run, status="deferred", diagnostic=detail)
-                return WorkerResult(run.run_id, "deferred", detail=detail)
             if not effective_decision.ai_review:
                 if not self.store.finish(run.run_id, "succeeded", claim_token=run.claim_token):
                     return self._lease_recovery_result(
