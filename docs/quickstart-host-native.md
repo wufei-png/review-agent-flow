@@ -113,4 +113,9 @@ review-agent-flow worker --once
 
 The Worker fetches the frozen base/start/head commits, runs OpenCode in a detached worktree, parses the strict Result JSON, and publishes the ReviewFlow-owned MR Note. If GitLab is still preparing `diff_refs`, the Run is deferred without consuming its failure budget; run `worker --once` again later. Repeating `review-mr` or retrying the Worker does not create a second Review Run or duplicate Note for the same ReviewKey.
 
+Auto-fix captures every tracked or untracked workspace change. Ensure normal
+tool-generated files such as Python `__pycache__/` or build output are covered
+by the Project's committed ignore rules; otherwise binary or unrelated output
+is deliberately rejected rather than silently omitted from the candidate.
+
 For continuous webhook operation and separate API/Worker identities, continue with [the Linux systemd deployment](deployment-linux-systemd.md).

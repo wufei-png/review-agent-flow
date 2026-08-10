@@ -62,21 +62,25 @@ def test_capture_diff_envelope_canonicalizes_text_actions(tmp_path: Path) -> Non
 
 
 @pytest.mark.parametrize(
-    ("name", "content"),
+    ("name", "content", "message"),
     [
-        ("binary.dat", b"text\x00binary"),
-        ("not-utf8.txt", b"\xff"),
-        ("large.txt", b"x" * (MAX_AUTOFIX_FILE_BYTES + 1)),
+        ("binary.dat", b"text\x00binary", "binary content at path: binary.dat"),
+        ("not-utf8.txt", b"\xff", "UTF-8 at path: not-utf8.txt"),
+        (
+            "large.txt",
+            b"x" * (MAX_AUTOFIX_FILE_BYTES + 1),
+            "per-file bound",
+        ),
     ],
     ids=("binary", "non-utf8", "oversized"),
 )
 def test_capture_rejects_binary_non_utf8_and_oversized_files(
-    tmp_path: Path, name: str, content: bytes
+    tmp_path: Path, name: str, content: bytes, message: str
 ) -> None:
     sha = _repository(tmp_path)
     (tmp_path / name).write_bytes(content)
 
-    with pytest.raises(DiffEnvelopeError):
+    with pytest.raises(DiffEnvelopeError, match=message):
         capture_diff_envelope(tmp_path, sha)
 
 

@@ -89,8 +89,10 @@ hostname、tool version、reason、result 和独立 recovery ID。
 Plan rearm/abandon 不访问 GitLab；它们依据持久化 write phase 选择安全发布重试、
 仅对账重试或终止，并记录独立 action ID。
 
-本地测试不访问真实 GitLab、飞书、企微或 Agent Provider。真实 E2E
-需要 Operator 提供受控凭据和运行环境。
+本地测试不访问真实 GitLab、飞书、企微或 Agent Provider。2026-08-10 的
+JiHuLab/OpenCode A1 canary 已验证 Program-owned Note、幂等手动触发和租约回收，
+但 Auto-fix 与通知投递仍未闭环；完整收据与边界见
+[docs/evidence/jihulab-opencode-a1-2026-08-10.md](docs/evidence/jihulab-opencode-a1-2026-08-10.md)。
 
 ## License
 

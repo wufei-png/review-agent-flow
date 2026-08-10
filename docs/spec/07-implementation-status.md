@@ -2,13 +2,18 @@
 
 ## Migration status
 
-The normative specifications and ADRs describe the accepted Program-owned publication target. Publication, target-branch Policy Snapshots, Operator-owned notification bindings, Review Outcome projection, retention enforcement and the Linux systemd reference deployment are implemented. Live GitLab, reverse-proxy and backup/restore verification remain deployment gates.
+The normative specifications and ADRs describe the accepted Program-owned publication target. Publication, target-branch Policy Snapshots, Operator-owned notification bindings, Review Outcome projection, retention enforcement and the Linux systemd reference deployment are implemented. A 2026-08-10 JiHuLab/OpenCode canary verified exact-SHA execution, Program-owned Notes, manual-trigger idempotency and lease reclaim, but did not complete Auto-fix or notification delivery; reverse-proxy and backup/restore verification also remain deployment gates.
 
 Policy v4, Operator configuration v4, kind-free ReviewKey storage, strict external Operator Backend/Profile and notification authorization, minimal Agent environment, RESULT_PATH v1 parsing, durable Program-owned Note publication, immutable Auto-fix Intent creation, bounded Diff Envelope capture, Operator verification, Publication Plan freeze, normal-path AutoFixPublisher and exceptional online reconciliation are implemented. The Publisher persists precise preflight/commit/MR write phases, uses one GitLab Commits API request with the frozen `start_sha` and `force=false`, creates the child MR, and atomically persists its Relation, Notification Request and outbox deliveries. The Reconciler processes only Plans that crossed an external-write boundary and established Relations; child Webhooks cannot create local authority. One supervised Worker process runs independent Review/Publication, Notification and Reconciliation/Cleanup loops, with Retention scheduled in the third loop, separate from the API OS process. Explicit Store-loss recovery requires the canonical Plan payload and validates the unique Review Bot MR plus remote commit parent/actions before atomically rebuilding authority; it never creates a notification, and notification resend fails closed without the retained frozen Policy Snapshot. Separate audited commands resend notification generations, rearm blocked Plans according to their write phase, or terminally abandon idle Plans. The fresh schema contains neither Agent-owned Auto-fix tables nor Run-ID marker readers. There is no migration or compatibility requirement for old database rows, policies or markers.
 
 Implemented foundations that remain useful include exact-SHA worktrees, bound-Project webhook validation, SQLite claims/leases, notification outbox primitives, GitLab event normalization, Pipeline Gate, provider protocols and Feishu/WeCom adapters. Webhook transport/authentication is separated from the project-bound decision applier, and Worker polling delegates publication, idle reconciliation and completed-effect publication to focused seams without changing their scheduling order. Their contracts may still change while adopting the target model.
 
 ## Historical evidence
+
+The current OpenCode adapter canary evidence is recorded in
+[JiHuLab/OpenCode A1 canary evidence — 2026-08-10](../evidence/jihulab-opencode-a1-2026-08-10.md).
+It is intentionally a partial verdict: Note publication succeeded, while
+Auto-fix commit/MR and durable notification delivery remain unverified.
 
 On 2026-08-03 a JiHuLab canary in Project `358268` completed Review Run `2`, parent MR `!3`, Auto-fix MR `!4` and Agent-owned Note `8733889`. Project `358268` was later marked for deletion.
 
@@ -37,4 +42,4 @@ This is evidence for the old Agent-owned path only. It does not verify strict RE
 - Retention tests prove backup-before-purge, immutable backup conflicts, terminal payload purge and graceful Worker shutdown.
 - `command` and OpenCode thin adapters now consume the same frozen `AgentTaskV1`; OpenCode uses an isolated adapter-owned Agent through native non-interactive `run --pure --agent reviewflow` without `--auto`, while the shared Runner retains lifecycle, heartbeat and strict Result parsing.
 
-Live GitLab verification of the target path remains required after the implementation and local integration gates pass.
+Live JiHuLab verification of the remaining Program-owned Auto-fix and durable notification path is still required. The successful Note receipts establish only the OpenCode composition and must not be extrapolated to other Backend adapters.

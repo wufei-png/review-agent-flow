@@ -1317,7 +1317,7 @@ class ReviewWorker:
                     sha=run.sha,
                     worktree=worktree,
                     result_path=result_path,
-                    skill_path=skill_path,
+                    skill_path=task.skill_path,
                     auto_fix_enabled=enabled,
                     task=task,
                 ),

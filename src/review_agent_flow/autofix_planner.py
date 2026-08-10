@@ -190,13 +190,17 @@ def _read_regular_file(path: Path) -> tuple[bytes, bool]:
         os.close(descriptor)
 
 
-def _text(content: bytes) -> str:
+def _text(content: bytes, path: str) -> str:
     if b"\0" in content:
-        raise DiffEnvelopeError("Auto-fix candidate rejects binary content")
+        raise DiffEnvelopeError(
+            f"Auto-fix candidate rejects binary content at path: {path}"
+        )
     try:
         return content.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise DiffEnvelopeError("Auto-fix candidate content must be UTF-8") from exc
+        raise DiffEnvelopeError(
+            f"Auto-fix candidate content must be UTF-8 at path: {path}"
+        ) from exc
 
 
 def capture_diff_envelope(worktree: Path, expected_sha: str) -> DiffEnvelope:
@@ -224,14 +228,14 @@ def capture_diff_envelope(worktree: Path, expected_sha: str) -> DiffEnvelope:
             baseline_mode, baseline_type, object_id = baseline
             if baseline_type != "blob" or baseline_mode not in {"100644", "100755"}:
                 raise DiffEnvelopeError("Auto-fix cannot delete a symlink or gitlink")
-            _text(_read_baseline_blob(worktree, object_id))
+            _text(_read_baseline_blob(worktree, object_id), path)
             actions.append(DiffAction("delete", path))
             continue
 
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
             raise DiffEnvelopeError("Auto-fix candidate rejects symlinks, gitlinks and special files")
         current, executable = _read_regular_file(candidate_path)
-        current_text = _text(current)
+        current_text = _text(current, path)
         if baseline is None:
             total_bytes += len(current)
             if total_bytes > MAX_AUTOFIX_TOTAL_BYTES:
