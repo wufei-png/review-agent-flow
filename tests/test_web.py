@@ -115,10 +115,24 @@ def test_gitlab_webhook_is_idempotent_and_secret_checked(tmp_path) -> None:
     headers = {"X-Gitlab-Token": "secret", "X-Gitlab-Event": "Merge Request Hook"}
     first = client.post("/webhooks/gitlab", json=payload, headers=headers)
     duplicate = client.post("/webhooks/gitlab", json=payload, headers=headers)
-    unauthorized = client.post("/webhooks/gitlab", json=payload, headers={"X-Gitlab-Token": "bad"})
+    unauthorized_sha = "d" * 40
+    unauthorized_payload = {
+        **payload,
+        "object_attributes": {
+            **payload["object_attributes"],
+            "iid": 2,
+            "last_commit": {"id": unauthorized_sha},
+        },
+    }
+    unauthorized = client.post(
+        "/webhooks/gitlab",
+        json=unauthorized_payload,
+        headers={"X-Gitlab-Token": "bad"},
+    )
     assert first.status_code == 200
     assert duplicate.json()["run_id"] == first.json()["run_id"]
     assert unauthorized.status_code == 401
+    assert store.wake_run("42", 2, unauthorized_sha) is None
 
 
 def test_auto_fix_merge_marks_only_the_resulting_sha(tmp_path) -> None:
