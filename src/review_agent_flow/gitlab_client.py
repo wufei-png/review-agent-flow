@@ -22,6 +22,11 @@ from .gitlab import (
     is_valid_sha,
     normalize_sha,
 )
+from .publication_plan import (
+    MAX_PUBLICATION_ACTIONS,
+    MAX_PUBLICATION_FILE_BYTES,
+    MAX_PUBLICATION_TOTAL_BYTES,
+)
 
 
 class PythonGitLabClient(GitLabClient):
@@ -421,7 +426,7 @@ class PythonGitLabClient(GitLabClient):
         ):
             raise GitLabIdentityConflict("GitLab returned invalid commit parents")
         diffs = list(commit.diff(get_all=True))
-        if len(diffs) > 100:
+        if len(diffs) > MAX_PUBLICATION_ACTIONS:
             raise GitLabIdentityConflict("repository commit exceeds the recovery action bound")
 
         actions: list[RepositoryAction] = []
@@ -463,7 +468,7 @@ class PythonGitLabClient(GitLabClient):
                 raise GitLabIdentityConflict("GitLab returned unreadable repository content") from exc
             if not isinstance(raw_content, bytes) or b"\0" in raw_content:
                 raise GitLabIdentityConflict("recovery rejects binary repository content")
-            if len(raw_content) > 1024 * 1024:
+            if len(raw_content) > MAX_PUBLICATION_FILE_BYTES:
                 raise GitLabIdentityConflict("repository file exceeds the recovery size bound")
             try:
                 content = raw_content.decode("utf-8")
@@ -482,7 +487,7 @@ class PythonGitLabClient(GitLabClient):
             else:
                 total_content_bytes += len(raw_content)
                 actions.append(RepositoryAction("update", new_path, content, executable))
-            if total_content_bytes > 5 * 1024 * 1024:
+            if total_content_bytes > MAX_PUBLICATION_TOTAL_BYTES:
                 raise GitLabIdentityConflict("repository commit exceeds the recovery size bound")
         actions.sort(key=lambda action: action.file_path)
         return RepositoryCommitObservation(
