@@ -26,6 +26,7 @@ dev = [
 
 [project.scripts]
 review-agent-flow = "review_agent_flow.cli:main"
+review-agent-flow-opencode = "review_agent_flow.opencode_auth_wrapper:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/review_agent_flow"]
