@@ -1,6 +1,6 @@
 # ReviewFlow 试运行准备执行队列
 
-状态：实施中；01–04 已完成本地实现与检查，05 的部署故障手册已本地完成，真实 canary 与试运行判定待现场资源及证据。规划基线：2026-09-20，`f407d0b25583a9553cbac24741183e87457d1523`。每次实施先核对当前提交、工作区和实际代码；本文的基线不是跳过核对的理由。
+状态：实施中；01–04 已完成本地实现与检查，05 的部署故障手册已完成，新 canary 已完成部分现场预检；真实 ReviewFlow canary 与试运行判定仍待专用凭据、入口及恢复证据。规划基线：2026-09-20，`f407d0b25583a9553cbac24741183e87457d1523`。每次实施先核对当前提交、工作区和实际代码；本文的基线不是跳过核对的理由。
 
 ## 目标与契约
 
@@ -10,7 +10,7 @@ Agent 仍从冻结的目标分支 Skill 与 `AgentTaskV1` 获取任务，只向 
 
 通知沿用 [ADR-0010](../adr/0010-notification-outbox.md) 的 outbox、有限次自动重试和至少一次投递。持久状态 `delivered` 保持兼容，其含义是飞书或企微服务端以 HTTP 和业务响应接受了请求；收件人可见须另有人工证据，崩溃窗口可能重复发送。不新增发送不确定状态机或自动停止重试规则。
 
-当前 SQLite schema 为 16。进入试运行前一次性切到 17；本项目现阶段没有旧数据库在线迁移契约。切换前保存需要保留的 canary 证据和一致性数据库快照，不把删库当成试运行后的升级方法。不可变 Plan、精确 SHA、外部写阶段和显式恢复继续是发布契约。
+当前 SQLite schema 为 17；本项目现阶段没有旧数据库在线迁移契约。试运行后的升级必须先保存需保留的 canary 证据和一致性数据库快照，不把删库当成升级方法。不可变 Plan、精确 SHA、外部写阶段和显式恢复继续是发布契约。
 
 ## 建议取舍
 
@@ -32,7 +32,7 @@ Agent 仍从冻结的目标分支 Skill 与 `AgentTaskV1` 获取任务，只向 
 | 02 | P1 | [终态保留与 Worker 所有权](02-retention-worker-ownership.md) | 01 完成；schema 切换前保存证据 | 本地完成；现场证据待 05 |
 | 03 | P1 | [Operator 诊断](03-operator-diagnostics.md) | 02 完成 | 本地完成；现场证据待 05 |
 | 04 | P1 | [一致性备份与恢复验证](04-backup-restore.md) | 02 完成；建议 03 完成以复用状态查询 | 本地完成；现场证据待 05 |
-| 05 | 发布门槛 | [部署与真实 canary](05-deployment-canary.md) | 01–04 完成；取得独立 canary 资源 | 阶段 1 本地完成；阶段 2 待现场验证；未作 go/no-go 判定 |
+| 05 | 发布门槛 | [部署与真实 canary](05-deployment-canary.md) | 01–04 完成；取得独立 canary 资源 | 阶段 1 完成；阶段 2 部分现场预检完成，真实 Run 与恢复待验证；未作 go/no-go 判定 |
 
 每项任务由一个新会话完成，并依照该任务的阶段顺序用 `implement-in-stages` 逐阶段验证、本地提交。每个阶段都须留下有效仓库状态；提交前只暂存该阶段文件并检查 staged diff。完成一个会话后更新本队列及对应计划的状态、提交与检查结果。若代码事实推翻计划，只调整未开始的阶段，并记录理由。不要把本地测试、模拟 GitLab 或配置检查记成真实平台验收。
 
@@ -54,3 +54,5 @@ Agent 仍从冻结的目标分支 Skill 与 `AgentTaskV1` 获取任务，只向 
 - `.venv/bin/python -m pytest`：417 passed，1 条 Starlette/httpx 测试依赖弃用警告；备份相关针对性测试、`.venv/bin/ruff check .`、`.venv/bin/python -m compileall -q src tests`、CLI `--help`、`git diff --check` 通过。临时 Store 的 WAL 并发快照、损坏拒绝和空路径恢复演练验证了只读查询及绝对收据路径；未在 Linux systemd 部署、独立备份介质或真实服务身份下演练，05 仍需现场恢复和新 canary 证据。
 - 2026-09-21，05 阶段 1 本地完成：`fc6d1a0`（部署故障手册及 reference 权限核对）、`30f52df`（独立只读审查后补齐 Operator 命令的活动 Store 与安全凭据环境）、`9added1`（修正既有 Worker 失租测试的链式异常竞态断言）。审查的两项 P2 均核实并修复，无拒绝项；审查者复核测试修正无新增发现。阶段 2 未实施，试运行 go/no-go 尚无依据。
 - 本地最终 `.venv/bin/python -m pytest` 417 passed，1 条 Starlette/httpx 弃用警告；期间一次复检为 416 passed、1 failed，定位为已有 Worker 失租测试只接受顶层异常文本，改为检查顶层及链式根因后定向连跑 5 次和全量复跑通过。OpenCode `1.18.11` 在本机的 runtime-isolation 定向测试为 1 passed；CLI/部署定向测试 19 passed，`.venv/bin/ruff check .`、compileall、CLI `--help`、相对 Markdown 链接检查、staged `git diff --check` 通过。当前主机为 macOS，未运行 `systemd-analyze verify` 或 Linux 服务演练。虽本机有 JiHuLab CLI 登录与模型凭据，独立 canary Project、新通知 webhook/人工收件人、Linux systemd 主机和隔离恢复环境尚未确认；没有新的 exact-SHA 远端 Note、commit/MR、Relation、通知或恢复收据。旧 A1 证据不计入 05 验收。
+- 2026-09-21，05 阶段 2 部分预检：新增仅吴非的 `feishu_dm`、通道重绑防外发、私有 Project/MR 与专用 Review Bot；主机完成 systemd unit 验证、OpenCode isolation、精确 SHA fetch、API readiness 与跨 Unix 身份 Store 写入。提交 `3c68159`、`394579b`、`6d56bb8`、`647a475`、`ce20858`、`f8c99f9`；其中 `6d56bb8` 在 Bus error 现场探测后由 `ce20858` 撤回。独立只读 review 的另一项 P1（同 ID 私信改绑其他 open ID）由 `f8c99f9` 修复并定向复测，复审无新增发现。单次 owner-only lark-cli 私信仅有服务端接受，未确认可见。当前 Worker 模型 key 无效，飞书 app 凭据缺失；两服务已停止且未启用。逐项收据、现场失败与未验证项见[新 canary 证据](../evidence/jihulab-opencode-canary-2026-09-21.md)。真实 ReviewFlow Run、外部写和完整恢复仍未执行，未作 go/no-go 判定。
+- 本轮本地全量 `.venv/bin/python -m pytest` 424 passed、1 条 Starlette/httpx 弃用警告；通知定向测试 20 passed；`.venv/bin/ruff check .`、`.venv/bin/python -m compileall -q src tests`、`git diff --check` 通过。`systemd-analyze verify` 在主机退出码为 0，systemd 245 提示两项 sandbox 指令未生效；仅属 unit 语法检查，未计为完整运行或发布验收。

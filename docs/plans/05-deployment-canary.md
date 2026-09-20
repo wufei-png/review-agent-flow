@@ -1,6 +1,6 @@
 # 05 · 部署与真实 canary
 
-状态：阶段 1 本地完成；阶段 2 待现场资源和验证，试运行未判定。优先级：试运行门槛。前置条件：[01](01-notification-and-outcome.md)、[02](02-retention-worker-ownership.md)、[03](03-operator-diagnostics.md)、[04](04-backup-restore.md) 均完成；阶段 2 仍需独立 canary Project、健康 Agent provider、Review Bot 权限及新通知 webhook。
+状态：阶段 1 本地完成；阶段 2 已完成 Project、MR、主机和部分传输/存储预检，真实 ReviewFlow canary 尚未运行，试运行未判定。优先级：试运行门槛。前置条件：[01](01-notification-and-outcome.md)、[02](02-retention-worker-ownership.md)、[03](03-operator-diagnostics.md)、[04](04-backup-restore.md) 均完成；阶段 2 仍需专用健康 Agent provider 凭据、吴非专属飞书私信应用凭据、TLS webhook 入口及隔离恢复验证。
 
 ## 交付结果
 
@@ -21,7 +21,7 @@
 
 本地 `ruff check .`、`pytest`、`python -m compileall -q src tests` 和 `git diff --check` 必须通过；OpenCode runtime isolation 测试在 canary 主机确认实际执行，不能把 skip 记作通过。真实通知分成队列已落库、服务端已接受、收件人确认可见三项记录。前两项仍不能推出已读。
 
-若 provider 凭据、可用 webhook、独立 Project 或隔离恢复环境缺失，完成可独立验证的阶段 1，保留阶段 2 为待验证并列出缺项；不要制造 live 结论或复用旧 Note。只在完成恢复演练、外部写对账和安全退出路径后记录试运行 go/no-go。
+若 provider 凭据、仅吴非可收的私信通道、独立 Project 或隔离恢复环境缺失，完成可独立验证的部分，保留阶段 2 为待验证并列出缺项；不要制造 live 结论或复用旧 Note。只在完成恢复演练、外部写对账和安全退出路径后记录试运行 go/no-go。此 canary 不向其他人私聊，也不向群聊发送消息。
 
 完成记录写入[执行队列](pilot-readiness-queue.md)，并在本文记录提交、现场收据与未验证项。
 
@@ -31,3 +31,6 @@
 - 本地检查：最终 `.venv/bin/python -m pytest` 417 passed，1 条 Starlette/httpx 依赖弃用警告；此前一次复检为 416 passed、1 failed，失败的既有断言经修正后定向连跑 5 次及全量复跑通过。`.venv/bin/python -m pytest tests/test_opencode_runtime_isolation.py -rs` 1 passed（OpenCode `1.18.11`，仅本机）；`.venv/bin/python -m pytest tests/test_cli.py tests/test_deployment.py` 19 passed；`.venv/bin/ruff check .`、`.venv/bin/python -m compileall -q src tests`、相关 CLI `--help`、相对 Markdown 链接和 staged `git diff --check` 通过。
 - 现场收据：无新收据。本机确认 JiHuLab CLI 已登录且存在模型凭据；未确认独立 canary Project、新通知 webhook 与人工收件人、Linux systemd 主机和隔离恢复环境。当前主机是 macOS，`systemd-analyze verify`、服务身份/sandbox 验证和 canary 主机上的 OpenCode isolation 尚未执行。
 - 阶段 2 保持待现场验证：新的 exact-SHA ReviewKey、frozen Policy/Plan digest、Note ID、Auto-fix commit/child MR/Relation、通知服务端接受与人工可见、重复入队及 Worker replay、commit/MR 写边界中断恢复、完整备份包隔离恢复均未取得。未作试运行 go/no-go 判定；不复用 A1 Note。
+- 2026-09-21，阶段 2 部分预检与阻塞记录见[新 canary 证据](../evidence/jihulab-opencode-canary-2026-09-21.md)：新私有 Project `373614`、MR `!1`、精确 head `8610a97e552468a78787aaba0d31f8817b54ca48` 和专用 Review Bot 已就绪；Linux systemd unit 验证、Worker 身份 OpenCode isolation、精确 SHA fetch、API `/readyz`、跨 Unix 身份 Store 写入与重启后访问已在主机执行。`3c68159` 增加仅吴非的飞书私信通道，`394579b` 修复通道类型重绑外发风险，独立只读 review 又发现同类型改绑其他 open ID 的 P1 并由 `f8c99f9` 修复，复审无新增发现；`6d56bb8` 的运行时 SQLite 权限修补在并发探测出现 Bus error 后由 `ce20858` 撤回并改为预创建共享数据库；`647a475` 修正启动顺序。单次吴非私信仅验证 lark-cli 服务端接受，不是 ReviewFlow 通知，人工可见待确认。
+- 专用 Worker 模型 key 现场返回 `Incorrect API key`，飞书 app ID/secret 未配置；TLS webhook 入口、真实 Run/Note/Auto-fix/Relation/outbox、重复与崩溃恢复及完整隔离恢复均未验证。API/Worker 均停止且未启用，未作试运行 go/no-go 判定。
+- 本轮本地全量 `.venv/bin/python -m pytest` 424 passed、1 条 Starlette/httpx 弃用警告；通知定向测试 20 passed；`.venv/bin/ruff check .`、`.venv/bin/python -m compileall -q src tests`、`git diff --check` 通过。真实主机 systemd 245 的 `systemd-analyze verify` 退出码为 0，但提示 `ProtectProc` 和 `ProcSubset` 未生效；这些检查不能代替真实 MR 发布与恢复验收。
