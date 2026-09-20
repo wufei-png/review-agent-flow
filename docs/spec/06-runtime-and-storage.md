@@ -94,6 +94,8 @@ Operator configuration v4 sets sensitive review, diff, notification and diagnost
 
 A Publication Plan remains in the active Store after publication or abandonment until the Worker writes canonical JSON to the configured Operator-owned mode-`0700` backup directory, verifies ownership, exact bytes, digest and mode `0600`, fsyncs the file and directory, and records an immutable backup receipt. With no backup directory, Plan payloads are not purged. The digest or GitLab marker alone is deliberately insufficient authority. The recovery CLI consumes retained canonical JSON but never writes it back into the active Store after successful reconstruction.
 
+The Operator `backup-store` CLI uses SQLite's backup API to take a consistent schema-17 snapshot under concurrent WAL writes. It copies only canonical Plan files referenced by backup receipts in that snapshot, after checking their exact absolute path under the configured private directory, owner, mode, length, digest and retained Store payload when present. A private manifest binds the application/schema versions, snapshot time, database digest/length and each receipt to its relative bundle file and original path. A private temporary directory is fsynced and published by rename after checks pass; an existing bundle name is refused. `verify-backup` checks the closed bundle's modes, manifest, SQLite integrity/schema and complete receipt mapping offline. Recovery restores the DB and Plan files into an empty, stopped deployment at the exact original receipt paths before read-only status queries and service restart. It does not rewrite immutable receipts or contact GitLab.
+
 ## Deployment defaults
 
 - SQLite and database polling are the first storage/queue implementation.

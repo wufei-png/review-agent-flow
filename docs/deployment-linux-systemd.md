@@ -91,6 +91,8 @@ from its creation time.
 After a Note body is purged, periodic exact-content reconciliation stops; its
 last confirmed identity/state remains historical evidence.
 
-Back up the SQLite database and `plan-backups` directory as one protected
-recovery set. A digest or GitLab marker without the canonical Plan JSON is not
-sufficient Store-loss recovery authority.
+Use the [Store backup and restore procedure](backup-restore.md) to capture a
+consistent SQLite snapshot and its receipt-referenced `plan-backups` files as
+one protected recovery set. A direct copy of a live WAL database is not a
+consistent snapshot. A digest or GitLab marker without the canonical Plan JSON
+is not sufficient Store-loss recovery authority.

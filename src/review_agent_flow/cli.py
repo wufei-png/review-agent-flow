@@ -17,7 +17,7 @@ from uuid import uuid4
 
 from . import __version__
 from .autofix_recovery import AutoFixPlanOperator, AutoFixRecoveryService, OperatorContext
-from .backup import create_backup
+from .backup import create_backup, verify_backup
 from .gitlab import canonical_note_marker, is_valid_sha, normalize_sha
 from .gitlab_client import PythonGitLabClient
 from .notifications import notifiers_from_operator
@@ -217,6 +217,16 @@ def _run_backup_store(args: argparse.Namespace) -> int:
         "snapshot_at": manifest["snapshot_at"],
         "plan_count": len(manifest["plans"]),
     }, sort_keys=True))
+    return 0
+
+
+def _run_verify_backup(args: argparse.Namespace) -> int:
+    try:
+        result = verify_backup(Path(args.bundle))
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        print(f"verify-backup failed: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(result, sort_keys=True))
     return 0
 
 
@@ -435,6 +445,8 @@ def main(argv: list[str] | None = None) -> int:
     backup.add_argument("--db", required=True)
     backup.add_argument("--plan-backup-dir", required=True)
     backup.add_argument("--output", required=True)
+    verify = subparsers.add_parser("verify-backup", help="verify a private recovery bundle")
+    verify.add_argument("--bundle", required=True)
     review_mr = subparsers.add_parser(
         "review-mr",
         help="idempotently enqueue the current head of one bound-Project Merge Request",
@@ -494,6 +506,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_ops_status(args)
     if args.command == "backup-store":
         return _run_backup_store(args)
+    if args.command == "verify-backup":
+        return _run_verify_backup(args)
     if args.command == "review-mr":
         return _run_review_mr(args)
     if args.command == "recover-autofix-relation":
