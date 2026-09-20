@@ -553,12 +553,13 @@ class SQLiteStore:
             plans = connection.execute(
                 """SELECT
                      SUM(CASE WHEN p.state IN ('needs_reconciliation', 'reconciling')
-                         OR (p.state = 'running' AND p.write_phase != 'preflight')
+                         OR (p.state = 'running' AND p.write_phase != 'preflight'
+                             AND (p.lease_until IS NULL OR p.lease_until <= ?))
                          THEN 1 ELSE 0 END) AS reconciliation,
                      SUM(CASE WHEN p.state = 'blocked' THEN 1 ELSE 0 END) AS blocked
                    FROM auto_fix_publication_plans p
                    JOIN review_runs r ON r.id = p.run_id WHERE r.project_id = ?""",
-                (project_id,),
+                (now_text, project_id),
             ).fetchone()
             notifications = connection.execute(
                 """SELECT
@@ -1832,9 +1833,12 @@ class SQLiteStore:
 
         note_item = None
         if note is not None:
+            note_uncertain = bool(note["write_uncertain"]) and note["state"] not in {
+                "published", "removed", "superseded"
+            }
             note_item = {
                 "request_id": note["id"], "state": note["state"],
-                "attempts": note["attempts"], "write_uncertain": bool(note["write_uncertain"]),
+                "attempts": note["attempts"], "write_uncertain": note_uncertain,
                 "external_note_id": note["external_note_id"],
                 "next_attempt_at": note["next_attempt_at"],
                 "lease_active": self._lease_active(note["lease_until"], now),
@@ -1845,7 +1849,9 @@ class SQLiteStore:
                 "error": self._redact(note["last_error"]) if note["last_error"] else None,
                 "next_action": (
                     "operator_check" if note["state"] == "blocked"
-                    else "wait_for_reconciliation" if note["write_uncertain"]
+                    else "wait_for_worker" if note["state"] == "running"
+                    and self._lease_active(note["lease_until"], now)
+                    else "wait_for_reconciliation" if note_uncertain
                     else "wait_for_worker" if note["state"] in {"pending", "running"}
                     else "none"
                 ),
@@ -1866,7 +1872,8 @@ class SQLiteStore:
                     "operator_check" if plan["state"] == "blocked"
                     else "wait_for_reconciliation" if plan["state"] in {
                         "needs_reconciliation", "reconciling"
-                    } or (plan["state"] == "running" and plan["write_phase"] != "preflight")
+                    } or (plan["state"] == "running" and plan["write_phase"] != "preflight"
+                          and not self._lease_active(plan["lease_until"], now))
                     else "wait_for_worker" if plan["state"] in {"frozen", "running"}
                     else "none"
                 ),

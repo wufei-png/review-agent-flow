@@ -109,6 +109,25 @@ def test_ops_status_counts_plan_reconciliation_block_and_relation_divergence(tmp
     relation = _published_relation(store)
     with sqlite3.connect(database) as connection:
         connection.execute(
+            "UPDATE auto_fix_publication_plans SET state = 'running', "
+            "write_phase = 'commit_write_started', lease_until = ? WHERE id = ?",
+            ("9999-01-01T00:00:00+00:00", relation.plan_id),
+        )
+    active = store.get_project_bound_review_run_status("42", relation.run_id)
+    assert active is not None
+    assert active["effects"]["auto_fix_plan"]["next_action"] == "wait_for_worker"
+    assert store.get_project_ops_status("42")["auto_fix"]["reconciliation"] == 0
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE auto_fix_publication_plans SET lease_until = ? WHERE id = ?",
+            ("2000-01-01T00:00:00+00:00", relation.plan_id),
+        )
+    expired = store.get_project_bound_review_run_status("42", relation.run_id)
+    assert expired is not None
+    assert expired["effects"]["auto_fix_plan"]["next_action"] == "wait_for_reconciliation"
+    assert store.get_project_ops_status("42")["auto_fix"]["reconciliation"] == 1
+    with sqlite3.connect(database) as connection:
+        connection.execute(
             "UPDATE auto_fix_publication_plans SET state = 'needs_reconciliation' "
             "WHERE id = ?", (relation.plan_id,),
         )

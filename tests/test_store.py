@@ -166,6 +166,34 @@ def test_project_ops_status_counts_only_bound_work_and_expired_leases(tmp_path) 
     assert token not in json.dumps(summary)
 
 
+def test_published_note_diagnostic_has_no_pending_reconciliation(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "review.db")
+    run = store.enqueue("42", 1, SHA)
+    claimed_run = store.claim_next(project_id="42")
+    assert claimed_run is not None
+    receipt = store.create_effect_receipt(
+        run.run_id, "note_expected", canonical_note_marker("42", 1, SHA)
+    )
+    note = store.create_note_publication_request(
+        run.run_id, receipt.receipt_id, "review", claimed_run.claim_token
+    )
+    assert note is not None
+    claimed_note = store.claim_note_publication(request_id=note.request_id)
+    assert claimed_note is not None
+    assert store.mark_note_write_uncertain(note.request_id, claimed_note.claim_token)
+    active = store.get_project_bound_review_run_status("42", run.run_id)
+    assert active is not None
+    assert active["effects"]["note"]["next_action"] == "wait_for_worker"
+    assert store.finish_note_publication(
+        note.request_id, claimed_note.claim_token, state="published", external_note_id=123
+    )
+    snapshot = store.get_project_bound_review_run_status("42", run.run_id)
+    assert snapshot is not None
+    assert snapshot["effects"]["note"]["state"] == "published"
+    assert snapshot["effects"]["note"]["write_uncertain"] is False
+    assert snapshot["effects"]["note"]["next_action"] == "none"
+
+
 def test_policy_snapshot_is_exact_and_immutable_per_run(tmp_path) -> None:
     store = SQLiteStore(tmp_path / "review.db")
     run = store.enqueue("42", 1, SHA)
