@@ -1,6 +1,6 @@
 # ReviewFlow 试运行准备执行队列
 
-状态：实施中；01–04 已完成本地实现与检查，05 的部署故障手册已完成，新 canary 已完成部分现场预检；真实 ReviewFlow canary 与试运行判定仍待专用凭据、入口及恢复证据。规划基线：2026-09-20，`f407d0b25583a9553cbac24741183e87457d1523`。每次实施先核对当前提交、工作区和实际代码；本文的基线不是跳过核对的理由。
+状态：实施中；01–04 已完成本地实现与检查，05 的故障手册、真实 OpenCode Luna 正向 canary、MR 写后恢复和隔离备份演练已有证据；commit 写后完整恢复未通过，试运行判定 no-go。仍待 TLS webhook、专用可续期 Provider 身份及实际通知可见性。规划基线：2026-09-20，`f407d0b25583a9553cbac24741183e87457d1523`。每次实施先核对当前提交、工作区和实际代码；本文的基线不是跳过核对的理由。
 
 ## 目标与契约
 
@@ -32,7 +32,7 @@ Agent 仍从冻结的目标分支 Skill 与 `AgentTaskV1` 获取任务，只向 
 | 02 | P1 | [终态保留与 Worker 所有权](02-retention-worker-ownership.md) | 01 完成；schema 切换前保存证据 | 本地完成；现场证据待 05 |
 | 03 | P1 | [Operator 诊断](03-operator-diagnostics.md) | 02 完成 | 本地完成；现场证据待 05 |
 | 04 | P1 | [一致性备份与恢复验证](04-backup-restore.md) | 02 完成；建议 03 完成以复用状态查询 | 本地完成；现场证据待 05 |
-| 05 | 发布门槛 | [部署与真实 canary](05-deployment-canary.md) | 01–04 完成；取得独立 canary 资源 | 阶段 1 完成；阶段 2 部分现场预检完成，真实 Run 与恢复待验证；未作 go/no-go 判定 |
+| 05 | 发布门槛 | [部署与真实 canary](05-deployment-canary.md) | 01–04 完成；取得独立 canary 资源 | 阶段 1 完成；阶段 2 正向 Run、MR 写后恢复和隔离备份已验证，commit 写后只能安全阻断；no-go，验收未完成 |
 
 每项任务由一个新会话完成，并依照该任务的阶段顺序用 `implement-in-stages` 逐阶段验证、本地提交。每个阶段都须留下有效仓库状态；提交前只暂存该阶段文件并检查 staged diff。完成一个会话后更新本队列及对应计划的状态、提交与检查结果。若代码事实推翻计划，只调整未开始的阶段，并记录理由。不要把本地测试、模拟 GitLab 或配置检查记成真实平台验收。
 
@@ -56,3 +56,5 @@ Agent 仍从冻结的目标分支 Skill 与 `AgentTaskV1` 获取任务，只向 
 - 本地最终 `.venv/bin/python -m pytest` 417 passed，1 条 Starlette/httpx 弃用警告；期间一次复检为 416 passed、1 failed，定位为已有 Worker 失租测试只接受顶层异常文本，改为检查顶层及链式根因后定向连跑 5 次和全量复跑通过。OpenCode `1.18.11` 在本机的 runtime-isolation 定向测试为 1 passed；CLI/部署定向测试 19 passed，`.venv/bin/ruff check .`、compileall、CLI `--help`、相对 Markdown 链接检查、staged `git diff --check` 通过。当前主机为 macOS，未运行 `systemd-analyze verify` 或 Linux 服务演练。虽本机有 JiHuLab CLI 登录与模型凭据，独立 canary Project、新通知 webhook/人工收件人、Linux systemd 主机和隔离恢复环境尚未确认；没有新的 exact-SHA 远端 Note、commit/MR、Relation、通知或恢复收据。旧 A1 证据不计入 05 验收。
 - 2026-09-21，05 阶段 2 部分预检：新增仅吴非的 `feishu_dm`、通道重绑防外发、私有 Project/MR 与专用 Review Bot；主机完成 systemd unit 验证、OpenCode isolation、精确 SHA fetch、API readiness 与跨 Unix 身份 Store 写入。提交 `3c68159`、`394579b`、`6d56bb8`、`647a475`、`ce20858`、`f8c99f9`；其中 `6d56bb8` 在 Bus error 现场探测后由 `ce20858` 撤回。独立只读 review 的另一项 P1（同 ID 私信改绑其他 open ID）由 `f8c99f9` 修复并定向复测，复审无新增发现。单次 owner-only lark-cli 私信仅有服务端接受，未确认可见。当前 Worker 模型 key 无效，飞书 app 凭据缺失；两服务已停止且未启用。逐项收据、现场失败与未验证项见[新 canary 证据](../evidence/jihulab-opencode-canary-2026-09-21.md)。真实 ReviewFlow Run、外部写和完整恢复仍未执行，未作 go/no-go 判定。
 - 本轮本地全量 `.venv/bin/python -m pytest` 424 passed、1 条 Starlette/httpx 弃用警告；通知定向测试 20 passed；`.venv/bin/ruff check .`、`.venv/bin/python -m compileall -q src tests`、`git diff --check` 通过。`systemd-analyze verify` 在主机退出码为 0，systemd 245 提示两项 sandbox 指令未生效；仅属 unit 语法检查，未计为完整运行或发布验收。
+- 2026-09-21，05 阶段 2 现场推进：`52ad655`（Worker 私有 OpenCode OAuth 启动器）、`c1b8b8a`（保留内置 OAuth 插件）；主机 Worker 身份 OpenCode `openai/gpt-5.6-luna` 探针返回 `OK`。Run `1` 完成 Note `9207699`、Auto-fix commit `85fcd9c9640de3e4dc90a0a0d68eb4b4eb49d327`、子 MR `!2`、Relation `1`、飞书 owner-only outbox 服务端接受；重复入队和 Worker 重启无重复效果。Run `4` 在子 MR 写后退出 `137`，正常 Worker 对账 `!3` 并只生成一次 Relation/通知请求。Run `3` 在 commit 写后退出 `137`，远端唯一 commit 与 Plan 一致且未重写，但因 SHA 未持久化被安全阻断；备份后审计式 abandon，未完成发布。真实 Store bundle 和隔离副本上的含 canonical Plan bundle 均通过隔离恢复；原 Store 的 API/Worker 重启健康。详见[本计划](05-deployment-canary.md)与[现场收据](../evidence/jihulab-opencode-canary-2026-09-21.md)。
+- 最终本地全量 `.venv/bin/python -m pytest` 427 passed、1 条 Starlette/httpx 弃用警告；OpenCode 定向 4 passed；Ruff、compileall、`git diff --check` 通过。仅吴非的 lark-cli 测试私信已获人工可见确认；ReviewFlow outbox 的可见性仍待确认。当前使用可用的个人 OpenCode OAuth 副本，不是专用可续期 Provider 身份；TLS webhook 和 commit 写后继续完成发布亦未通过。05 保持未完成，试运行 no-go，两个 systemd 服务已停止并 disabled。

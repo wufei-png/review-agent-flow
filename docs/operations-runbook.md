@@ -16,6 +16,15 @@ storage; the evidence document contains only redacted identities and digests.
   Keep its token in `worker.env` only. Confirm a healthy OpenCode executable,
   selected model and Operator-approved provider credential under the Worker
   identity. The Agent must not receive the GitLab token or notification URL.
+- For an OpenCode OAuth canary, install the `review-agent-flow-opencode` entry
+  point and use it as the Operator Backend command. Put only the selected
+  provider's OAuth record in a Worker-owned mode-`0600` JSON file beneath a
+  private Worker directory. Set `OPENCODE_AUTH_SOURCE` in `worker.env` and
+  allowlist only that variable in the Backend profile. The entry point copies
+  the record to the private Run directory and retains OpenCode's built-in OAuth
+  plugin; `--pure` still excludes external plugins. Refreshes in a Run copy do
+  not update the stable source, so renew it before expiry. Prefer a dedicated
+  renewable Provider identity for a pilot.
 - Prepare an authorized notification transport, an Operator channel binding and a
   canary recipient who will separately confirm visibility. For an owner-only
   Feishu canary, use `feishu_dm` with `recipient_username` bound to the parent
@@ -159,6 +168,13 @@ Neither command removes a remote effect. A busy or unresolved Plan needs
 escalation, not repeated rearm. These commands run as the Worker service user,
 so record the human Operator and incident reference in the reason and private
 operations log alongside the CLI audit.
+
+If a commit exists remotely but the process died before persisting
+`branch_commit_sha`, the current reconciler does not promote that remote branch
+to a confirmed local commit. Rearming alone cannot complete that window.
+Preserve the branch and Store evidence, and do not replay the commit. An
+audited abandon is a safe stop when publication cannot be completed; it does
+not satisfy the post-commit recovery acceptance gate.
 
 For notification `pending` or `running`, inspect the outbox state and provider
 response before restart; a crash after provider acceptance may send the same
