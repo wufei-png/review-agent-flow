@@ -1,3 +1,5 @@
+import sqlite3
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -99,6 +101,32 @@ def test_project_status_exposes_published_plan_and_relation_without_private_payl
     assert snapshot["effects"]["auto_fix_relation"]["auto_fix_mr_iid"] == 9
     assert snapshot["effects"]["auto_fix_relation"]["next_action"] == "none"
     assert store.get_project_bound_review_run_status("99", relation.run_id) is None
+
+
+def test_ops_status_counts_plan_reconciliation_block_and_relation_divergence(tmp_path) -> None:
+    database = tmp_path / "review.db"
+    store = SQLiteStore(database)
+    relation = _published_relation(store)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE auto_fix_publication_plans SET state = 'needs_reconciliation' "
+            "WHERE id = ?", (relation.plan_id,),
+        )
+        connection.execute(
+            "UPDATE auto_fix_relations SET divergence = 'source_branch' WHERE id = ?",
+            (relation.relation_id,),
+        )
+    summary = store.get_project_ops_status("42")
+    assert summary["auto_fix"]["reconciliation"] == 1
+    assert summary["auto_fix"]["relation_divergence"] == 1
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE auto_fix_publication_plans SET state = 'blocked' WHERE id = ?",
+            (relation.plan_id,),
+        )
+    summary = store.get_project_ops_status("42")
+    assert summary["auto_fix"]["blocked"] == 1
+    assert summary["auto_fix"]["reconciliation"] == 0
 
 
 def test_webhook_configuration_is_required(tmp_path) -> None:

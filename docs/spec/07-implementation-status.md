@@ -8,6 +8,8 @@ Policy v4, Operator configuration v4, kind-free ReviewKey storage, strict extern
 
 Project-bound Run status now includes read-only Note, Auto-fix Plan/Relation and notification delivery diagnostics with bounded action hints. These are Store observations, not live external verification.
 
+The local `ops-status` CLI reads Project queue and effect counts, plus deployment-wide Worker ownership and the last persisted purge time. The overall retention sweep result is unavailable because no complete sweep outcome is persisted.
+
 Implemented foundations that remain useful include exact-SHA worktrees, bound-Project webhook validation, SQLite claims/leases, notification outbox primitives, GitLab event normalization, Pipeline Gate, provider protocols and Feishu/WeCom adapters. Webhook transport/authentication is separated from the project-bound decision applier, and Worker polling delegates publication, idle reconciliation and completed-effect publication to focused seams without changing their scheduling order. Their contracts may still change while adopting the target model.
 
 ## Historical evidence

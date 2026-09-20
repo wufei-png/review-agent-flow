@@ -231,6 +231,24 @@ def test_status_does_not_create_missing_database(tmp_path: Path, capsys) -> None
     assert not database.exists()
 
 
+def test_ops_status_uses_read_only_database_and_reports_missing_database(tmp_path: Path, capsys) -> None:
+    database = tmp_path / "review.db"
+    args = ["ops-status", "--project-id", "42", "--db", str(database)]
+    assert cli.main(args) == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "unavailable", "reason": "database_missing"
+    }
+    assert not database.exists()
+    from review_agent_flow.store import SQLiteStore
+
+    SQLiteStore(database).enqueue("42", 1, "a" * 40)
+    assert cli.main(args) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["project_id"] == "42"
+    assert result["runs"]["pending"] == 1
+    assert result["retention"]["last_sweep_result"] == "unavailable"
+
+
 def test_review_mr_is_project_bound_and_idempotent(monkeypatch, tmp_path: Path, capsys) -> None:
     sha = "a" * 40
     merge_request = MergeRequest(

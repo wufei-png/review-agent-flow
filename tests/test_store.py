@@ -106,6 +106,66 @@ def test_project_bound_status_explains_effects_without_claims_or_payloads(tmp_pa
         assert secret not in encoded
 
 
+def test_project_ops_status_counts_only_bound_work_and_expired_leases(tmp_path) -> None:
+    database = tmp_path / "review.db"
+    store = SQLiteStore(database)
+    empty = store.get_project_ops_status("42")
+    assert empty["runs"]["pending"] == 0
+    assert empty["notifications"]["oldest_pending_age_seconds"] is None
+    assert empty["worker"]["state"] == "absent"
+    assert empty["retention"]["last_sweep_result"] == "unavailable"
+
+    running = store.enqueue("42", 1, SHA)
+    store.enqueue("42", 2, OLD_SHA)
+    store.enqueue("99", 3, NEW_SHA)
+    claimed = store.claim_next(project_id="42")
+    assert claimed is not None
+    receipt = store.create_effect_receipt(
+        running.run_id, "note_expected", canonical_note_marker("42", 1, SHA)
+    )
+    note = store.create_note_publication_request(
+        running.run_id, receipt.receipt_id, "review", claimed.claim_token
+    )
+    assert note is not None
+    store.enqueue_notifications(
+        f"review-run:{running.run_id}:human", "title", "body", None,
+        (), (("reviewers", "feishu"),),
+    )
+    store.enqueue_notifications(
+        "review-run:3:human", "foreign title", "foreign body", None,
+        (), (("foreign", "feishu"),),
+    )
+    token = store.acquire_worker_lease("worker-1", 60)
+    assert token is not None
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE review_runs SET lease_until = ? WHERE id = ?",
+            ("2000-01-01T00:00:00+00:00", running.run_id),
+        )
+        connection.execute(
+            "UPDATE note_publication_requests SET state = 'blocked', write_uncertain = 1 "
+            "WHERE id = ?", (note.request_id,),
+        )
+        connection.execute(
+            "UPDATE notification_outbox SET status = 'failed' WHERE correlation_id = ?",
+            (f"review-run:{running.run_id}:human",),
+        )
+        connection.execute(
+            "UPDATE worker_runtime_lease SET lease_until = ?",
+            ("2000-01-01T00:00:00+00:00",),
+        )
+    summary = store.get_project_ops_status("42")
+    assert summary["worker"]["state"] == "expired"
+    assert summary["runs"]["pending"] == 1
+    assert summary["runs"]["running"] == 1
+    assert summary["runs"]["expired_leases"] == 1
+    assert summary["runs"]["oldest_pending_age_seconds"] is not None
+    assert summary["notes"] == {"blocked": 1, "uncertain": 1}
+    assert summary["notifications"]["failed"] == 1
+    assert summary["notifications"]["pending"] == 0
+    assert token not in json.dumps(summary)
+
+
 def test_policy_snapshot_is_exact_and_immutable_per_run(tmp_path) -> None:
     store = SQLiteStore(tmp_path / "review.db")
     run = store.enqueue("42", 1, SHA)

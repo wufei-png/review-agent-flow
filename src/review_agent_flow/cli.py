@@ -187,6 +187,19 @@ def _run_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_ops_status(args: argparse.Namespace) -> int:
+    """Print local Store aggregates without contacting providers or claiming work."""
+    project_id = _required(args.project_id, "REVIEW_AGENT_FLOW_PROJECT_ID")
+    database = args.db or os.getenv("REVIEW_AGENT_FLOW_DB", "review-agent-flow.sqlite3")
+    try:
+        store = SQLiteStore(database, read_only=True)
+    except FileNotFoundError:
+        print(json.dumps({"status": "unavailable", "reason": "database_missing"}, sort_keys=True))
+        return 1
+    print(json.dumps(store.get_project_ops_status(project_id), sort_keys=True))
+    return 0
+
+
 def _run_review_mr(args: argparse.Namespace) -> int:
     """Idempotently enqueue the current head of one bound-Project Merge Request."""
 
@@ -395,6 +408,9 @@ def main(argv: list[str] | None = None) -> int:
     status.add_argument("--run-id", type=int, required=True)
     status.add_argument("--project-id")
     status.add_argument("--db")
+    ops_status = subparsers.add_parser("ops-status", help="query local Project operations summary")
+    ops_status.add_argument("--project-id")
+    ops_status.add_argument("--db")
     review_mr = subparsers.add_parser(
         "review-mr",
         help="idempotently enqueue the current head of one bound-Project Merge Request",
@@ -450,6 +466,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_api(args)
     if args.command == "status":
         return _run_status(args)
+    if args.command == "ops-status":
+        return _run_ops_status(args)
     if args.command == "review-mr":
         return _run_review_mr(args)
     if args.command == "recover-autofix-relation":

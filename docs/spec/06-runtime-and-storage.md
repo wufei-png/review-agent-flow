@@ -64,6 +64,8 @@ Note, Auto-fix and notification state is independent from process success. Reque
 
 The Project-bound Run status query reads persisted Note request, Auto-fix Plan and Relation, and notification delivery facts without claiming work or contacting GitLab. It exposes only selected identity, state, attempt, schedule, lease-validity and redacted diagnostic fields. Its finite `next_action` values are hints to wait for the Worker, wait for reconciliation of an uncertain write, or inspect a blocked/divergent effect. Notification `delivered` is labeled server acceptance with possible duplicates; the query never asserts recipient visibility.
 
+The local `ops-status` CLI opens SQLite read-only and reports bound-Project Run backlog, oldest pending age, expired Run leases, Note blocked/uncertain counts, Auto-fix reconciliation/blocked counts, notification pending/running/failed counts and oldest pending age, and Relation divergence. The singleton Worker owner/heartbeat/expiry and last persisted retention purge are deployment-wide facts. A purge receipt proves only that the purge transaction completed; the overall last sweep result, including Plan backup work or failed attempts, is unavailable without a durable source. An absent database is unavailable rather than an empty healthy queue.
+
 ## Fresh SQLite schema
 
 The pre-release implementation uses schema 17 and performs a hard cutover to a fresh database; schema 16 is rejected, not migrated. It does not read legacy ReviewRun kinds, Run-ID markers or Agent-owned publication state. The schema retains at least:

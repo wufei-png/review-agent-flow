@@ -513,6 +513,117 @@ class SQLiteStore:
             ).fetchone()
         return dict(row) if row is not None else None
 
+    @staticmethod
+    def _age_seconds(created_at: str | None, now: datetime) -> int | None:
+        if created_at is None:
+            return None
+        return max(0, int((now - datetime.fromisoformat(created_at)).total_seconds()))
+
+    def get_project_ops_status(self, project_id: str) -> dict[str, object]:
+        """Read bounded, project-scoped operational aggregates without claiming work."""
+        if not project_id or not project_id.strip():
+            raise ValueError("project_id cannot be empty")
+        now = self._now()
+        now_text = now.isoformat()
+        with self._connect() as connection:
+            worker = connection.execute(
+                "SELECT owner_id, heartbeat_at, lease_until FROM worker_runtime_lease "
+                "WHERE singleton_id = 1"
+            ).fetchone()
+            runs = connection.execute(
+                """SELECT
+                     SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending,
+                     SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END) AS running,
+                     MIN(CASE WHEN status = 'pending' THEN created_at END) AS oldest_pending,
+                     SUM(CASE WHEN status = 'running' AND
+                         (lease_until IS NULL OR lease_until <= ?) THEN 1 ELSE 0 END)
+                         AS expired_leases
+                   FROM review_runs WHERE project_id = ?""",
+                (now_text, project_id),
+            ).fetchone()
+            notes = connection.execute(
+                """SELECT
+                     SUM(CASE WHEN n.state = 'blocked' THEN 1 ELSE 0 END) AS blocked,
+                     SUM(CASE WHEN n.write_uncertain = 1 AND n.state NOT IN
+                         ('published', 'removed', 'superseded') THEN 1 ELSE 0 END) AS uncertain
+                   FROM note_publication_requests n
+                   JOIN review_runs r ON r.id = n.run_id WHERE r.project_id = ?""",
+                (project_id,),
+            ).fetchone()
+            plans = connection.execute(
+                """SELECT
+                     SUM(CASE WHEN p.state IN ('needs_reconciliation', 'reconciling')
+                         OR (p.state = 'running' AND p.write_phase != 'preflight')
+                         THEN 1 ELSE 0 END) AS reconciliation,
+                     SUM(CASE WHEN p.state = 'blocked' THEN 1 ELSE 0 END) AS blocked
+                   FROM auto_fix_publication_plans p
+                   JOIN review_runs r ON r.id = p.run_id WHERE r.project_id = ?""",
+                (project_id,),
+            ).fetchone()
+            notifications = connection.execute(
+                """SELECT
+                     SUM(CASE WHEN o.status = 'pending' THEN 1 ELSE 0 END) AS pending,
+                     SUM(CASE WHEN o.status = 'running' THEN 1 ELSE 0 END) AS running,
+                     SUM(CASE WHEN o.status = 'failed' THEN 1 ELSE 0 END) AS failed,
+                     MIN(CASE WHEN o.status = 'pending' THEN o.created_at END)
+                         AS oldest_pending
+                   FROM notification_outbox o
+                   LEFT JOIN notification_requests n ON n.correlation_id = o.correlation_id
+                   LEFT JOIN auto_fix_relations a ON a.id = n.relation_id
+                   LEFT JOIN review_runs r ON r.id = a.run_id
+                   WHERE o.correlation_id IN (
+                       SELECT 'review-run:' || id || ':human' FROM review_runs
+                       WHERE project_id = ?
+                   ) OR r.project_id = ?""",
+                (project_id, project_id),
+            ).fetchone()
+            divergence = connection.execute(
+                """SELECT COUNT(*) FROM auto_fix_relations a
+                   JOIN review_runs r ON r.id = a.run_id
+                   WHERE r.project_id = ? AND a.divergence IS NOT NULL""",
+                (project_id,),
+            ).fetchone()[0]
+            purge = connection.execute(
+                "SELECT created_at FROM sensitive_payload_purges ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        return {
+            "project_id": project_id,
+            "observed_at": now_text,
+            "worker": {
+                "scope": "deployment",
+                "state": "absent" if worker is None else
+                "active" if worker["lease_until"] > now_text else "expired",
+                "owner_id": worker["owner_id"] if worker is not None else None,
+                "heartbeat_at": worker["heartbeat_at"] if worker is not None else None,
+                "lease_until": worker["lease_until"] if worker is not None else None,
+            },
+            "runs": {
+                "pending": runs["pending"] or 0,
+                "running": runs["running"] or 0,
+                "oldest_pending_age_seconds": self._age_seconds(runs["oldest_pending"], now),
+                "expired_leases": runs["expired_leases"] or 0,
+            },
+            "notes": {"blocked": notes["blocked"] or 0, "uncertain": notes["uncertain"] or 0},
+            "auto_fix": {
+                "reconciliation": plans["reconciliation"] or 0,
+                "blocked": plans["blocked"] or 0,
+                "relation_divergence": divergence,
+            },
+            "notifications": {
+                "pending": notifications["pending"] or 0,
+                "running": notifications["running"] or 0,
+                "failed": notifications["failed"] or 0,
+                "oldest_pending_age_seconds": self._age_seconds(
+                    notifications["oldest_pending"], now
+                ),
+            },
+            "retention": {
+                "scope": "deployment",
+                "last_purge_at": purge["created_at"] if purge is not None else None,
+                "last_sweep_result": "unavailable",
+            },
+        }
+
     def _initialize(self) -> None:
         with self._connect() as connection:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])

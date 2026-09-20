@@ -81,6 +81,9 @@ probe is explicit and separate from the default readiness gate.
 status, attempts, redacted failures, effect-receipt summaries and safe
 diagnostics, but never lease claim tokens, GitLab tokens or notification
 credentials. Unknown or out-of-bound Runs return the same not-found response.
+The local `ops-status` summary reads the bound Project's backlog and effect
+counts plus the deployment-wide Worker lease and last recorded retention purge.
+Missing retention sweep results are reported as unavailable.
 The HTTP status routes and explicit live-probe route require
 `X-ReviewFlow-Internal-Token` equal to the configured `GITLAB_WEBHOOK_SECRET`;
 missing or incorrect tokens fail with `401` before Store or provider access.
