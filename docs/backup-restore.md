@@ -10,7 +10,8 @@ canonical Publication Plans. Do not put a bundle or its manifest in Git.
 Run as the Worker identity. Create an empty, Worker-owned mode-`0700` output
 parent on the protected backup medium. The `--db` value is the active Store;
 `--plan-backup-dir` is the exact Operator-configured Plan directory. The output
-name must not already exist.
+name must not already exist. Before the first Plan backup receipt, that Plan
+directory may not exist; an empty-receipt bundle still contains the Store.
 
 ```bash
 review-agent-flow backup-store \
