@@ -43,6 +43,9 @@ sudo install -d -o root -g reviewflow-shared -m 2770 \
   /var/lib/review-agent-flow/shared
 sudo install -d -o reviewflow-worker -g reviewflow-shared -m 0700 \
   /var/lib/review-agent-flow-worker
+sudo test ! -e /var/lib/review-agent-flow/shared/review-agent-flow.sqlite3 && \
+  sudo install -o reviewflow-api -g reviewflow-shared -m 0660 /dev/null \
+    /var/lib/review-agent-flow/shared/review-agent-flow.sqlite3
 ```
 
 Set the Worker account home to its private state directory even with
@@ -50,13 +53,14 @@ Set the Worker account home to its private state directory even with
 variables for runtime state. A synthetic `/home/reviewflow-worker` home can
 make it fail before ReviewFlow's isolated invocation starts.
 
-Both units set `UMask=0007`. The shared directory is setgid and group-writable;
-the Store keeps a connection open and adds group write to its own database,
-WAL and shared-memory files before the other identity starts. SQLite's default
-file mode alone does not grant group write, even with this umask. Start the API
-and verify `/readyz` before the Worker on a fresh Store; a wrong file group or
-missing group write causes Store startup to fail instead of silently running
-with one service unable to write.
+The final `install` command is for a fresh Store only and refuses to overwrite
+an existing database. Preserve an existing Store through the backup and restore
+procedure below; do not copy a live WAL database or truncate it. Both units set
+`UMask=0007`, and the pre-created database is group-writable, so SQLite can
+create its WAL and shared-memory files with group write access for both
+identities. The setgid shared directory keeps all three files in
+`reviewflow-shared`. Verify their owner, group and modes under the actual
+service identities. Start the API and verify `/readyz` before the Worker.
 This release uses fresh SQLite schema 17 and rejects schema 16. Before a
 pre-production cutover, retain the old canary evidence and a consistent
 database snapshot; start the new deployment with a fresh database only after
@@ -71,8 +75,8 @@ run `systemd-analyze verify` on both installed service files as shown in the
 sudo systemctl daemon-reload
 sudo systemctl enable --now review-agent-flow-api
 curl --fail --silent --show-error --retry 10 --retry-delay 1 \
-  --retry-connrefused http://127.0.0.1:8000/readyz
-sudo systemctl enable --now review-agent-flow-worker
+  --retry-connrefused http://127.0.0.1:8000/readyz && \
+  sudo systemctl enable --now review-agent-flow-worker
 sudo systemctl status review-agent-flow-api review-agent-flow-worker
 ```
 

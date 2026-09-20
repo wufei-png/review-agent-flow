@@ -45,8 +45,8 @@ storage; the evidence document contains only redacted identities and digests.
 sudo systemctl daemon-reload
 sudo systemctl enable --now review-agent-flow-api
 curl --fail --silent --show-error --retry 10 --retry-delay 1 \
-  --retry-connrefused http://127.0.0.1:8000/readyz
-sudo systemctl enable --now review-agent-flow-worker
+  --retry-connrefused http://127.0.0.1:8000/readyz && \
+  sudo systemctl enable --now review-agent-flow-worker
 sudo systemctl status review-agent-flow-api review-agent-flow-worker
 curl --fail --silent http://127.0.0.1:8000/healthz
 curl --fail --silent http://127.0.0.1:8000/readyz
