@@ -185,7 +185,15 @@ class NotificationDispatcher:
                 correlation_id=delivery.correlation_id,
             )
             try:
-                result = self.notifier.notify_channel(event, delivery.channel_id)
+                current_channel = dict(self.notifier.channel_specs()).get(delivery.channel_id)
+                if current_channel != delivery.channel:
+                    result = NotificationResult(
+                        delivery.channel_id,
+                        False,
+                        "notification channel type changed since enqueue",
+                    )
+                else:
+                    result = self.notifier.notify_channel(event, delivery.channel_id)
             except Exception as exc:  # noqa: BLE001 - isolate one channel failure
                 result = NotificationResult(delivery.channel_id, False, str(exc))
             try:

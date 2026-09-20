@@ -63,6 +63,32 @@ def test_enqueue_is_async_and_dispatcher_retries(tmp_path) -> None:
     assert notifier.calls == ["reviewers", "reviewers"]
 
 
+def test_queued_direct_message_cannot_be_rebound_to_group_webhook(tmp_path, monkeypatch) -> None:
+    store = SQLiteStore(tmp_path / "review.db")
+    direct = notifiers_from_operator(
+        (
+            ResolvedNotificationChannel(
+                "owner", "feishu_dm", None, {}, "cli_app", "private-secret", "ou_owner", "wufei-png"
+            ),
+        )
+    )
+    delivery = NotificationDispatcher(store, direct).enqueue(
+        NotificationEvent("Review", "Private body", recipients=("wufei-png",))
+    )[0]
+    webhook = notifiers_from_operator(
+        (ResolvedNotificationChannel("owner", "feishu", "https://hooks.example.invalid/group", {}),)
+    )
+    calls = []
+    monkeypatch.setattr(webhook.notifiers[0], "notify", lambda event: calls.append(event))
+
+    assert NotificationDispatcher(store, webhook, max_attempts=1).process() == 1
+
+    assert calls == []
+    recorded = store.get_notification_delivery(delivery.delivery_id)
+    assert recorded.status == "failed"
+    assert "channel type changed" in recorded.last_error
+
+
 def test_stale_completion_is_not_logged_as_delivered(tmp_path, monkeypatch, caplog) -> None:
     store = SQLiteStore(tmp_path / "review.db")
     notifier = RecordingNotifier()

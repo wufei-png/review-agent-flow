@@ -462,7 +462,10 @@ def resolve_notification_channels(
                 f"notification channel {channel_id} does not allow Project {project_id}"
             )
         if channel.channel_type == "feishu_dm":
-            assert channel.app_id_env and channel.app_secret_env and channel.recipient_open_id_env
+            if not all((channel.app_id_env, channel.app_secret_env, channel.recipient_open_id_env)):
+                raise OperatorConfigError(
+                    f"notification channel {channel_id} is missing a credential binding"
+                )
             app_id = source.get(channel.app_id_env)
             app_secret = source.get(channel.app_secret_env)
             recipient_open_id = source.get(channel.recipient_open_id_env)

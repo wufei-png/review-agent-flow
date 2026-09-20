@@ -34,9 +34,9 @@ Create the identities and state boundaries before starting either unit:
 ```bash
 sudo groupadd --system reviewflow-shared
 sudo useradd --system --no-create-home --shell /usr/sbin/nologin \
-  --gid reviewflow-shared reviewflow-api
+  --gid reviewflow-shared --home-dir /var/lib/review-agent-flow/shared reviewflow-api
 sudo useradd --system --no-create-home --shell /usr/sbin/nologin \
-  --gid reviewflow-shared reviewflow-worker
+  --gid reviewflow-shared --home-dir /var/lib/review-agent-flow-worker reviewflow-worker
 sudo install -d -o root -g reviewflow-shared -m 0750 \
   /etc/review-agent-flow
 sudo install -d -o root -g reviewflow-shared -m 2770 \
@@ -44,6 +44,11 @@ sudo install -d -o root -g reviewflow-shared -m 2770 \
 sudo install -d -o reviewflow-worker -g reviewflow-shared -m 0700 \
   /var/lib/review-agent-flow-worker
 ```
+
+Set the Worker account home to its private state directory even with
+`--no-create-home`. OpenCode consults the passwd home as well as environment
+variables for runtime state. A synthetic `/home/reviewflow-worker` home can
+make it fail before ReviewFlow's isolated invocation starts.
 
 Both units set `UMask=0007`, so SQLite database, WAL and shared-memory files
 remain group-writable without becoming world-readable.
