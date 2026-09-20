@@ -15,6 +15,7 @@ from review_agent_flow.gitlab import (
     MergeRequest,
     canonical_note_marker,
 )
+from review_agent_flow.notification_dispatcher import NotificationDispatcher
 from review_agent_flow.notifications import FanoutNotifier, NotificationEvent, NotificationResult
 from review_agent_flow.operator_config import AutoFixPublicationConfig
 from review_agent_flow.policy import NotificationPolicy, ReviewPolicy, policy_json
@@ -249,13 +250,15 @@ def _frozen_plan(
     return store, run.run_id, plan.plan_id, branch
 
 
-def _publisher(store: SQLiteStore, gitlab: FakeGitLab) -> AutoFixPublisher:
+def _publisher(
+    store: SQLiteStore, gitlab: FakeGitLab, notifier: FanoutNotifier | None = None
+) -> AutoFixPublisher:
     return AutoFixPublisher(
         store,
         gitlab,
         "42",
         AutoFixPublicationConfig(True, frozenset({"42"}), "draft", "manual"),
-        FanoutNotifier((Channel(),)),
+        notifier or FanoutNotifier((Channel(),)),
         retry_delay_seconds=0,
     )
 
@@ -309,6 +312,46 @@ def test_publisher_uses_exact_commit_contract_and_atomically_requests_notificati
         assert connection.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0] == 1
     receipt = store.list_effect_receipts(run_id, "autofix_plan")[0]
     assert receipt.state == "published"
+
+
+def test_published_autofix_notifications_are_claimable_once_per_channel(tmp_path: Path) -> None:
+    store, _run_id, plan_id, _branch = _frozen_plan(
+        tmp_path, policy_channels=("autofix-alerts", "backup-alerts")
+    )
+    gitlab = FakeGitLab(
+        MergeRequest("42", 1, "Parent", "alice", "feature", "main", SHA, "https://parent")
+    )
+    calls: list[str] = []
+
+    class RecordingChannel:
+        def __init__(self, channel_id: str, channel: str) -> None:
+            self.channel_id = channel_id
+            self.channel = channel
+
+        def notify(self, event: NotificationEvent) -> NotificationResult:
+            assert event.recipients == ("alice",)
+            calls.append(self.channel_id)
+            return NotificationResult(self.channel_id, True)
+
+    notifier = FanoutNotifier(
+        (RecordingChannel("autofix-alerts", "feishu"), RecordingChannel("backup-alerts", "wecom"))
+    )
+    publisher = _publisher(store, gitlab, notifier)
+    assert publisher.process(plan_id=plan_id) is not None
+    assert publisher.process(plan_id=plan_id) is None
+
+    with sqlite3.connect(tmp_path / "review.db") as connection:
+        rows = connection.execute(
+            "SELECT channel_id, next_attempt_at, created_at FROM notification_outbox ORDER BY id"
+        ).fetchall()
+        assert [row[0] for row in rows] == ["autofix-alerts", "backup-alerts"]
+        assert all(row[1] == row[2] and row[1] is not None for row in rows)
+        assert connection.execute("SELECT COUNT(*) FROM notification_requests").fetchone()[0] == 1
+
+    dispatcher = NotificationDispatcher(store, notifier)
+    assert dispatcher.process(limit=2) == 2
+    assert calls == ["autofix-alerts", "backup-alerts"]
+    assert dispatcher.process(limit=2) == 0
 
 
 def test_lost_lease_before_commit_prevents_external_write(

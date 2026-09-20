@@ -3878,8 +3878,8 @@ class SQLiteStore:
                     """
                     INSERT INTO notification_outbox(
                         correlation_id, channel_id, channel, title, body, url,
-                        recipients_json, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        recipients_json, next_attempt_at, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(correlation_id, channel_id) DO NOTHING
                     """,
                     (
@@ -3890,6 +3890,7 @@ class SQLiteStore:
                         body,
                         url,
                         recipients_json,
+                        now,
                         now,
                     ),
                 )
@@ -4787,8 +4788,8 @@ class SQLiteStore:
                     """
                     INSERT INTO notification_outbox(
                         correlation_id, channel_id, channel, title, body, url,
-                        recipients_json, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        recipients_json, next_attempt_at, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         correlation_id,
@@ -4798,6 +4799,7 @@ class SQLiteStore:
                         body,
                         url,
                         recipients_json,
+                        now,
                         now,
                     ),
                 )

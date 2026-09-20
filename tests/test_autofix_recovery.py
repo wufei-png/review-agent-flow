@@ -18,6 +18,8 @@ from review_agent_flow.gitlab import (
     RepositoryAction,
     RepositoryCommitObservation,
 )
+from review_agent_flow.notification_dispatcher import NotificationDispatcher
+from review_agent_flow.notifications import FanoutNotifier, NotificationEvent, NotificationResult
 from review_agent_flow.store import SQLiteStore
 
 PARENT_SHA = "a" * 40
@@ -242,24 +244,25 @@ def test_notification_resend_is_separate_immutable_generation_and_idempotent(
     gitlab = FakeRecoveryGitLab()
     relation = _recover(store, gitlab)
     service = AutoFixRecoveryService(store, gitlab, "review-bot")
+    channels = (("alerts", "feishu"), ("backup", "wecom"))
 
     first = service.resend_notification(
         context=_context("resend-1"),
         project_id="42",
         child_mr_iid=9,
-        channels=(("alerts", "feishu"),),
+        channels=channels,
     )
     repeated = service.resend_notification(
         context=_context("resend-1"),
         project_id="42",
         child_mr_iid=9,
-        channels=(("alerts", "feishu"),),
+        channels=channels,
     )
     second = service.resend_notification(
         context=_context("resend-2"),
         project_id="42",
         child_mr_iid=9,
-        channels=(("alerts", "feishu"),),
+        channels=channels,
     )
 
     assert first.request_id == repeated.request_id
@@ -269,7 +272,43 @@ def test_notification_resend_is_separate_immutable_generation_and_idempotent(
     assert store.get_auto_fix_notification_request(relation.relation_id, 2) == second
     with sqlite3.connect(tmp_path / "review.db") as connection:
         assert connection.execute("SELECT COUNT(*) FROM notification_requests").fetchone()[0] == 2
-        assert connection.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0] == 2
+        rows = connection.execute(
+            "SELECT correlation_id, channel_id, next_attempt_at, created_at "
+            "FROM notification_outbox ORDER BY id"
+        ).fetchall()
+        assert len(rows) == 4
+        assert [row[1] for row in rows] == ["alerts", "backup", "alerts", "backup"]
+        assert all(row[2] == row[3] and row[2] is not None for row in rows)
+        assert [row[0] for row in rows] == [
+            first.correlation_id,
+            first.correlation_id,
+            second.correlation_id,
+            second.correlation_id,
+        ]
+
+    calls: list[tuple[str, str]] = []
+
+    class RecordingChannel:
+        def __init__(self, channel_id: str, channel: str) -> None:
+            self.channel_id = channel_id
+            self.channel = channel
+
+        def notify(self, event: NotificationEvent) -> NotificationResult:
+            calls.append((event.correlation_id or "", self.channel_id))
+            return NotificationResult(self.channel_id, True)
+
+    notifier = FanoutNotifier(
+        (RecordingChannel("alerts", "feishu"), RecordingChannel("backup", "wecom"))
+    )
+    dispatcher = NotificationDispatcher(store, notifier)
+    assert dispatcher.process(limit=4) == 4
+    assert calls == [
+        (first.correlation_id, "alerts"),
+        (first.correlation_id, "backup"),
+        (second.correlation_id, "alerts"),
+        (second.correlation_id, "backup"),
+    ]
+    assert dispatcher.process(limit=4) == 0
     assert [audit.action for audit in store.list_operator_recoveries()] == [
         "relation_recovery",
         "notification_resend",
