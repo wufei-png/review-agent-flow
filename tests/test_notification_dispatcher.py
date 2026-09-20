@@ -86,7 +86,37 @@ def test_queued_direct_message_cannot_be_rebound_to_group_webhook(tmp_path, monk
     assert calls == []
     recorded = store.get_notification_delivery(delivery.delivery_id)
     assert recorded.status == "failed"
-    assert "channel type changed" in recorded.last_error
+    assert "channel binding changed" in recorded.last_error
+
+
+def test_queued_direct_message_cannot_be_rebound_to_another_open_id(tmp_path, monkeypatch) -> None:
+    store = SQLiteStore(tmp_path / "review.db")
+    original = notifiers_from_operator(
+        (
+            ResolvedNotificationChannel(
+                "owner", "feishu_dm", None, {}, "cli_app", "secret", "ou_owner", "wufei-png"
+            ),
+        )
+    )
+    delivery = NotificationDispatcher(store, original).enqueue(
+        NotificationEvent("Review", "Private body", recipients=("wufei-png",))
+    )[0]
+    rebound = notifiers_from_operator(
+        (
+            ResolvedNotificationChannel(
+                "owner", "feishu_dm", None, {}, "cli_app", "secret", "ou_other", "wufei-png"
+            ),
+        )
+    )
+    calls = []
+    monkeypatch.setattr(rebound.notifiers[0], "notify", lambda event: calls.append(event))
+
+    assert NotificationDispatcher(store, rebound, max_attempts=1).process() == 1
+
+    assert calls == []
+    recorded = store.get_notification_delivery(delivery.delivery_id)
+    assert recorded.status == "failed"
+    assert "channel binding changed" in recorded.last_error
 
 
 def test_stale_completion_is_not_logged_as_delivered(tmp_path, monkeypatch, caplog) -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from hashlib import sha256
 from html import escape
 from typing import Protocol
 from urllib.error import HTTPError, URLError
@@ -124,6 +125,13 @@ class FeishuDirectNotifier:
         self.app_secret = app_secret
         self.recipient_open_id = recipient_open_id
         self.recipient_username = recipient_username
+        binding = json.dumps(
+            (app_id, recipient_open_id, recipient_username),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        # Persist this fingerprint with queued deliveries to reject later rebinding.
+        self.delivery_binding = f"feishu_dm:{sha256(binding).hexdigest()}"
 
     def _post(self, url: str, payload: dict[str, object], token: str | None = None) -> dict | str:
         headers = {"Content-Type": "application/json; charset=utf-8"}
@@ -224,7 +232,13 @@ class FanoutNotifier:
                         notifier, "channel_id", getattr(notifier, "channel", f"channel-{index}")
                     )
                 ),
-                str(getattr(notifier, "channel", f"channel-{index}")),
+                str(
+                    getattr(
+                        notifier,
+                        "delivery_binding",
+                        getattr(notifier, "channel", f"channel-{index}"),
+                    )
+                ),
             )
             for index, notifier in enumerate(self.notifiers)
         )

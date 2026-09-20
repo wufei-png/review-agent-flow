@@ -190,7 +190,7 @@ class NotificationDispatcher:
                     result = NotificationResult(
                         delivery.channel_id,
                         False,
-                        "notification channel type changed since enqueue",
+                        "notification channel binding changed since enqueue",
                     )
                 else:
                     result = self.notifier.notify_channel(event, delivery.channel_id)
