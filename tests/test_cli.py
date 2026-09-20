@@ -1,4 +1,5 @@
 import json
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -43,6 +44,10 @@ def test_worker_configures_target_branch_policy_resolver(monkeypatch, tmp_path: 
 
         def run_forever(self, poll_interval):
             raise AssertionError("test must use --once")
+
+        @contextmanager
+        def runtime_ownership(self):
+            yield lambda: None
 
     monkeypatch.setattr(cli, "SQLiteStore", lambda path: object())
     monkeypatch.setenv("GITLAB_REVIEW_BOT_USERNAME", "review-bot")
@@ -114,6 +119,10 @@ def test_worker_once_emits_json_run_status(monkeypatch, tmp_path: Path, capsys) 
 
         def run_forever(self, poll_interval):
             raise AssertionError("test must use --once")
+
+        @contextmanager
+        def runtime_ownership(self):
+            yield lambda: None
 
     monkeypatch.setattr(cli, "SQLiteStore", lambda path: object())
     monkeypatch.setenv("GITLAB_REVIEW_BOT_USERNAME", "review-bot")

@@ -906,8 +906,16 @@ def test_worker_services_pending_publication_before_new_review_run(
     assert claimed is not None and claimed.run_id == queued.run_id
 
 
+@pytest.mark.parametrize(
+    ("loop_name", "method_name"),
+    [
+        ("Review/Publication", "process_one"),
+        ("Notification", "notification"),
+        ("Reconciliation/Cleanup", "reconcile_auto_fixes"),
+    ],
+)
 def test_supervised_worker_fails_when_one_independent_loop_exits(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, loop_name: str, method_name: str
 ) -> None:
     repository = tmp_path / "repo"
     repository.mkdir()
@@ -924,13 +932,20 @@ def test_supervised_worker_fails_when_one_independent_loop_exits(
         project_id="42",
     )
 
-    def fail_review_loop():
-        raise RuntimeError("review loop crashed")
+    def fail_loop(*_args, **_kwargs):
+        raise RuntimeError(f"{loop_name} crashed")
 
-    monkeypatch.setattr(worker, "process_one", fail_review_loop)
+    if method_name == "notification":
+        monkeypatch.setattr(worker, "process_one", lambda: None)
+        monkeypatch.setattr(worker.notification_dispatcher, "run_forever", fail_loop)
+    else:
+        if method_name == "reconcile_auto_fixes":
+            monkeypatch.setattr(worker, "process_one", lambda: None)
+        monkeypatch.setattr(worker, method_name, fail_loop)
 
-    with pytest.raises(RuntimeError, match="Review/Publication loop failed"):
+    with pytest.raises(RuntimeError, match=f"{loop_name} loop failed"):
         worker.run_forever(0.01)
+    assert worker.store.worker_lease_summary() is None
 
 
 def test_supervised_worker_stops_gracefully_on_external_event(
@@ -974,6 +989,106 @@ def test_supervised_worker_stops_gracefully_on_external_event(
 
     assert not thread.is_alive()
     assert errors == []
+    assert worker.store.worker_lease_summary() is None
+
+
+def test_runtime_heartbeat_continues_during_long_running_work(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    sha = _git_repository(repository)
+    store = SQLiteStore(tmp_path / "review.db")
+    worker = ReviewWorker(
+        store,
+        FakeGitLab(MergeRequest("42", 1, "Parent", "alice", "feature", "main", sha, "https://mr")),
+        GitWorktreeManager(repository, tmp_path / "worktrees"),
+        ReviewPolicy(),
+        repository,
+        "https://gitlab",
+        project_id="42",
+    )
+    with worker.runtime_ownership(lease_seconds=1, heartbeat_interval_seconds=0.05) as owned:
+        first = store.worker_lease_summary()
+        assert first is not None
+        Event().wait(0.2)  # Simulates an Agent or verifier blocking its work loop.
+        owned()
+        later = store.worker_lease_summary()
+        assert later is not None and later["heartbeat_at"] > first["heartbeat_at"]
+        assert store.acquire_worker_lease("second worker", 1) is None
+    assert store.worker_lease_summary() is None
+
+
+def test_worker_does_not_claim_review_after_runtime_ownership_is_lost(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    sha = _git_repository(repository)
+    store = SQLiteStore(tmp_path / "review.db")
+    run = store.enqueue("42", 1, sha)
+    worker = ReviewWorker(
+        store,
+        FakeGitLab(MergeRequest("42", 1, "Parent", "alice", "feature", "main", sha, "https://mr")),
+        GitWorktreeManager(repository, tmp_path / "worktrees"),
+        ReviewPolicy(),
+        repository,
+        "https://gitlab",
+        project_id="42",
+    )
+
+    def lose_ownership():
+        with store._connect() as connection:
+            connection.execute("DELETE FROM worker_runtime_lease")
+
+    monkeypatch.setattr(worker, "_process_publication_backlog", lose_ownership)
+    with pytest.raises(RuntimeError, match="runtime lease lost"), worker.runtime_ownership():
+        worker.process_one()
+    saved = store.get_review_run(run.run_id)
+    assert saved is not None and saved.status == "pending"
+
+
+def test_supervised_worker_fails_after_runtime_lease_loss(tmp_path: Path, monkeypatch) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    sha = _git_repository(repository)
+    store = SQLiteStore(tmp_path / "review.db")
+    worker = ReviewWorker(
+        store,
+        FakeGitLab(MergeRequest("42", 1, "Parent", "alice", "feature", "main", sha, "https://mr")),
+        GitWorktreeManager(repository, tmp_path / "worktrees"),
+        ReviewPolicy(),
+        repository,
+        "https://gitlab",
+        project_id="42",
+    )
+    started = Event()
+    claims = 0
+
+    def wait_for_loss():
+        nonlocal claims
+        claims += 1
+        started.set()
+        Event().wait(0.1)
+
+    monkeypatch.setattr(worker, "process_one", wait_for_loss)
+    monkeypatch.setattr(store, "heartbeat_worker_lease", lambda *_args: False)
+    errors: list[RuntimeError] = []
+
+    def run() -> None:
+        try:
+            worker.run_forever(
+                0.01, runtime_lease_seconds=1, runtime_heartbeat_interval_seconds=0.05
+            )
+        except RuntimeError as exc:
+            errors.append(exc)
+
+    thread = Thread(target=run)
+    thread.start()
+    assert started.wait(1)
+    # Runtime lease loss is detected by the independent heartbeat, not a work loop.
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert errors and "runtime lease lost" in str(errors[0]).lower()
+    assert claims == 1
 
 
 def test_workspace_diff_without_proposal_blocks_only_auto_fix(tmp_path: Path) -> None:

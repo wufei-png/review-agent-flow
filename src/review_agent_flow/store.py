@@ -24,6 +24,7 @@ DEFAULT_NOTIFICATION_LEASE_SECONDS = 30
 DEFAULT_NOTIFICATION_MAX_ATTEMPTS = 3
 DEFAULT_WORKTREE_CLEANUP_LEASE_SECONDS = 60
 DEFAULT_WORKTREE_CLEANUP_MAX_ATTEMPTS = 5
+DEFAULT_WORKER_RUNTIME_LEASE_SECONDS = 30
 SCHEMA_VERSION = 17
 DEFAULT_EFFECT_LEASE_SECONDS = 60
 DEFAULT_NOTE_PUBLICATION_LEASE_SECONDS = 60
@@ -428,6 +429,89 @@ class SQLiteStore:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
         if version != SCHEMA_VERSION:
             raise RuntimeError(f"unsupported SQLite schema version {version}; recreate {self.path}")
+
+    def acquire_worker_lease(
+        self,
+        owner_id: str,
+        lease_seconds: int = DEFAULT_WORKER_RUNTIME_LEASE_SECONDS,
+    ) -> str | None:
+        """Claim the single Worker slot; expired owners are replaced atomically."""
+        if not owner_id.strip() or lease_seconds <= 0:
+            raise ValueError("Worker owner and positive lease are required")
+        now = self._now()
+        now_text = now.isoformat()
+        token = uuid4().hex
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            claimed = connection.execute(
+                """
+                INSERT INTO worker_runtime_lease(
+                    singleton_id, owner_id, claim_token, heartbeat_at, lease_until
+                ) VALUES (1, ?, ?, ?, ?)
+                ON CONFLICT(singleton_id) DO UPDATE SET
+                    owner_id = excluded.owner_id,
+                    claim_token = excluded.claim_token,
+                    heartbeat_at = excluded.heartbeat_at,
+                    lease_until = excluded.lease_until
+                WHERE worker_runtime_lease.lease_until <= ?
+                """,
+                (
+                    owner_id, token, now_text,
+                    (now + timedelta(seconds=lease_seconds)).isoformat(), now_text,
+                ),
+            )
+        return token if claimed.rowcount == 1 else None
+
+    def heartbeat_worker_lease(
+        self,
+        claim_token: str,
+        lease_seconds: int = DEFAULT_WORKER_RUNTIME_LEASE_SECONDS,
+    ) -> bool:
+        if not claim_token or lease_seconds <= 0:
+            raise ValueError("Worker claim token and positive lease are required")
+        now = self._now()
+        now_text = now.isoformat()
+        with self._connect() as connection:
+            updated = connection.execute(
+                """
+                UPDATE worker_runtime_lease
+                SET heartbeat_at = ?, lease_until = ?
+                WHERE singleton_id = 1 AND claim_token = ? AND lease_until > ?
+                """,
+                (now_text, (now + timedelta(seconds=lease_seconds)).isoformat(),
+                 claim_token, now_text),
+            )
+        return updated.rowcount == 1
+
+    def has_worker_lease(self, claim_token: str) -> bool:
+        if not claim_token:
+            return False
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM worker_runtime_lease WHERE singleton_id = 1 "
+                "AND claim_token = ? AND lease_until > ?",
+                (claim_token, self._now().isoformat()),
+            ).fetchone()
+        return row is not None
+
+    def release_worker_lease(self, claim_token: str) -> bool:
+        if not claim_token:
+            return False
+        with self._connect() as connection:
+            deleted = connection.execute(
+                "DELETE FROM worker_runtime_lease WHERE singleton_id = 1 AND claim_token = ?",
+                (claim_token,),
+            )
+        return deleted.rowcount == 1
+
+    def worker_lease_summary(self) -> dict[str, str] | None:
+        """Return operator-safe ownership facts, never the claim token."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT owner_id, heartbeat_at, lease_until FROM worker_runtime_lease "
+                "WHERE singleton_id = 1"
+            ).fetchone()
+        return dict(row) if row is not None else None
 
     def _initialize(self) -> None:
         with self._connect() as connection:

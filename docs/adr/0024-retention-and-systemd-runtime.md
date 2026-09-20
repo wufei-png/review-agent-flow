@@ -35,6 +35,12 @@ remain Worker-private. The API receives the webhook secret but no publication
 or Agent credentials. The Worker receives GitLab, Agent, verification,
 notification and retention authority and continues to host independent
 internal loops. Each Agent or verifier timeout is capped at 1800 seconds.
+Both the supervised Worker and CLI `--once` acquire the Store's singleton
+runtime lease before claiming work. An independent heartbeat renews ownership
+through long calls. A second owner cannot start until expiry or release;
+token-fenced release cannot remove a successor's lease. Loss of ownership
+fails the Worker. Operator diagnostics may expose owner and heartbeat times,
+but not the claim token.
 SIGTERM stops new claims and waits for in-flight Worker loops; a 3700-second
 systemd stop timeout bounds a sequential Agent plus verifier.
 

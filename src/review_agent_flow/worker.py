@@ -5,10 +5,12 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from queue import Empty, Queue
+from socket import gethostname
 from threading import Event, Thread
 from time import monotonic
 
@@ -46,6 +48,7 @@ from .store import (
     DEFAULT_MAX_ATTEMPTS,
     DEFAULT_NOTIFICATION_LEASE_SECONDS,
     DEFAULT_NOTIFICATION_MAX_ATTEMPTS,
+    DEFAULT_WORKER_RUNTIME_LEASE_SECONDS,
     DEFAULT_WORKTREE_CLEANUP_LEASE_SECONDS,
     DEFAULT_WORKTREE_CLEANUP_MAX_ATTEMPTS,
     AutoFixPublicationIntent,
@@ -109,6 +112,7 @@ class ReviewWorker:
                 "project_id (REVIEW_AGENT_FLOW_PROJECT_ID) must be set"
             )
         self.store = store
+        self._runtime_assert_owned: Callable[[], None] | None = None
         self.gitlab = gitlab
         self.worktrees = worktrees
         self.policy = policy
@@ -453,15 +457,18 @@ class ReviewWorker:
         return WorkerResult(run.run_id, "deferred", detail=result_detail)
 
     def process_one(self) -> WorkerResult | None:
+        self._assert_runtime_ownership()
         publication = self._process_publication_backlog()
         if publication is not None:
             return publication
+        self._assert_runtime_ownership()
         run = self.store.claim_next(
             lease_seconds=self.lease_seconds,
             max_attempts=self.max_attempts,
             project_id=self.project_id,
         )
         if run is None:
+            self._assert_runtime_ownership()
             return self._process_idle_backlog()
 
         self._log_run(run, status="running", event="worker.run.claimed")
@@ -861,6 +868,7 @@ class ReviewWorker:
                 note_result.status,
                 detail=note_result.detail,
             )
+        self._assert_runtime_ownership()
         note_reconciliation = self.note_publisher.reconcile_published()
         if note_reconciliation is not None:
             return WorkerResult(
@@ -889,6 +897,7 @@ class ReviewWorker:
     ) -> WorkerResult:
         if note_request_id is not None:
             try:
+                self._assert_runtime_ownership()
                 self.note_publisher.process(request_id=note_request_id)
             except Exception as exc:  # noqa: BLE001 - Note state is independently durable
                 self._log_run(
@@ -899,6 +908,7 @@ class ReviewWorker:
                 )
         if auto_fix_plan_id is not None:
             try:
+                self._assert_runtime_ownership()
                 self.auto_fix_publisher.process(plan_id=auto_fix_plan_id)
             except Exception as exc:  # noqa: BLE001 - Plan state is independently durable
                 self._log_run(
@@ -1178,6 +1188,7 @@ class ReviewWorker:
         )
 
     def reconcile_auto_fixes(self, limit: int = 1) -> WorkerResult | None:
+        self._assert_runtime_ownership()
         results = self.auto_fix_reconciler.process(limit=limit)
         if not results:
             return None
@@ -1194,16 +1205,93 @@ class ReviewWorker:
         *,
         stop_event: Event | None = None,
         retention_interval_seconds: float = 3600.0,
+        runtime_lease_seconds: int = DEFAULT_WORKER_RUNTIME_LEASE_SECONDS,
+        runtime_heartbeat_interval_seconds: float = 10.0,
     ) -> None:
         if poll_interval_seconds <= 0:
             raise ValueError("Worker poll interval must be positive")
         if retention_interval_seconds <= 0:
             raise ValueError("Worker retention interval must be positive")
         stop = stop_event or Event()
+        with self.runtime_ownership(
+            stop_event=stop,
+            lease_seconds=runtime_lease_seconds,
+            heartbeat_interval_seconds=runtime_heartbeat_interval_seconds,
+        ) as assert_owned:
+            self._run_owned_loops(
+                poll_interval_seconds, retention_interval_seconds, stop, assert_owned
+            )
+
+    @contextmanager
+    def runtime_ownership(
+        self,
+        *,
+        stop_event: Event | None = None,
+        lease_seconds: int = DEFAULT_WORKER_RUNTIME_LEASE_SECONDS,
+        heartbeat_interval_seconds: float = 10.0,
+    ) -> Iterator[Callable[[], None]]:
+        """Hold one process-wide Worker slot, renewing it outside work loops."""
+        if heartbeat_interval_seconds <= 0 or heartbeat_interval_seconds >= lease_seconds:
+            raise ValueError("Worker heartbeat interval must be below lease duration")
+        token = self.store.acquire_worker_lease(f"{gethostname()}:{os.getpid()}", lease_seconds)
+        if token is None:
+            raise RuntimeError("another Worker owns the runtime lease")
+        stop_heartbeat = Event()
+        lost = Event()
+
+        def heartbeat() -> None:
+            while not stop_heartbeat.wait(heartbeat_interval_seconds):
+                try:
+                    current = self.store.heartbeat_worker_lease(token, lease_seconds)
+                except BaseException:  # noqa: BLE001 - heartbeat death must fail the Worker
+                    current = False
+                if not current:
+                    lost.set()
+                    if stop_event is not None:
+                        stop_event.set()
+                    return
+
+        thread = Thread(target=heartbeat, name="reviewflow-runtime-heartbeat", daemon=False)
+        thread.start()
+
+        def assert_owned() -> None:
+            if lost.is_set() or not self.store.has_worker_lease(token):
+                lost.set()
+                if stop_event is not None:
+                    stop_event.set()
+                raise RuntimeError("Worker runtime lease lost")
+
+        body_error: BaseException | None = None
+        self._runtime_assert_owned = assert_owned
+        try:
+            yield assert_owned
+        except BaseException as exc:
+            body_error = exc
+            raise
+        finally:
+            self._runtime_assert_owned = None
+            stop_heartbeat.set()
+            thread.join()
+            self.store.release_worker_lease(token)
+            if lost.is_set() and body_error is None:
+                raise RuntimeError("Worker runtime lease lost")
+
+    def _assert_runtime_ownership(self) -> None:
+        if self._runtime_assert_owned is not None:
+            self._runtime_assert_owned()
+
+    def _run_owned_loops(
+        self,
+        poll_interval_seconds: float,
+        retention_interval_seconds: float,
+        stop: Event,
+        assert_owned: Callable[[], None],
+    ) -> None:
         failures: Queue[tuple[str, BaseException]] = Queue()
 
         def review_publication_loop() -> None:
             while not stop.is_set():
+                assert_owned()
                 result = self.process_one()
                 if result is None or result.status == "deferred":
                     stop.wait(poll_interval_seconds)
@@ -1211,8 +1299,13 @@ class ReviewWorker:
         def reconciliation_cleanup_loop() -> None:
             next_retention_at = 0.0
             while not stop.is_set():
+                assert_owned()
                 cleanup_count = self.process_worktree_cleanup(limit=1)
+                if stop.is_set():
+                    break
                 reconciliation = self.reconcile_auto_fixes(limit=1)
+                if stop.is_set():
+                    break
                 retention_ran = False
                 if self.retention_manager is not None and monotonic() >= next_retention_at:
                     self.retention_manager.sweep()
@@ -1284,6 +1377,7 @@ class ReviewWorker:
             raise ValueError("worktree cleanup limit must be positive")
         processed = 0
         for _ in range(limit):
+            self._assert_runtime_ownership()
             record = self.store.claim_next_worktree_cleanup(
                 lease_seconds=self.worktree_cleanup_lease_seconds,
                 max_attempts=self.worktree_cleanup_max_attempts,

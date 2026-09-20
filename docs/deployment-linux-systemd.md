@@ -36,6 +36,11 @@ sudo install -d -o reviewflow-worker -g reviewflow-shared -m 0700 \
 
 Both units set `UMask=0007`, so SQLite database, WAL and shared-memory files
 remain group-writable without becoming world-readable.
+This release uses fresh SQLite schema 17 and rejects schema 16. Before a
+pre-production cutover, retain the old canary evidence and a consistent
+database snapshot; start the new deployment with a fresh database only after
+that evidence is secured. Production data requires a planned backup and
+rollback path before any later schema change.
 
 Copy the examples from `deploy/`, install both units, then run:
 
@@ -51,6 +56,11 @@ finish. Operator configuration bounds each Agent or verification command to
 1800 seconds. Since an Agent and its verifier may run sequentially, the
 reference Worker unit allows 3700 seconds before systemd applies its final kill
 bound. The API delegates SIGTERM handling to Uvicorn.
+The Worker holds a Store-backed singleton runtime lease and renews it from an
+independent heartbeat while Agent or verifier calls run. A second Worker,
+including `worker --once`, fails to start while the first lease is valid.
+Normal shutdown releases its token; after a crash, takeover waits for lease
+expiry. Lost ownership fails the Worker so systemd can restart it.
 
 Expose `127.0.0.1:8000` only through an Operator-managed TLS reverse proxy.
 Configure GitLab to send webhooks to that proxy. `/healthz` is liveness and
@@ -74,6 +84,10 @@ identities, Plan and policy digests, lifecycle states, Effect Receipts,
 expectations, Relations, notification payload digests, backup receipts, purge
 audits, and Operator audits. The stable Note retention timestamp is set on its
 first terminal publication outcome and is not refreshed by reconciliation.
+Notification payload retention begins at each delivery's first terminal
+outcome. An Auto-fix request with multiple channels is retained until every
+channel's terminal time is old enough; a request with no deliveries expires
+from its creation time.
 After a Note body is purged, periodic exact-content reconciliation stops; its
 last confirmed identity/state remains historical evidence.
 

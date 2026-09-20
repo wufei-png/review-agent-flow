@@ -1,5 +1,6 @@
 import hashlib
 import sqlite3
+from threading import Barrier, Thread
 
 import pytest
 
@@ -320,6 +321,47 @@ def test_legacy_schema_is_rejected_for_writable_and_read_only_access(
 
     with pytest.raises(RuntimeError, match=f"unsupported SQLite schema version {version}"):
         SQLiteStore(database, read_only=read_only)
+
+
+def test_worker_runtime_lease_fences_competing_owners_and_recovers_after_expiry(tmp_path) -> None:
+    database = tmp_path / "review.db"
+    stores = (SQLiteStore(database), SQLiteStore(database))
+    barrier = Barrier(2)
+    claims: list[str | None] = [None, None]
+
+    def acquire(index: int) -> None:
+        barrier.wait()
+        claims[index] = stores[index].acquire_worker_lease(f"worker-{index}", 60)
+
+    threads = [Thread(target=acquire, args=(index,)) for index in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+    assert sum(token is not None for token in claims) == 1
+    winner = 0 if claims[0] is not None else 1
+    loser = 1 - winner
+    old_token = claims[winner]
+    assert old_token is not None
+    assert stores[winner].heartbeat_worker_lease(old_token, 60)
+    assert stores[loser].acquire_worker_lease("second", 60) is None
+    summary = stores[loser].worker_lease_summary()
+    assert summary is not None and summary["owner_id"] == f"worker-{winner}"
+    assert "claim_token" not in summary
+
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE worker_runtime_lease SET lease_until = ?",
+            ("2000-01-01T00:00:00+00:00",),
+        )
+    new_token = stores[loser].acquire_worker_lease("replacement", 60)
+    assert new_token is not None and new_token != old_token
+    assert not stores[winner].heartbeat_worker_lease(old_token)
+    assert not stores[winner].release_worker_lease(old_token)
+    assert stores[loser].has_worker_lease(new_token)
+    assert stores[loser].release_worker_lease(new_token)
+    assert stores[loser].worker_lease_summary() is None
 
 
 def test_deferred_run_does_not_block_a_later_run(tmp_path) -> None:

@@ -120,12 +120,18 @@ def _run_worker(args: argparse.Namespace) -> int:
         retention_manager=RetentionManager(store, operator_config.retention),
     )
     if args.once:
-        result = worker.process_one()
-        if result is None:
-            result = worker.reconcile_auto_fixes(limit=1)
-        worker.process_worktree_cleanup(limit=1)
-        worker.notification_dispatcher.process_channel_batch()
-        worker.process_retention()
+        with worker.runtime_ownership() as assert_owned:
+            assert_owned()
+            result = worker.process_one()
+            if result is None:
+                assert_owned()
+                result = worker.reconcile_auto_fixes(limit=1)
+            assert_owned()
+            worker.process_worktree_cleanup(limit=1)
+            assert_owned()
+            worker.notification_dispatcher.process_channel_batch()
+            assert_owned()
+            worker.process_retention()
         if result is None:
             print(json.dumps({"status": "idle"}))
             return 0

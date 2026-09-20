@@ -45,7 +45,7 @@ flowchart LR
     Notify --> Providers
 ```
 
-The API acknowledges Webhooks quickly. One supervised Worker OS process runs three independent loops: Review/Publication, Notification and Reconciliation/Cleanup. The third loop also runs the startup/hourly Retention sweep. Each loop isolates per-item errors and uses independent claims/backoff so a stuck notification does not block reviews. Unexpected death of any loop terminates the Worker process; the process supervisor restarts the whole Worker. The Agent remains a child process. Separate Dispatcher/Reconciler OS processes are deferred until operational evidence requires them.
+The API acknowledges Webhooks quickly. One supervised Worker OS process runs three independent loops: Review/Publication, Notification and Reconciliation/Cleanup. The third loop also runs the startup/hourly Retention sweep. Before either the supervised service or CLI `--once` claims work, it must atomically own the Store's singleton runtime lease. A separate heartbeat renews it during long Agent and verifier calls. A second process fails to start while the lease is valid; after expiry, a new token fences the old owner from heartbeat or release. Loss of ownership stops new loop claims and fails the process. The stored owner, heartbeat and expiry are safe for read-only operator diagnostics; the token is never exposed. Each loop isolates per-item errors and uses independent claims/backoff so a stuck notification does not block reviews. Unexpected death of any loop terminates the Worker process; the process supervisor restarts the whole Worker. The Agent remains a child process. Separate Dispatcher/Reconciler OS processes are deferred until operational evidence requires them.
 
 ## Review Run and effect lifecycle
 

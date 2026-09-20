@@ -110,7 +110,7 @@ _Avoid_: Untrusted-MR Sandbox, Multi-tenant Service
 **Trusted Workspace**: ReviewFlow 为精确 SHA 创建的 linked worktree，Agent 可在其中分析和编辑。它不是文件系统沙箱；宿主隔离属于 Backend Profile 和 Operator 边界。
 _Avoid_: Secure Sandbox, Untrusted Execution
 
-**Worker Process**: v0.1 中受外部 supervisor 管理的单一 OS 进程，内部运行独立 Review/Publication、Notification 和 Reconciliation/Cleanup 循环。任一循环意外退出都使进程失败，而不静默降级。
+**Worker Process**: v0.1 中受外部 supervisor 管理的单一 OS 进程，以 Store 中的运行时单例租约证明所有权，内部运行独立 Review/Publication、Notification 和 Reconciliation/Cleanup 循环。独立 heartbeat 在长时间 Agent/Verifier 执行时续租；失去所有权或任一循环意外退出都使进程失败，而不静默降级。CLI `--once` 使用同一所有权约束。
 _Avoid_: Monolithic Loop, Silent Partial Worker
 
 **Deployment Boundary**: v0.1 一个 API/Worker 部署只服务一个 GitLab Project；Webhook secret 和 Project ID 必须配置。多进程 Dispatcher/Reconciler 在需要独立扩缩容或替换 SQLite 时再引入。
