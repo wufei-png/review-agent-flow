@@ -13,7 +13,9 @@ credentials. SQLite necessarily remains readable by both service identities.
 - API identity: `reviewflow-api:reviewflow-shared`
 - Worker identity: `reviewflow-worker:reviewflow-shared`
 - API environment: `/etc/review-agent-flow/api.env`, root-owned mode `0600`
-- Worker environment and Operator configuration: root-owned mode `0600`
+- Worker environment: root-owned mode `0600`, read by systemd;
+  Operator configuration: `reviewflow-worker`-owned mode `0600`, read by
+  the Worker process
 - shared Store directory: `/var/lib/review-agent-flow/shared`, mode `2770`,
   group `reviewflow-shared`
 - Worker-private state: `/var/lib/review-agent-flow-worker`, mode `0700`, owned
@@ -49,6 +51,13 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now review-agent-flow-api review-agent-flow-worker
 sudo systemctl status review-agent-flow-api review-agent-flow-worker
 ```
+
+Before enabling the units on the deployment host, run `systemd-analyze verify`
+on both installed service files. Follow the
+[single-Project operations runbook](operations-runbook.md) for service and
+three-loop observation, queue triage, uncertain external writes, credential
+rotation and the new exact-SHA canary. Keep the reference sandbox settings
+until they have been tested under the actual service identities.
 
 Terminate with `systemctl stop`. The Worker handles SIGTERM by stopping new
 claims, asking all independent loops to stop, and waiting for in-flight work to
