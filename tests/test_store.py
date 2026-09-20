@@ -16,6 +16,22 @@ MERGED_SHA = "d" * 40
 LATER_SHA = "e" * 40
 
 
+def test_setgid_shared_store_keeps_database_and_wal_group_writable(tmp_path) -> None:
+    directory = tmp_path / "shared"
+    directory.mkdir()
+    directory.chmod(0o2770)
+
+    store = SQLiteStore(directory / "review.db")
+    another = SQLiteStore(directory / "review.db")
+
+    for suffix in ("", "-wal", "-shm"):
+        path = directory / f"review.db{suffix}"
+        assert path.is_file()
+        assert path.stat().st_mode & 0o020
+    assert store.readiness_probe()["status"] == "ok"
+    assert another.readiness_probe()["status"] == "ok"
+
+
 def test_enqueue_is_idempotent_and_claimable(tmp_path) -> None:
     store = SQLiteStore(tmp_path / "review.db")
     first = store.enqueue("42", 1, SHA)

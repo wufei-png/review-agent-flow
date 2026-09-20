@@ -50,8 +50,13 @@ Set the Worker account home to its private state directory even with
 variables for runtime state. A synthetic `/home/reviewflow-worker` home can
 make it fail before ReviewFlow's isolated invocation starts.
 
-Both units set `UMask=0007`, so SQLite database, WAL and shared-memory files
-remain group-writable without becoming world-readable.
+Both units set `UMask=0007`. The shared directory is setgid and group-writable;
+the Store keeps a connection open and adds group write to its own database,
+WAL and shared-memory files before the other identity starts. SQLite's default
+file mode alone does not grant group write, even with this umask. Start the API
+and verify `/readyz` before the Worker on a fresh Store; a wrong file group or
+missing group write causes Store startup to fail instead of silently running
+with one service unable to write.
 This release uses fresh SQLite schema 17 and rejects schema 16. Before a
 pre-production cutover, retain the old canary evidence and a consistent
 database snapshot; start the new deployment with a fresh database only after

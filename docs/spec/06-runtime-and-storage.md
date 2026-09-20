@@ -100,6 +100,7 @@ The Operator `backup-store` CLI uses SQLite's backup API to take a consistent sc
 
 - SQLite and database polling are the first storage/queue implementation.
 - One API process and one supervised Worker process with separate Unix identities are the reference deployment. They share only the SQLite directory; repository, worktrees, Plan backups and Worker credentials are Worker-private.
+- A setgid, group-writable SQLite directory signals the shared-identity mode. The mutable Store pins a WAL connection and grants group write on its own database, WAL and shared-memory files, refusing an unexpected file group or a foreign owner without group write. This is required because SQLite's default creation mode does not become group-writable from the service umask alone.
 - One deployment is bound to exactly one GitLab Project.
 - The repository is a persistent writable non-shallow checkout or mirror. The Worker obtains a requested SHA through a locked, bounded fetch before creating a detached worktree.
 - Agent, verification and publication credentials are distinct Operator-owned inputs; the Agent receives no GitLab publication token.

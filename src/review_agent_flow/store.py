@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
+import stat
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -352,6 +354,7 @@ class SQLiteStore:
     ) -> None:
         self.path = str(path)
         self._read_only = read_only
+        self._shared_guard: sqlite3.Connection | None = None
         self._redaction_secrets: set[str] = set()
         if isinstance(redaction_secrets, str):
             self.add_redaction_secret(redaction_secrets)
@@ -364,6 +367,7 @@ class SQLiteStore:
             self._validate_schema_version()
         else:
             self._initialize()
+            self._keep_shared_wal_writable()
 
     def add_redaction_secret(self, secret: str | None) -> None:
         """Register a runtime credential before writing audit diagnostics."""
@@ -389,6 +393,35 @@ class SQLiteStore:
         if not self._read_only:
             connection.execute("PRAGMA journal_mode = WAL")
         return connection
+
+    def _keep_shared_wal_writable(self) -> None:
+        """Keep WAL files present and writable across two setgid service identities."""
+
+        parent = Path(self.path).parent
+        directory = parent.stat()
+        if not (directory.st_mode & stat.S_ISGID and directory.st_mode & stat.S_IWGRP):
+            return
+        guard = self._connect()
+        try:
+            guard.execute("BEGIN IMMEDIATE")
+            guard.rollback()
+            for suffix in ("", "-wal", "-shm"):
+                filename = self.path + suffix
+                descriptor = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW)
+                try:
+                    metadata = os.fstat(descriptor)
+                    if not stat.S_ISREG(metadata.st_mode) or metadata.st_gid != directory.st_gid:
+                        raise PermissionError(f"shared SQLite file has wrong type or group: {filename}")
+                    if metadata.st_uid == os.geteuid():
+                        os.fchmod(descriptor, stat.S_IMODE(metadata.st_mode) | stat.S_IWGRP)
+                    elif not metadata.st_mode & stat.S_IWGRP:
+                        raise PermissionError(f"shared SQLite file is not group-writable: {filename}")
+                finally:
+                    os.close(descriptor)
+        except BaseException:
+            guard.close()
+            raise
+        self._shared_guard = guard
 
     def readiness_probe(self) -> dict[str, str | None]:
         """Run a bounded, non-destructive SQLite read/write health probe.
