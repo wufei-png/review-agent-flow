@@ -301,19 +301,24 @@ def test_fresh_schema_has_no_agent_owned_autofix_tables(tmp_path) -> None:
         "auto_fix_publication_intents",
         "auto_fix_publication_plans",
         "auto_fix_relations",
+        "worker_runtime_lease",
     } <= tables
+
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 17
 
 
 @pytest.mark.parametrize("read_only", [False, True])
+@pytest.mark.parametrize("version", [2, 16])
 def test_legacy_schema_is_rejected_for_writable_and_read_only_access(
-    tmp_path, read_only: bool
+    tmp_path, read_only: bool, version: int
 ) -> None:
-    database = tmp_path / f"legacy-{read_only}.db"
+    database = tmp_path / f"legacy-{version}-{read_only}.db"
     with sqlite3.connect(database) as connection:
         connection.execute("CREATE TABLE legacy_record(id INTEGER PRIMARY KEY)")
-        connection.execute("PRAGMA user_version = 2")
+        connection.execute(f"PRAGMA user_version = {version}")
 
-    with pytest.raises(RuntimeError, match="unsupported SQLite schema version 2"):
+    with pytest.raises(RuntimeError, match=f"unsupported SQLite schema version {version}"):
         SQLiteStore(database, read_only=read_only)
 
 
@@ -771,6 +776,10 @@ def test_notification_outbox_is_idempotent_per_channel(tmp_path) -> None:
     assert store.finish_notification(
         claimed.delivery_id, True, claim_token=claimed.claim_token
     )
+    completed = store.get_notification_delivery(claimed.delivery_id)
+    assert completed is not None
+    assert completed.terminal_at is not None
+    assert completed.delivered_at == completed.terminal_at
     next_delivery = store.claim_next_notification()
     assert next_delivery is not None
     assert next_delivery.channel == "wecom"
@@ -799,12 +808,35 @@ def test_notification_outbox_retries_then_records_terminal_failure(tmp_path) -> 
             claim_token=claimed.claim_token,
             retry_delay_seconds=0,
         )
+        saved = store.get_notification_delivery(delivery_id)
+        assert saved is not None
+        assert (saved.terminal_at is not None) == (attempt == 2)
     terminal = store.get_notification_delivery(delivery_id)
     assert terminal is not None
     assert terminal.status == "failed"
     assert terminal.attempts == 3
     assert terminal.last_error == "timeout"
     assert store.claim_next_notification() is None
+
+
+def test_exhausted_notification_lease_sets_terminal_time_once(tmp_path) -> None:
+    database = tmp_path / "review.db"
+    store = SQLiteStore(database)
+    delivery = store.enqueue_notifications(
+        "lease-expiry", "Title", "Body", None, (), (("reviewers", "feishu"),)
+    )[0]
+    claimed = store.claim_notification(delivery.delivery_id, max_attempts=1)
+    assert claimed is not None and claimed.terminal_at is None
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE notification_outbox SET lease_until = ? WHERE id = ?",
+            ("2000-01-01T00:00:00+00:00", delivery.delivery_id),
+        )
+    assert store.claim_next_notification(max_attempts=1) is None
+    failed = store.get_notification_delivery(delivery.delivery_id)
+    assert failed is not None and failed.status == "failed" and failed.terminal_at
+    assert store.claim_next_notification(max_attempts=1) is None
+    assert store.get_notification_delivery(delivery.delivery_id).terminal_at == failed.terminal_at
 
 
 def test_stale_notification_claim_cannot_finish_reclaimed_delivery(tmp_path) -> None:

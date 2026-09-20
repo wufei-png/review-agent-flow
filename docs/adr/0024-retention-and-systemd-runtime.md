@@ -11,7 +11,11 @@ digests, decisions, expectations, lifecycle states, Effect Receipts, Relations,
 backup receipts, purge audits, and Operator audits. After the retention period
 it removes terminal Note bodies, terminal notification presentation/recipient
 fields, and terminal diagnostics. Stable terminal timestamps govern expiry;
-periodic reconciliation does not extend retention. Notification presentation,
+periodic reconciliation does not extend retention. Notification deliveries expire
+from a stable `terminal_at` set on delivery or final failure; retries remain
+nonterminal. A multi-channel request expires after all deliveries are terminal
+and its latest terminal time is old enough. An empty request expires from its
+creation time. Notification presentation,
 recipient, and channel bindings retain a non-sensitive digest so idempotent
 replays remain immutable after payload purge.
 

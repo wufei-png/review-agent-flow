@@ -142,15 +142,16 @@ def _terminal_payloads(tmp_path: Path) -> tuple[SQLiteStore, int, int, str]:
             """
             INSERT INTO notification_outbox(
                 correlation_id, channel_id, channel, title, body, url,
-                recipients_json, status, created_at, delivered_at
+                recipients_json, status, created_at, delivered_at, terminal_at
             ) VALUES ('autofix:retention', 'reviewers', 'feishu', ?, ?, ?, ?,
-                      'delivered', ?, ?)
+                      'delivered', ?, ?, ?)
             """,
             (
                 "sensitive title",
                 "sensitive notification body",
                 "https://sensitive.invalid/item",
                 '["secret-recipient"]',
+                OLD,
                 OLD,
                 OLD,
             ),
@@ -202,6 +203,62 @@ def test_retention_requires_plan_backup_but_purges_other_expired_payloads(
     assert agent_task["payload_purged_at"] is not None
     assert store.claim_published_note_reconciliation(request_id=1) is None
     assert store.get_auto_fix_publication_plan(run_id).plan_id == plan_id
+
+
+def test_notification_retention_starts_at_terminal_time_and_latest_channel(tmp_path: Path) -> None:
+    store, _run_id, _plan_id, _marker = _terminal_payloads(tmp_path)
+    recent = "2026-01-01T00:00:00+00:00"
+    with store._connect() as connection:
+        connection.execute(
+            "INSERT INTO notification_outbox(correlation_id, channel_id, channel, "
+            "title, body, recipients_json, status, created_at, terminal_at) "
+            "VALUES ('autofix:retention', 'second', 'wecom', 'second title', "
+            "'second body', '[]', 'failed', ?, ?)",
+            (OLD, recent),
+        )
+
+    first = RetentionManager(store, RetentionConfig(1, None)).sweep(
+        now=datetime(2026, 1, 1, 12, tzinfo=UTC)
+    )
+    assert first.purge.notification_payloads == 1
+    with store._connect() as connection:
+        rows = connection.execute(
+            "SELECT channel_id, body FROM notification_outbox ORDER BY channel_id"
+        ).fetchall()
+        request_body = connection.execute(
+            "SELECT body FROM notification_requests"
+        ).fetchone()[0]
+    assert [tuple(row) for row in rows] == [("reviewers", ""), ("second", "second body")]
+    assert request_body == "sensitive notification body"
+
+    second = RetentionManager(store, RetentionConfig(1, None)).sweep(
+        now=datetime(2026, 1, 2, 12, tzinfo=UTC)
+    )
+    assert second.purge.notification_payloads == 2
+    with store._connect() as connection:
+        assert connection.execute("SELECT body FROM notification_requests").fetchone()[0] == ""
+
+
+def test_notification_retention_keeps_old_queue_until_terminal_and_handles_empty_request(
+    tmp_path: Path,
+) -> None:
+    store, _run_id, _plan_id, _marker = _terminal_payloads(tmp_path)
+    with store._connect() as connection:
+        connection.execute(
+            "UPDATE notification_outbox SET status = 'pending', terminal_at = NULL"
+        )
+    RetentionManager(store, RetentionConfig(1, None)).sweep(
+        now=datetime(2026, 1, 1, tzinfo=UTC)
+    )
+    with store._connect() as connection:
+        assert connection.execute("SELECT body FROM notification_outbox").fetchone()[0]
+        assert connection.execute("SELECT body FROM notification_requests").fetchone()[0]
+        connection.execute("DELETE FROM notification_outbox")
+    RetentionManager(store, RetentionConfig(1, None)).sweep(
+        now=datetime(2026, 1, 1, tzinfo=UTC)
+    )
+    with store._connect() as connection:
+        assert connection.execute("SELECT body FROM notification_requests").fetchone()[0] == ""
 
 
 def test_retention_backs_up_exact_plan_before_purge_and_preserves_audit(

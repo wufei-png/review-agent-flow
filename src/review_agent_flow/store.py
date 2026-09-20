@@ -24,7 +24,7 @@ DEFAULT_NOTIFICATION_LEASE_SECONDS = 30
 DEFAULT_NOTIFICATION_MAX_ATTEMPTS = 3
 DEFAULT_WORKTREE_CLEANUP_LEASE_SECONDS = 60
 DEFAULT_WORKTREE_CLEANUP_MAX_ATTEMPTS = 5
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 DEFAULT_EFFECT_LEASE_SECONDS = 60
 DEFAULT_NOTE_PUBLICATION_LEASE_SECONDS = 60
 DEFAULT_NOTE_PUBLICATION_MAX_ATTEMPTS = 5
@@ -314,6 +314,7 @@ class NotificationDelivery:
     claim_token: str | None
     created_at: str
     delivered_at: str | None
+    terminal_at: str | None
     last_error: str | None
 
 
@@ -336,7 +337,7 @@ class WorktreeRecord:
 class SQLiteStore:
     """Small SQLite store.
 
-    Version 16 is intentionally a fresh schema.  There is no production database
+    Version 17 is intentionally a fresh schema.  There is no production database
     migration contract for this pre-release implementation; an older database
     must be recreated rather than guessed into a new notification or Auto-fix
     routing model.
@@ -705,9 +706,17 @@ class SQLiteStore:
                     claim_token TEXT,
                     created_at TEXT NOT NULL,
                     delivered_at TEXT,
+                    terminal_at TEXT,
                     payload_purged_at TEXT,
                     last_error TEXT,
                     UNIQUE(correlation_id, channel_id)
+                );
+                CREATE TABLE IF NOT EXISTS worker_runtime_lease (
+                    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+                    owner_id TEXT NOT NULL,
+                    claim_token TEXT NOT NULL,
+                    heartbeat_at TEXT NOT NULL,
+                    lease_until TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS worktree_cleanup (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -740,7 +749,7 @@ class SQLiteStore:
                     diagnostic_payloads INTEGER NOT NULL,
                     created_at TEXT NOT NULL
                 );
-                PRAGMA user_version = 16;
+                PRAGMA user_version = 17;
                 """
             )
 
@@ -5173,7 +5182,7 @@ class SQLiteStore:
                 UPDATE notification_outbox
                 SET title = '', body = '', url = NULL, recipients_json = '[]',
                     last_error = NULL, payload_purged_at = ?
-                WHERE status IN ('delivered', 'failed') AND created_at <= ?
+                WHERE status IN ('delivered', 'failed') AND terminal_at <= ?
                   AND payload_purged_at IS NULL AND claim_token IS NULL
                 """,
                 (now, cutoff_at),
@@ -5183,14 +5192,27 @@ class SQLiteStore:
                 UPDATE notification_requests
                 SET title = '', body = '', url = NULL, recipients_json = '[]',
                     payload_purged_at = ?
-                WHERE created_at <= ? AND payload_purged_at IS NULL
-                  AND NOT EXISTS (
-                      SELECT 1 FROM notification_outbox o
-                      WHERE o.correlation_id = notification_requests.correlation_id
-                        AND o.status NOT IN ('delivered', 'failed')
+                WHERE payload_purged_at IS NULL
+                  AND (
+                      (NOT EXISTS (
+                          SELECT 1 FROM notification_outbox o
+                          WHERE o.correlation_id = notification_requests.correlation_id
+                      ) AND created_at <= ?)
+                      OR (
+                          EXISTS (
+                              SELECT 1 FROM notification_outbox o
+                              WHERE o.correlation_id = notification_requests.correlation_id
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1 FROM notification_outbox o
+                              WHERE o.correlation_id = notification_requests.correlation_id
+                                AND (o.status NOT IN ('delivered', 'failed')
+                                     OR o.terminal_at IS NULL OR o.terminal_at > ?)
+                          )
+                      )
                   )
                 """,
-                (now, cutoff_at),
+                (now, cutoff_at, cutoff_at),
             ).rowcount
             diagnostics = 0
             for query, parameters in (
@@ -5337,7 +5359,7 @@ class SQLiteStore:
                 SELECT id AS delivery_id, correlation_id, channel_id, channel,
                        title, body, url, recipients_json, status, attempts,
                        next_attempt_at, lease_until, claim_token, created_at,
-                       delivered_at, last_error
+                       delivered_at, terminal_at, last_error
                 FROM notification_outbox
                 WHERE correlation_id = ?
                 ORDER BY id
@@ -5353,7 +5375,7 @@ class SQLiteStore:
                 SELECT id AS delivery_id, correlation_id, channel_id, channel,
                        title, body, url, recipients_json, status, attempts,
                        next_attempt_at, lease_until, claim_token, created_at,
-                       delivered_at, last_error
+                       delivered_at, terminal_at, last_error
                 FROM notification_outbox WHERE id = ?
                 """,
                 (delivery_id,),
@@ -5399,7 +5421,7 @@ class SQLiteStore:
                 SELECT id AS delivery_id, correlation_id, channel_id, channel,
                        title, body, url, recipients_json, status, attempts,
                        next_attempt_at, lease_until, claim_token, created_at,
-                       delivered_at, last_error
+                       delivered_at, terminal_at, last_error
                 FROM notification_outbox
                 WHERE status = 'pending' AND next_attempt_at <= ?
                   {exclusion}
@@ -5419,7 +5441,7 @@ class SQLiteStore:
                 SELECT id AS delivery_id, correlation_id, channel_id, channel,
                        title, body, url, recipients_json, status, attempts,
                        next_attempt_at, lease_until, claim_token, created_at,
-                       delivered_at, last_error
+                       delivered_at, terminal_at, last_error
                 FROM notification_outbox
                 WHERE id = ? AND status = 'pending' AND next_attempt_at <= ?
                   {channel_scope}
@@ -5442,7 +5464,7 @@ class SQLiteStore:
             SELECT id AS delivery_id, correlation_id, channel_id, channel,
                    title, body, url, recipients_json, status, attempts,
                    next_attempt_at, lease_until, claim_token, created_at,
-                   delivered_at, last_error
+                   delivered_at, terminal_at, last_error
             FROM notification_outbox WHERE id = ?
             """,
             (row["delivery_id"],),
@@ -5473,13 +5495,16 @@ class SQLiteStore:
                 SET status = CASE WHEN attempts >= ? THEN 'failed' ELSE 'pending' END,
                     next_attempt_at = CASE WHEN attempts >= ? THEN NULL ELSE ? END,
                     lease_until = NULL, claim_token = NULL,
+                    terminal_at = CASE WHEN attempts >= ?
+                        THEN COALESCE(terminal_at, ?) ELSE NULL END,
                     last_error = CASE WHEN attempts >= ?
                         THEN 'notification delivery lease expired'
                         ELSE 'notification delivery lease expired; retrying' END
                 WHERE status = 'running'
                   AND (lease_until IS NULL OR lease_until <= ?)
                 """,
-                (max_attempts, max_attempts, now_text, max_attempts, now_text),
+                (max_attempts, max_attempts, now_text, max_attempts, now_text,
+                 max_attempts, now_text),
             )
             claimed = self._claim_notification_row(
                 connection,
@@ -5570,10 +5595,14 @@ class SQLiteStore:
                 )
             query = (
                 "UPDATE notification_outbox SET status = ?, next_attempt_at = ?, "
-                "lease_until = NULL, claim_token = NULL, delivered_at = ?, last_error = ? "
+                "lease_until = NULL, claim_token = NULL, delivered_at = ?, "
+                "terminal_at = CASE WHEN ? IN ('delivered', 'failed') "
+                "THEN COALESCE(terminal_at, ?) ELSE NULL END, last_error = ? "
                 "WHERE id = ? AND status = 'running'"
             )
-            parameters = (status, next_attempt_at, delivered_at, last_error, delivery_id)
+            parameters = (
+                status, next_attempt_at, delivered_at, status, now_text, last_error, delivery_id
+            )
             if claim_token is not None:
                 query += " AND claim_token = ? AND lease_until IS NOT NULL AND lease_until > ?"
                 parameters += (claim_token, now_text)
