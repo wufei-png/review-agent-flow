@@ -1,6 +1,6 @@
 # ReviewFlow 试运行准备执行队列
 
-状态：实施中；01–04 已完成本地实现与检查，05 待实施。规划基线：2026-09-20，`f407d0b25583a9553cbac24741183e87457d1523`。每次实施先核对当前提交、工作区和实际代码；本文的基线不是跳过核对的理由。
+状态：实施中；01–04 已完成本地实现与检查，05 的部署故障手册已本地完成，真实 canary 与试运行判定待现场资源及证据。规划基线：2026-09-20，`f407d0b25583a9553cbac24741183e87457d1523`。每次实施先核对当前提交、工作区和实际代码；本文的基线不是跳过核对的理由。
 
 ## 目标与契约
 
@@ -32,7 +32,7 @@ Agent 仍从冻结的目标分支 Skill 与 `AgentTaskV1` 获取任务，只向 
 | 02 | P1 | [终态保留与 Worker 所有权](02-retention-worker-ownership.md) | 01 完成；schema 切换前保存证据 | 本地完成；现场证据待 05 |
 | 03 | P1 | [Operator 诊断](03-operator-diagnostics.md) | 02 完成 | 本地完成；现场证据待 05 |
 | 04 | P1 | [一致性备份与恢复验证](04-backup-restore.md) | 02 完成；建议 03 完成以复用状态查询 | 本地完成；现场证据待 05 |
-| 05 | 发布门槛 | [部署与真实 canary](05-deployment-canary.md) | 01–04 完成；取得独立 canary 资源 | 待实施 |
+| 05 | 发布门槛 | [部署与真实 canary](05-deployment-canary.md) | 01–04 完成；取得独立 canary 资源 | 阶段 1 本地完成；阶段 2 待现场验证；未作 go/no-go 判定 |
 
 每项任务由一个新会话完成，并依照该任务的阶段顺序用 `implement-in-stages` 逐阶段验证、本地提交。每个阶段都须留下有效仓库状态；提交前只暂存该阶段文件并检查 staged diff。完成一个会话后更新本队列及对应计划的状态、提交与检查结果。若代码事实推翻计划，只调整未开始的阶段，并记录理由。不要把本地测试、模拟 GitLab 或配置检查记成真实平台验收。
 
@@ -52,3 +52,5 @@ Agent 仍从冻结的目标分支 Skill 与 `AgentTaskV1` 获取任务，只向 
 - `.venv/bin/python -m pytest`：398 passed，1 条 Starlette/httpx 测试依赖弃用警告；相关四个测试文件、`.venv/bin/ruff check .`、`.venv/bin/python -m compileall -q src tests`、CLI `--help`、`git diff --check` 通过。诊断仅读取 Store 的已知事实；未核查远端 Note/MR、收件人可见性、真实 Worker 部署或告警阈值。
 - 2026-09-21，04 本地完成：`39f643b`（一致性 Store/Plan 备份包）、`8f5680e`（离线验包和恢复手册）、`cad3ac2`（独立只读审查后修正首次无 Plan 收据、并发目标覆盖及发布后 fsync 失败）。审查的两项 P2、一项 P3 均核实并修复，无拒绝项。
 - `.venv/bin/python -m pytest`：417 passed，1 条 Starlette/httpx 测试依赖弃用警告；备份相关针对性测试、`.venv/bin/ruff check .`、`.venv/bin/python -m compileall -q src tests`、CLI `--help`、`git diff --check` 通过。临时 Store 的 WAL 并发快照、损坏拒绝和空路径恢复演练验证了只读查询及绝对收据路径；未在 Linux systemd 部署、独立备份介质或真实服务身份下演练，05 仍需现场恢复和新 canary 证据。
+- 2026-09-21，05 阶段 1 本地完成：`fc6d1a0`（部署故障手册及 reference 权限核对）、`30f52df`（独立只读审查后补齐 Operator 命令的活动 Store 与安全凭据环境）、`9added1`（修正既有 Worker 失租测试的链式异常竞态断言）。审查的两项 P2 均核实并修复，无拒绝项；审查者复核测试修正无新增发现。阶段 2 未实施，试运行 go/no-go 尚无依据。
+- 本地最终 `.venv/bin/python -m pytest` 417 passed，1 条 Starlette/httpx 弃用警告；期间一次复检为 416 passed、1 failed，定位为已有 Worker 失租测试只接受顶层异常文本，改为检查顶层及链式根因后定向连跑 5 次和全量复跑通过。OpenCode `1.18.11` 在本机的 runtime-isolation 定向测试为 1 passed；CLI/部署定向测试 19 passed，`.venv/bin/ruff check .`、compileall、CLI `--help`、相对 Markdown 链接检查、staged `git diff --check` 通过。当前主机为 macOS，未运行 `systemd-analyze verify` 或 Linux 服务演练。虽本机有 JiHuLab CLI 登录与模型凭据，独立 canary Project、新通知 webhook/人工收件人、Linux systemd 主机和隔离恢复环境尚未确认；没有新的 exact-SHA 远端 Note、commit/MR、Relation、通知或恢复收据。旧 A1 证据不计入 05 验收。

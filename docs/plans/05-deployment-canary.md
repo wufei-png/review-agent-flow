@@ -1,0 +1,33 @@
+# 05 · 部署与真实 canary
+
+状态：阶段 1 本地完成；阶段 2 待现场资源和验证，试运行未判定。优先级：试运行门槛。前置条件：[01](01-notification-and-outcome.md)、[02](02-retention-worker-ownership.md)、[03](03-operator-diagnostics.md)、[04](04-backup-restore.md) 均完成；阶段 2 仍需独立 canary Project、健康 Agent provider、Review Bot 权限及新通知 webhook。
+
+## 交付结果
+
+值班人员能按运行手册启停服务、检查告警、轮换凭据、恢复备份，并在外部写结果不明时按已持久化的阶段作出安全决定。新的 exact-SHA canary 证明最终 OpenCode 配置下的 Note、Auto-fix commit/child MR、Relation、通知服务端接受、人工可见确认、幂等重放及提交/MR 写边界恢复。试运行 go/no-go 只依据完成的现场证据。
+
+## 当前边界与资料
+
+- [A1 历史证据](../evidence/jihulab-opencode-a1-2026-08-10.md)只完成 Program-owned Note；成功 Note 早于最终 target-frozen Skill 和 OpenCode 配置，Auto-fix 与通知闭环未完成。该文档保留为历史，不作为新 canary 的验收收据。
+- `docs/quickstart-host-native.md` 给出本机试用入口，`docs/deployment-linux-systemd.md` 和 `deploy/` 给出 reference unit；`docs/spec/05-integrations.md`、`06-runtime-and-storage.md` 定义发布、通知及恢复边界。
+- Agent 的任务输入与 RESULT_PATH v1 已有契约。canary 使用当前最终配置验证实际能力；仅在具体失败证据指向现有约束时另行处理 Agent 提示词或工具权限。
+
+## 阶段
+
+1. **部署与故障操作手册** — 更新 reference deployment，增加可执行的 runbook：单 Worker 及三循环存活检查、队列和异常状态、关闭 Auto-fix/通知外部写入、Note/commit/MR 不确定结果核查、notification resend 的人工判断、rearm/abandon、凭据轮换、备份验证与停止服务后的恢复。列出新 canary 所需资源、最小身份权限、日志/收据字段和退出条件。`/readyz` 保持本地 Store readiness；Worker/provider 由独立状态与告警观察。只在真实服务验证后调整 systemd sandbox 指令。**依赖：** 01–04 完成。**验收：** 操作步骤与当前 CLI 参数相符；`systemd-analyze verify` 在可用主机通过；操作手册对每个不确定边界给出明确核查与升级路径；文档检查与相关测试通过。一个本地提交。
+2. **新 exact-SHA 现场验证** — 使用与 A1 不同的新 MR head，保存 ReviewKey、frozen policy/Plan digest、Note ID、Auto-fix commit SHA、child MR IID、Relation、notification request generation/outbox 状态与脱敏 correlation。核对服务端接受后由 canary 收件人单独确认可见；重复入队和 Worker replay 不新增 Note/Auto-fix Relation/请求 generation，通知传输仍按至少一次契约允许重复。分别在 Auto-fix commit、MR 外部写边界之后中断并恢复，对账不重复创建远端 commit/MR；演练备份包在隔离环境的完整恢复。把成功与失败及环境版本记录到新的 `docs/evidence/` 文档，更新 implementation status。**依赖：** 阶段 1 与真实资源可用。**验收：** 逐项证据可追溯到同一精确 SHA、配置与实际远端身份；所有要求的正向与崩溃演练完成；失败时按 runbook 关闭相应外部写并保留现场。证据文档一个本地提交。
+
+## 证据与试运行判定
+
+本地 `ruff check .`、`pytest`、`python -m compileall -q src tests` 和 `git diff --check` 必须通过；OpenCode runtime isolation 测试在 canary 主机确认实际执行，不能把 skip 记作通过。真实通知分成队列已落库、服务端已接受、收件人确认可见三项记录。前两项仍不能推出已读。
+
+若 provider 凭据、可用 webhook、独立 Project 或隔离恢复环境缺失，完成可独立验证的阶段 1，保留阶段 2 为待验证并列出缺项；不要制造 live 结论或复用旧 Note。只在完成恢复演练、外部写对账和安全退出路径后记录试运行 go/no-go。
+
+完成记录写入[执行队列](pilot-readiness-queue.md)，并在本文记录提交、现场收据与未验证项。
+
+## 完成记录
+
+- 2026-09-21，阶段 1：`fc6d1a0` 新增 [单 Project 运维手册](../operations-runbook.md)，核对 reference 部署的 Worker 配置文件身份与三循环、状态、外部写和恢复路径；`30f52df` 按独立只读 review 修正 rearm/abandon 的活动 Store 路径，以及 resend/recover 的 Worker 身份、root-owned 环境文件与活动 Store 调用。两项 P2 均接受并修复，无拒绝项。`9added1` 修正既有 Worker 失租测试的链式异常竞态断言，审查者复核后无新增发现。
+- 本地检查：最终 `.venv/bin/python -m pytest` 417 passed，1 条 Starlette/httpx 依赖弃用警告；此前一次复检为 416 passed、1 failed，失败的既有断言经修正后定向连跑 5 次及全量复跑通过。`.venv/bin/python -m pytest tests/test_opencode_runtime_isolation.py -rs` 1 passed（OpenCode `1.18.11`，仅本机）；`.venv/bin/python -m pytest tests/test_cli.py tests/test_deployment.py` 19 passed；`.venv/bin/ruff check .`、`.venv/bin/python -m compileall -q src tests`、相关 CLI `--help`、相对 Markdown 链接和 staged `git diff --check` 通过。
+- 现场收据：无新收据。本机确认 JiHuLab CLI 已登录且存在模型凭据；未确认独立 canary Project、新通知 webhook 与人工收件人、Linux systemd 主机和隔离恢复环境。当前主机是 macOS，`systemd-analyze verify`、服务身份/sandbox 验证和 canary 主机上的 OpenCode isolation 尚未执行。
+- 阶段 2 保持待现场验证：新的 exact-SHA ReviewKey、frozen Policy/Plan digest、Note ID、Auto-fix commit/child MR/Relation、通知服务端接受与人工可见、重复入队及 Worker replay、commit/MR 写边界中断恢复、完整备份包隔离恢复均未取得。未作试运行 go/no-go 判定；不复用 A1 Note。
