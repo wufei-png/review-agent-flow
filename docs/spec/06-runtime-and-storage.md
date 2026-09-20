@@ -60,7 +60,7 @@ pending -> running -> succeeded
 
 The Store atomically claims eligible work with an opaque token and lease. Expired work is recovered with a dedicated bounded lease-recovery counter; stale tokens cannot heartbeat, finish or mutate a reclaimed item. Transient GitLab, rate-limit and transport failures use capped backoff and a separate failure-attempt counter. Claim count is diagnostic and eligibility deferrals do not consume either failure budget. Configuration, policy, invalid SHA and Agent contract failures are terminal. A head change cancels or supersedes the old key and enqueues the new exact SHA without publishing old effects. All accepted Git SHAs are canonicalized to lowercase before they participate in identity or marker construction.
 
-Note, Auto-fix and notification state is independent from process success. Requested Outputs, the Effective Run Decision and Output Expectations are frozen before effects proceed. User-visible Review Outcome is a projection over those durable expectations and receipts, not a synonym for Agent exit status.
+Note, Auto-fix and notification state is independent from process success. Requested Outputs, the Effective Run Decision and Output Expectations are frozen before effects proceed. User-visible Review Outcome is a projection over those durable expectations and receipts, not a synonym for Agent exit status. A `superseded` effect was safely suppressed and contributes no delivery; an all-superseded ReviewKey has `no_effect`. An outbox `delivered` state records provider acceptance, not recipient visibility, and at-least-once delivery may duplicate messages.
 
 ## Fresh SQLite schema
 

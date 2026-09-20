@@ -27,7 +27,7 @@ _Avoid_: Review Key, Effect Marker
 **Run Lifecycle**: Review Run 从排队、执行到终止的编排状态。终止后保持稳定，不把外部 Review Artifact 的可见性编码为生命周期状态。
 _Avoid_: Review Outcome, Delivery Status
 
-**Review Outcome**: 从 Run Lifecycle、用户可见 Effect Receipts 和 Notification Delivery 记录派生的当前用户结果；它可随后续投递与对账而变化。
+**Review Outcome**: 从 Run Lifecycle、用户可见 Effect Receipts 和 Notification Delivery 记录派生的当前用户结果；它可随后续投递与对账而变化。`superseded` 表示旧 SHA 的输出被安全抑制，不算效果送达。
 _Avoid_: Run Status, Process Exit Status
 
 **Requested Output**: Review Run 入队时从 Policy Snapshot 持久化的不可变用户可见输出请求。它记录 Project 想要什么，但不证明本次 Run 具备产生该输出的资格。
@@ -44,7 +44,7 @@ _Avoid_: Raw Policy, Webhook Payload
 **Publication Request**: ReviewFlow 在调用外部平台前持久化的用户可见效果请求。它使 Note、Auto-fix 和通知能独立重试与对账。
 _Avoid_: Agent Side Effect, Synchronous Publish
 
-**Notification Delivery**: 一个通知渠道面向一组接收者的持久化投递结果。它独立于 Run Lifecycle，但参与 Review Outcome。
+**Notification Delivery**: 一个通知渠道面向一组接收者的持久化投递结果。它独立于 Run Lifecycle，但参与 Review Outcome。`delivered` 表示服务端接受，可能重复，不证明收件人可见。
 _Avoid_: Review Run Status, Synchronous Notification
 
 **Auto-fix Merge Request**: AutoFixPublisher 根据不可变 Publication Plan 以 Review Bot 身份创建的独立 MR，目标为父 MR 的 source branch。它必须由 Auto-fix Intent 授权并建立 Auto-fix Relation。

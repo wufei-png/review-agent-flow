@@ -1427,9 +1427,11 @@ class SQLiteStore:
                     state = str(row["state"]) if row is not None else "missing"
                     states.append(
                         "delivered"
-                        if state in {"published", "superseded"}
+                        if state == "published"
                         else "pending"
                         if state in {"pending", "running", "uncertain"}
+                        else "superseded"
+                        if state == "superseded"
                         else "failed"
                     )
                 else:
@@ -1443,18 +1445,19 @@ class SQLiteStore:
                     state = str(row["state"]) if row is not None else "missing"
                     states.append(
                         "delivered"
-                        if state in {"published", "superseded"}
+                        if state == "published"
                         else "pending"
                         if state in {"frozen", "running", "needs_reconciliation", "reconciling"}
+                        else "superseded"
+                        if state == "superseded"
                         else "failed"
                     )
         if "pending" in states:
             return "pending"
-        if all(state == "delivered" for state in states):
-            return "delivered"
-        if optional_delivered or "delivered" in states:
-            return "degraded"
-        return "undelivered"
+        observed_delivery = optional_delivered or "delivered" in states
+        if "failed" not in states:
+            return "delivered" if observed_delivery else "no_effect"
+        return "degraded" if observed_delivery else "undelivered"
 
     def get_project_bound_review_run_status(
         self, project_id: str, run_id: int
@@ -1465,6 +1468,8 @@ class SQLiteStore:
         are returned.  The response is deliberately assembled from a
         whitelist rather than serializing ``ReviewRun`` or ``EffectReceipt``
         directly, because those internal records contain lease claim tokens.
+        A delivered notification means provider acceptance, not recipient
+        visibility; at-least-once delivery may send duplicates after a crash.
         """
 
         if not project_id or not project_id.strip() or run_id <= 0:

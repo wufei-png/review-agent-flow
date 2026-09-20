@@ -38,7 +38,7 @@ This is evidence for the old Agent-owned path only. It does not verify strict RE
 - Child MR webhooks update or wake only an existing Intent/Relation; they never create a Review Run or local authority.
 - Notification delivery and reconciliation/cleanup use independent loops within one supervised Worker process.
 - Store-loss relation recovery, notification resend, blocked-Plan rearm and Plan abandonment are separate explicit audited Operator actions.
-- Review Outcome is derived from immutable expectations and durable receipts as `pending`, `no_effect`, `delivered`, `degraded`, `undelivered` or `indeterminate`.
+- Review Outcome is derived from immutable expectations and durable receipts as `pending`, `no_effect`, `delivered`, `degraded`, `undelivered` or `indeterminate`. A safely superseded old-SHA effect is not delivery; all-superseded expectations yield `no_effect`. Notification `delivered` means provider acceptance under an at-least-once contract, not recipient visibility.
 - Full unit/integration tests cover crash windows, idempotent retries, stale heads, duplicate markers, invalid diffs, verifier failure and recovery validation.
 - Retention tests prove backup-before-purge, immutable backup conflicts, terminal payload purge and graceful Worker shutdown.
 - `command` and OpenCode thin adapters now consume the same frozen `AgentTaskV1`; its bounded Skill bytes/digest come from the frozen target commit or Operator-owned default and are privately materialized per attempt. OpenCode uses an isolated adapter-owned Agent through native non-interactive `run --pure --agent reviewflow` without `--auto`, while the shared Runner retains lifecycle, heartbeat and strict Result parsing.

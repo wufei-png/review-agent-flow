@@ -135,6 +135,7 @@ def _frozen_plan(
     *,
     policy_channels: tuple[str, ...] | None = None,
     with_delivered_note: bool = False,
+    with_auto_fix_decision: bool = False,
 ) -> tuple[SQLiteStore, int, int, str]:
     store = SQLiteStore(tmp_path / "review.db")
     run = store.enqueue("42", 1, SHA)
@@ -153,6 +154,26 @@ def _frozen_plan(
             policy_json=policy_json(policy),
         )
     note_request_id = None
+    if with_auto_fix_decision:
+        assert store.freeze_requested_outputs(
+            run.run_id,
+            claimed.claim_token,
+            human_review=False,
+            ai_review=False,
+            auto_fix=True,
+            notification_channels=(),
+        )
+        assert store.freeze_effective_run_decision(
+            run.run_id,
+            claimed.claim_token,
+            decision="execute",
+            human_review=False,
+            ai_review=False,
+            auto_fix=True,
+            suppressed=False,
+            recipients=(),
+            notification_channels=(),
+        )
     if with_delivered_note:
         marker = canonical_note_marker("42", 1, SHA)
         assert store.freeze_requested_outputs(
@@ -491,7 +512,7 @@ def test_commit_error_stops_normal_retries_as_uncertain(tmp_path: Path) -> None:
 
 
 def test_stale_parent_supersedes_plan_without_gitlab_write(tmp_path: Path) -> None:
-    store, run_id, plan_id, _branch = _frozen_plan(tmp_path)
+    store, run_id, plan_id, _branch = _frozen_plan(tmp_path, with_delivered_note=True)
     gitlab = FakeGitLab(
         MergeRequest("42", 1, "Parent", "alice", "feature", "main", "b" * 40, "https://parent")
     )
@@ -504,6 +525,20 @@ def test_stale_parent_supersedes_plan_without_gitlab_write(tmp_path: Path) -> No
     assert plan is not None and plan.state == "superseded"
     assert store.get_auto_fix_publication_intent(run_id).state == "superseded"
     assert store.list_effect_receipts(run_id, "autofix_plan")[0].state == "superseded"
+    assert store.project_review_outcome(run_id) == "delivered"
+
+
+def test_stale_parent_with_only_expected_autofix_has_no_effect(tmp_path: Path) -> None:
+    store, run_id, plan_id, _branch = _frozen_plan(tmp_path, with_auto_fix_decision=True)
+    gitlab = FakeGitLab(
+        MergeRequest("42", 1, "Parent", "alice", "feature", "main", "b" * 40, "https://parent")
+    )
+
+    result = _publisher(store, gitlab).process(plan_id=plan_id)
+
+    assert result is not None and result.status == "superseded"
+    assert gitlab.commit_payloads == []
+    assert store.project_review_outcome(run_id) == "no_effect"
 
 
 def test_reconciler_recovers_missing_merge_request_after_confirmed_commit(

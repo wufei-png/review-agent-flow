@@ -96,6 +96,8 @@ The first release supports Feishu and WeCom. A Project may configure both. Each 
 
 ReviewFlow persists one immutable Notification Request and one outbox delivery per selected channel before delivery. Channel failure does not roll back the Review Run or another channel. Failed deliveries retry with bounded backoff and remain auditable. Delivery is at-least-once across a crash between provider delivery and acknowledgement, so a provider may receive a duplicate.
 
+The outbox and read-only status use `delivered` when HTTP 2xx and the provider business response accept the request. This does not establish recipient visibility or exclude duplicate messages. Record recipient visibility separately during a live canary. A safely `superseded` Note or Auto-fix Plan for an old SHA is not a delivered effect: if all expected effects are superseded, Review Outcome is `no_effect`; a published Note with an optional superseded Auto-fix Plan remains `delivered`.
+
 The webhook adapter succeeds only for HTTP 2xx plus provider business success (`code == 0` for Feishu, `errcode == 0` for WeCom). Provider-specific mention markup stays in the adapter.
 
 ## Explicit recovery

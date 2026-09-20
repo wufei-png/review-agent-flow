@@ -295,7 +295,9 @@ def test_stale_parent_supersedes_note_without_creating_it(tmp_path: Path) -> Non
 
     assert result.status == "superseded"
     assert gitlab.create_calls == 0
-    assert store.project_review_outcome(request.run_id) == "delivered"
+    assert store.project_review_outcome(request.run_id) == "no_effect"
+    status = store.get_project_bound_review_run_status("42", request.run_id)
+    assert status is not None and status["review_outcome"] == "no_effect"
 
 
 def test_confirmed_deleted_note_is_marked_removed_and_never_recreated(tmp_path: Path) -> None:
