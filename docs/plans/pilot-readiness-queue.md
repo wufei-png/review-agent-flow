@@ -4,7 +4,7 @@
 
 ## 目标与契约
 
-本队列收口单 Project、单 Worker 的有限生产试运行准备。完成代码和本地检查后，还需新的 JiHuLab/OpenCode、通知渠道及恢复演练证据才能作出试运行判定。既有 [A1 证据](../evidence/jihulab-opencode-a1-2026-08-10.md)只证明精确 SHA 评审、Program-owned Note、重复入队幂等及部分租约恢复。
+本队列收口单 Project、单 Worker 的有限生产试运行准备。01–04 的本地实施已完成并归档，剩余现场门槛由 05 跟踪；新 JiHuLab/OpenCode canary 已取得正向发布、通知及部分恢复收据，当前判定为 no-go。既有 [A1 证据](../evidence/jihulab-opencode-a1-2026-08-10.md)只证明精确 SHA 评审、Program-owned Note、重复入队幂等及部分租约恢复。
 
 Agent 仍从冻结的目标分支 Skill 与 `AgentTaskV1` 获取任务，只向 `RESULT_PATH` 写入现有 v1 结果；ReviewFlow 持有 GitLab 发布、通知和恢复权限。本队列不扩展 Agent 结果字段或增加提示词、工具限制。只有真实 canary 证明现有约束妨碍评审或修复时，才针对该证据另行调整。
 
@@ -28,11 +28,11 @@ Agent 仍从冻结的目标分支 Skill 与 `AgentTaskV1` 获取任务，只向 
 
 | 顺序 | 优先级 | 独立会话 | 前置条件 | 状态 |
 | --- | --- | --- | --- | --- |
-| 01 | P0 | [通知可领取与结果语义](01-notification-and-outcome.md) | 无 | 本地完成；现场证据待 05 |
-| 02 | P1 | [终态保留与 Worker 所有权](02-retention-worker-ownership.md) | 01 完成；schema 切换前保存证据 | 本地完成；现场证据待 05 |
-| 03 | P1 | [Operator 诊断](03-operator-diagnostics.md) | 02 完成 | 本地完成；现场证据待 05 |
-| 04 | P1 | [一致性备份与恢复验证](04-backup-restore.md) | 02 完成；建议 03 完成以复用状态查询 | 本地完成；现场证据待 05 |
-| 05 | 发布门槛 | [部署与真实 canary](05-deployment-canary.md) | 01–04 完成；取得独立 canary 资源 | 阶段 1 完成；阶段 2 正向 Run、MR 写后恢复和隔离备份已验证，commit 写后只能安全阻断；no-go，验收未完成 |
+| 01 | P0 | [通知可领取与结果语义](archive/2026-09-pilot-readiness/01-notification-and-outcome.md) | 无 | 本地实施完成并归档；现场收据见 05 |
+| 02 | P1 | [终态保留与 Worker 所有权](archive/2026-09-pilot-readiness/02-retention-worker-ownership.md) | 01 完成；schema 切换前保存证据 | 本地实施完成并归档；现场收据见 05 |
+| 03 | P1 | [Operator 诊断](archive/2026-09-pilot-readiness/03-operator-diagnostics.md) | 02 完成 | 本地实施完成并归档；现场收据见 05 |
+| 04 | P1 | [一致性备份与恢复验证](archive/2026-09-pilot-readiness/04-backup-restore.md) | 02 完成；建议 03 完成以复用状态查询 | 本地实施完成并归档；隔离恢复见 05，独立介质/恢复主机未验 |
+| 05 | 发布门槛 | [部署与真实 canary](05-deployment-canary.md) | 01–04 完成；取得独立 canary 资源 | 正向 Run、MR 写后恢复、隔离备份及仅吴非通知可见已验证；commit 写后未完成发布恢复，no-go |
 
 每项任务由一个新会话完成，并依照该任务的阶段顺序用 `implement-in-stages` 逐阶段验证、本地提交。每个阶段都须留下有效仓库状态；提交前只暂存该阶段文件并检查 staged diff。完成一个会话后更新本队列及对应计划的状态、提交与检查结果。若代码事实推翻计划，只调整未开始的阶段，并记录理由。不要把本地测试、模拟 GitLab 或配置检查记成真实平台验收。
 
@@ -43,6 +43,8 @@ Agent 仍从冻结的目标分支 Skill 与 `AgentTaskV1` 获取任务，只向 
 独立指标服务、固定 admission 阈值、分布式 tracing、通知静默与升级策略、凭据热加载及额外 systemd sandbox 指令，需要容量或运行证据再设计。队列中的只读队列年龄和状态汇总可供初期告警使用；试运行目标值由真实负载和恢复演练校准。
 
 ## 完成记录
+
+以下记录按实施时序保留；早期“待验证”是当时的阶段快照，当前结论以页首、05 计划和现场证据为准。
 
 - 2026-09-20，01 本地完成：`f85aaa8`（通知领取）、`b3e4381`（Run 租约 fencing）、`bb67f5c`（结果投影和措辞）、`7e5e6ac`（review 后修正 Worker 返回状态）。独立只读 review 的一项 P2 已核实并修复；无其他发现。
 - `.venv/bin/python -m pytest`：380 passed，1 条 Starlette/httpx 测试依赖弃用警告；`.venv/bin/ruff check .`、`.venv/bin/python -m compileall -q src tests`、`git diff --check` 通过。测试中的 GitLab 与通知服务为模拟；新 JiHuLab/OpenCode、飞书/企微服务端接受、收件人可见及崩溃恢复现场证据仍由 05 收集。
@@ -59,3 +61,4 @@ Agent 仍从冻结的目标分支 Skill 与 `AgentTaskV1` 获取任务，只向 
 - 2026-09-21，05 阶段 2 现场推进：`52ad655`（Worker 私有 OpenCode OAuth 启动器）、`c1b8b8a`（保留内置 OAuth 插件）；主机 Worker 身份 OpenCode `openai/gpt-5.6-luna` 探针返回 `OK`。Run `1` 完成 Note `9207699`、Auto-fix commit `85fcd9c9640de3e4dc90a0a0d68eb4b4eb49d327`、子 MR `!2`、Relation `1`、飞书 owner-only outbox 服务端接受；重复入队和 Worker 重启无重复效果。Run `4` 在子 MR 写后退出 `137`，正常 Worker 对账 `!3` 并只生成一次 Relation/通知请求。Run `3` 在 commit 写后退出 `137`，远端唯一 commit 与 Plan 一致且未重写，但因 SHA 未持久化被安全阻断；备份后审计式 abandon，未完成发布。真实 Store bundle 和隔离副本上的含 canonical Plan bundle 均通过隔离恢复；原 Store 的 API/Worker 重启健康。详见[本计划](05-deployment-canary.md)与[现场收据](../evidence/jihulab-opencode-canary-2026-09-21.md)。
 - 最终本地全量 `.venv/bin/python -m pytest` 427 passed、1 条 Starlette/httpx 弃用警告；OpenCode 定向 4 passed；Ruff、compileall、`git diff --check` 通过。`delegated-change-review` 的全新只读审查对 `0df06cc..1c45d02` 无 P0–P3 发现，未独立重放现场收据。当前使用可用的个人 OpenCode OAuth 副本，不是专用可续期 Provider 身份；TLS webhook 和 commit 写后继续完成发布亦未通过。05 保持未完成，试运行 no-go，两个 systemd 服务已停止并 disabled。
 - 吴非提供的个人飞书会话截图确认 ReviewFlow outbox 中子 MR `!2`、`!3` 的两条通知实际可见，另显示此前的通道测试和适配器探针。原图只保留在私有本机证据目录，摘要及证据边界见[现场收据](../evidence/jihulab-opencode-canary-2026-09-21.md)。实际通知人工可见性待验项已关闭；截图不证明阅读时间，也不改变 05 未完成及试运行 no-go 判定。
+- 2026-09-21 文档整理：01–04 已完成本地实施，详细任务与审查记录移至 `docs/plans/archive/2026-09-pilot-readiness/`；05 和本队列保留当前 no-go、未验证门槛及现场证据入口，实施状态与 README 同步到新 canary 收据。

@@ -2,7 +2,24 @@
 
 ## Migration status
 
-The normative specifications and ADRs describe the accepted Program-owned publication target. Publication, target-branch Policy Snapshots, Operator-owned notification bindings, Review Outcome projection, retention enforcement and the Linux systemd reference deployment are implemented. Consistent SQLite/receipt-referenced Plan bundle creation and offline verification have local tests and a temporary-directory restore rehearsal. A 2026-08-10 JiHuLab/OpenCode canary verified exact-SHA execution, Program-owned Notes, manual-trigger idempotency and lease reclaim, but did not complete Auto-fix or notification delivery. A separate 2026-09-21 canary preparation verified the reference host, exact target MR, Store access across the API and Worker Unix identities, and a transport-only owner DM. It did not start a ReviewFlow Run. Reverse-proxy ingress, dedicated Provider and Feishu app credentials, live publication, notification delivery, real backup-medium and systemd restore verification remain deployment gates.
+The normative specifications and ADRs describe the accepted Program-owned
+publication target. Publication, target-branch Policy Snapshots, Operator-owned
+notification bindings, Review Outcome projection, retention enforcement and
+the Linux systemd reference deployment are implemented. Consistent
+SQLite/receipt-referenced Plan bundle creation and offline verification have
+local tests. The 2026-08-10 JiHuLab/OpenCode A1 canary is historical and did
+not complete Auto-fix or notification delivery.
+
+The 2026-09-21 exact-SHA canary exercised the final OpenCode Luna configuration,
+Program-owned Note, Auto-fix commit and child MR, Relation, owner-only Feishu
+outbox delivery and recipient visibility, idempotent replay, post-MR-write
+recovery, and an isolated Linux mount-namespace restore. A post-commit-write
+crash stopped safely but could not complete publication from persisted
+identity; its Plan was abandoned after remote verification and backup. The
+pilot decision is **no-go**. TLS webhook ingress with signed live intake and
+a dedicated renewable Provider identity remain unverified. An independent
+backup medium and a recovery-host/systemd restore exercise also remain
+untested; the latter is required if the pilot must tolerate host loss.
 
 Policy v4, Operator configuration v4, kind-free ReviewKey storage, strict external Operator Backend/Profile and notification authorization, minimal Agent environment, RESULT_PATH v1 parsing, durable Program-owned Note publication, immutable Auto-fix Intent creation, bounded Diff Envelope capture, Operator verification, Publication Plan freeze, normal-path AutoFixPublisher and exceptional online reconciliation are implemented. The Publisher persists precise preflight/commit/MR write phases, uses one GitLab Commits API request with the frozen `start_sha` and `force=false`, creates the child MR, and atomically persists its Relation, Notification Request and outbox deliveries. The Reconciler processes only Plans that crossed an external-write boundary and established Relations; child Webhooks cannot create local authority. One supervised Worker process runs independent Review/Publication, Notification and Reconciliation/Cleanup loops, with Retention scheduled in the third loop, separate from the API OS process. Schema 17 adds notification terminal retention times and a Store-backed singleton Worker runtime lease, also used by CLI `--once`. Explicit Store-loss recovery requires the canonical Plan payload and validates the unique Review Bot MR plus remote commit parent/actions before atomically rebuilding authority; it never creates a notification, and notification resend fails closed without the retained frozen Policy Snapshot. Separate audited commands resend notification generations, rearm blocked Plans according to their write phase, or terminally abandon idle Plans. The fresh schema contains neither Agent-owned Auto-fix tables nor Run-ID marker readers. There is no migration or compatibility requirement for old database rows, policies or markers.
 
@@ -12,19 +29,23 @@ The local `ops-status` CLI reads Project queue and effect counts, plus deploymen
 
 Implemented foundations that remain useful include exact-SHA worktrees, bound-Project webhook validation, SQLite claims/leases, notification outbox primitives, GitLab event normalization, Pipeline Gate, provider protocols and Feishu/WeCom adapters. The Feishu direct-message adapter binds one Operator-selected username and app-specific open ID, and queued deliveries retain a routing fingerprint so changed recipient bindings fail before sending. Webhook transport/authentication is separated from the project-bound decision applier, and Worker polling delegates publication, idle reconciliation and completed-effect publication to focused seams without changing their scheduling order. Their contracts may still change while adopting the target model.
 
-## Historical evidence
+## Live and historical evidence
 
-The current OpenCode adapter canary evidence is recorded in
+The historical OpenCode adapter A1 evidence is recorded in
 [JiHuLab/OpenCode A1 canary evidence — 2026-08-10](../evidence/jihulab-opencode-a1-2026-08-10.md).
 It is intentionally a partial verdict: Note publication succeeded, while
 the final target-frozen Skill and nested-instruction isolation hardening, Auto-fix commit/MR and durable
 notification delivery remain unverified.
 
-The [2026-09-21 canary preparation](../evidence/jihulab-opencode-canary-2026-09-21.md)
-records a new private Project and exact MR head, Linux systemd and shared
-SQLite preflight, and one owner-only lark-cli transport check. The API and
-Worker are stopped; ReviewFlow Note, Auto-fix, Relation, notification outbox,
-crash recovery and full backup/restore evidence remains unverified.
+The [2026-09-21 live canary](../evidence/jihulab-opencode-canary-2026-09-21.md)
+records exact ReviewKeys, a Program-owned Note and Auto-fix child MR `!2`,
+post-MR-write reconciliation of child MR `!3`, Feishu server acceptance of
+both outbox deliveries, and 吴非's screenshot confirming both messages in the
+personal conversation. The post-commit-write fault left an unrecorded remote
+commit and a safely blocked Plan; it did not complete publication. Real Store
+bundles passed isolated namespace restores, while a separate recovery host,
+independent backup medium and systemd startup against the restored Store were
+not tested. The API and Worker were stopped and disabled at the end.
 
 On 2026-08-03 a JiHuLab canary in Project `358268` completed Review Run `2`, parent MR `!3`, Auto-fix MR `!4` and Agent-owned Note `8733889`. Project `358268` was later marked for deletion.
 
@@ -53,4 +74,7 @@ This is evidence for the old Agent-owned path only. It does not verify strict RE
 - Retention tests prove backup-before-purge, immutable backup conflicts, terminal payload purge and graceful Worker shutdown.
 - `command` and OpenCode thin adapters now consume the same frozen `AgentTaskV1`; its bounded Skill bytes/digest come from the frozen target commit or Operator-owned default and are privately materialized per attempt. OpenCode uses an isolated adapter-owned Agent through native non-interactive `run --pure --agent reviewflow` without `--auto`, while the shared Runner retains lifecycle, heartbeat and strict Result parsing.
 
-Live JiHuLab verification of the remaining Program-owned Auto-fix and durable notification path is still required. The successful Note receipts establish only the OpenCode composition and must not be extrapolated to other Backend adapters.
+The live canary verifies the positive OpenCode Luna Auto-fix and notification
+path only within the recorded Project and exact ReviewKeys. It does not prove
+post-commit publication recovery, live signed TLS webhook intake, a renewable
+dedicated Provider identity, or behavior of other Backend adapters.

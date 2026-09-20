@@ -1,5 +1,7 @@
 # 02 · 终态保留与 Worker 所有权
 
+> 历史归档：本地实施已完成；现场验收由[05 当前计划](../../05-deployment-canary.md)跟踪。本文保留当时的任务与检查记录，当前状态见[执行队列](../../pilot-readiness-queue.md)。
+
 状态：本地完成；现场证据待 05。优先级：P1。前置条件：[01 · 通知可领取与结果语义](01-notification-and-outcome.md) 完成。
 
 ## 交付结果
@@ -21,7 +23,7 @@
 
 逐阶段跑 `pytest -q tests/test_retention.py tests/test_store.py tests/test_worker.py tests/test_cli.py`；结束跑 `ruff check .`、`pytest`、`python -m compileall -q src tests`、`git diff --check`。部署时使用新数据库或明确批准的预生产重建；schema 16 不做隐式升级。新的生产数据一旦需要保留，升级必须先准备一致性备份及回滚方案。实施时更新当前规格/ADR 的 schema 版本与运行时契约，勿让文档停留在 16。
 
-完成记录写入[执行队列](pilot-readiness-queue.md)，并在本文记录提交、检查与 schema 切换证据。
+完成记录写入[执行队列](../../pilot-readiness-queue.md)，并在本文记录提交、检查与 schema 切换证据。
 
 ## 完成记录
 

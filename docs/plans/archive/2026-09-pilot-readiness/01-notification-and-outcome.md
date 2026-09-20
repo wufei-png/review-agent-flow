@@ -1,5 +1,7 @@
 # 01 · 通知可领取与结果语义
 
+> 历史归档：本地实施已完成；现场验收由[05 当前计划](../../05-deployment-canary.md)跟踪。本文保留当时的任务与检查记录，当前状态见[执行队列](../../pilot-readiness-queue.md)。
+
 状态：已完成本地实现与检查；现场证据待 05。优先级：P0。前置条件：无。规划代码基线：`f407d0b`；实施前已核对当前代码。
 
 ## 交付结果
@@ -23,7 +25,7 @@ Auto-fix Relation 建立和 Operator 人工 resend 产生的每个通知 outbox 
 
 先跑相关测试：`pytest -q tests/test_store.py tests/test_notification_dispatcher.py tests/test_autofix_publisher.py tests/test_autofix_recovery.py tests/test_worker.py`。会话结束跑 `ruff check .`、`pytest`、`python -m compileall -q src tests`、`git diff --check`。本地模拟不能证明飞书/企微实际送达。
 
-旧 canary 数据库若已有 `pending` 且 `next_attempt_at IS NULL` 的行，新代码不会自动修复旧行；实施时给出只读盘点和经 Operator 审核的修复或重建步骤，不静默改写历史通知。完成记录写入[执行队列](pilot-readiness-queue.md)，并在本文记录提交和检查结果。
+旧 canary 数据库若已有 `pending` 且 `next_attempt_at IS NULL` 的行，新代码不会自动修复旧行；实施时给出只读盘点和经 Operator 审核的修复或重建步骤，不静默改写历史通知。完成记录写入[执行队列](../../pilot-readiness-queue.md)，并在本文记录提交和检查结果。
 
 ## 旧 canary 通知处置
 

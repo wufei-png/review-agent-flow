@@ -34,6 +34,8 @@ GitLab Note、Auto-fix MR 和通知。
 完整规格见 [docs/spec/README.md](docs/spec/README.md)，领域语言见
 [CONTEXT.md](CONTEXT.md)，当前代码与目标的差距见
 [docs/spec/07-implementation-status.md](docs/spec/07-implementation-status.md)。
+有限生产试运行的分会话实施顺序与验收范围见
+[试运行准备执行队列](docs/plans/pilot-readiness-queue.md)。
 
 ## Development
 
@@ -47,10 +49,10 @@ ruff check .
 
 当前代码已完成从 checkpoint 中 Agent-owned 预发布实现到 Program-owned
 发布路径的硬切换；Review Outcome、目标分支 Policy Snapshot 和 Operator-owned
-通知绑定已实现，生产运维门禁仍在实现中。不提供旧 Policy/SQLite/marker
-兼容契约；项目尚在无生产数据的
-开发阶段，schema 变化时直接重建数据库，请以当前测试和
-implementation-status 为准。
+通知绑定已实现，有限生产试运行尚未放行。不提供旧 Policy/SQLite/marker
+兼容契约；已有真实 canary Store、外部收据和私有备份需要保留。schema 变化或
+重建前，应先保存一致性 Store/Plan 备份与现场证据，并核对恢复路径；当前边界见
+[implementation-status](docs/spec/07-implementation-status.md)。
 
 Linux + systemd 的 API/Worker 分进程、最小凭据、优雅停机和 30 天默认保留
 参考部署见 [docs/deployment-linux-systemd.md](docs/deployment-linux-systemd.md)。
@@ -89,10 +91,12 @@ hostname、tool version、reason、result 和独立 recovery ID。
 Plan rearm/abandon 不访问 GitLab；它们依据持久化 write phase 选择安全发布重试、
 仅对账重试或终止，并记录独立 action ID。
 
-本地测试不访问真实 GitLab、飞书、企微或 Agent Provider。2026-08-10 的
-JiHuLab/OpenCode A1 canary 已验证 Program-owned Note、幂等手动触发和租约回收，
-但 Auto-fix 与通知投递仍未闭环；完整收据与边界见
-[docs/evidence/jihulab-opencode-a1-2026-08-10.md](docs/evidence/jihulab-opencode-a1-2026-08-10.md)。
+本地测试不访问真实 GitLab、飞书、企微或 Agent Provider。历史上的
+[2026-08-10 A1 canary](docs/evidence/jihulab-opencode-a1-2026-08-10.md)
+只验证了 Program-owned Note、幂等手动触发和租约回收。新的
+[2026-09-21 exact-SHA canary](docs/evidence/jihulab-opencode-canary-2026-09-21.md)
+取得 Note、Auto-fix 子 MR、仅吴非的飞书私信可见性和 MR 写后恢复收据；
+commit 写后未完成发布恢复，试运行判定为 no-go。
 
 ## License
 

@@ -1,5 +1,7 @@
 # 03 · Operator 诊断
 
+> 历史归档：本地实施已完成；现场验收由[05 当前计划](../../05-deployment-canary.md)跟踪。本文保留当时的任务与检查记录，当前状态见[执行队列](../../pilot-readiness-queue.md)。
+
 状态：本地完成；现场证据待 05。优先级：P1。前置条件：[02 · 终态保留与 Worker 所有权](02-retention-worker-ownership.md) 完成。
 
 ## 交付结果
@@ -21,7 +23,7 @@ Operator 通过本地只读 CLI 就能判断 Worker 是否持有运行时租约�
 
 逐阶段跑 `pytest -q tests/test_store.py tests/test_cli.py tests/test_web.py tests/test_worker.py`；结束跑 `ruff check .`、`pytest`、`python -m compileall -q src tests`、`git diff --check`。状态查询只证明 Store 内的已知事实；远端 MR、Note 或通知可见性仍需独立核查。部署告警可先消费 CLI 汇总；独立 `/metrics` 服务及固定流量阈值留待实际负载确定。
 
-完成记录写入[执行队列](pilot-readiness-queue.md)，并在本文记录提交和检查结果。
+完成记录写入[执行队列](../../pilot-readiness-queue.md)，并在本文记录提交和检查结果。
 
 完成记录：2026-09-20。阶段 1 `cb42a79` 增加 Project-bound Note、Plan、Relation、通知状态与有限行动提示；阶段 2 `fd4ca73` 增加本地只读 `ops-status`。独立只读 review 的两项 P2 均核实并在 `0c6484a` 修复：已发布 Note 不再被标作待对账，有效租约中的 Auto-fix 外部写入不再误计为对账。无拒绝项。
 

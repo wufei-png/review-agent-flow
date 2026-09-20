@@ -1,10 +1,10 @@
 # 05 · 部署与真实 canary
 
-状态：阶段 1 本地完成；阶段 2 的真实 OpenCode Luna 正向链路、MR 写后恢复、隔离备份演练和实际通知人工可见性已有证据，但 commit 写后恢复停在安全阻断，完整验收未通过，试运行判定为 no-go。优先级：试运行门槛。前置条件：[01](01-notification-and-outcome.md)、[02](02-retention-worker-ownership.md)、[03](03-operator-diagnostics.md)、[04](04-backup-restore.md) 均完成；尚需 commit 写后完整恢复、TLS webhook 入口及专用可续期 Provider 身份。
+状态：阶段 1 本地完成；阶段 2 的真实 OpenCode Luna 正向链路、MR 写后恢复、隔离备份演练和实际通知人工可见性已有证据，但 commit 写后恢复停在安全阻断，完整验收未通过，试运行判定为 no-go。优先级：试运行门槛。前置条件：[01](archive/2026-09-pilot-readiness/01-notification-and-outcome.md)、[02](archive/2026-09-pilot-readiness/02-retention-worker-ownership.md)、[03](archive/2026-09-pilot-readiness/03-operator-diagnostics.md)、[04](archive/2026-09-pilot-readiness/04-backup-restore.md) 均完成本地实施并归档；尚需 commit 写后完整恢复、TLS webhook 入口及专用可续期 Provider 身份。
 
-## 交付结果
+## 目标交付结果
 
-值班人员能按运行手册启停服务、检查告警、轮换凭据、恢复备份，并在外部写结果不明时按已持久化的阶段作出安全决定。新的 exact-SHA canary 证明最终 OpenCode 配置下的 Note、Auto-fix commit/child MR、Relation、通知服务端接受、人工可见确认、幂等重放及提交/MR 写边界恢复。试运行 go/no-go 只依据完成的现场证据。
+值班人员能按运行手册启停服务、检查告警、轮换凭据、恢复备份，并在外部写结果不明时按已持久化的阶段作出安全决定。新的 exact-SHA canary 应证明最终 OpenCode 配置下的 Note、Auto-fix commit/child MR、Relation、通知服务端接受、人工可见确认、幂等重放及提交/MR 写边界恢复。试运行 go/no-go 只依据完成的现场证据。
 
 ## 当前边界与资料
 
@@ -26,6 +26,8 @@
 完成记录写入[执行队列](pilot-readiness-queue.md)，并在本文记录提交、现场收据与未验证项。
 
 ## 完成记录
+
+以下记录按实施时序保留；早期“待确认”是当时的阶段快照，当前结论以页首和现场证据为准。
 
 - 2026-09-21，阶段 1：`fc6d1a0` 新增 [单 Project 运维手册](../operations-runbook.md)，核对 reference 部署的 Worker 配置文件身份与三循环、状态、外部写和恢复路径；`30f52df` 按独立只读 review 修正 rearm/abandon 的活动 Store 路径，以及 resend/recover 的 Worker 身份、root-owned 环境文件与活动 Store 调用。两项 P2 均接受并修复，无拒绝项。`9added1` 修正既有 Worker 失租测试的链式异常竞态断言，审查者复核后无新增发现。
 - 本地检查：最终 `.venv/bin/python -m pytest` 417 passed，1 条 Starlette/httpx 依赖弃用警告；此前一次复检为 416 passed、1 failed，失败的既有断言经修正后定向连跑 5 次及全量复跑通过。`.venv/bin/python -m pytest tests/test_opencode_runtime_isolation.py -rs` 1 passed（OpenCode `1.18.11`，仅本机）；`.venv/bin/python -m pytest tests/test_cli.py tests/test_deployment.py` 19 passed；`.venv/bin/ruff check .`、`.venv/bin/python -m compileall -q src tests`、相关 CLI `--help`、相对 Markdown 链接和 staged `git diff --check` 通过。

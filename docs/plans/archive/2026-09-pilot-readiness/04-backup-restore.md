@@ -1,5 +1,7 @@
 # 04 · 一致性备份与恢复验证
 
+> 历史归档：本地实施已完成；现场验收由[05 当前计划](../../05-deployment-canary.md)跟踪。本文保留当时的任务与检查记录，当前状态见[执行队列](../../pilot-readiness-queue.md)。
+
 状态：本地完成；现场恢复证据待 05。优先级：P1。前置条件：[02 · 终态保留与 Worker 所有权](02-retention-worker-ownership.md) 完成；[03 · Operator 诊断](03-operator-diagnostics.md) 已完成。
 
 ## 交付结果
@@ -21,11 +23,11 @@ Operator 可生成一份包含一致性 SQLite 快照、收据引用的不可变
 
 逐阶段跑 `pytest -q tests/test_retention.py tests/test_store.py tests/test_cli.py tests/test_backup.py`（新文件依实施命名）；结束跑 `ruff check .`、`pytest`、`python -m compileall -q src tests`、`git diff --check`。本机临时目录演练证明工具契约，不代替新服务身份、真实备份介质与 systemd 停启演练。完整试运行恢复证据在任务 05 记录。
 
-完成记录写入[执行队列](pilot-readiness-queue.md)，并在本文记录提交、校验结果和仍待现场验证的条件。
+完成记录写入[执行队列](../../pilot-readiness-queue.md)，并在本文记录提交、校验结果和仍待现场验证的条件。
 
 ## 完成记录
 
-- 2026-09-21：`39f643b` 增加 `backup-store`、SQLite backup API 快照、快照收据对应的私有 Plan 包、manifest 和原子发布；`8f5680e` 增加 `verify-backup`、[恢复手册](../backup-restore.md)、规格说明和空目录演练；`cad3ac2` 修复独立只读审查提出的首次无收据时 Plan 目录尚不存在、并发同名目标覆盖、发布后 fsync 失败掩盖原错误三项问题（两项 P2、一项 P3；无拒绝项）。
+- 2026-09-21：`39f643b` 增加 `backup-store`、SQLite backup API 快照、快照收据对应的私有 Plan 包、manifest 和原子发布；`8f5680e` 增加 `verify-backup`、[恢复手册](../../../backup-restore.md)、规格说明和空目录演练；`cad3ac2` 修复独立只读审查提出的首次无收据时 Plan 目录尚不存在、并发同名目标覆盖、发布后 fsync 失败掩盖原错误三项问题（两项 P2、一项 P3；无拒绝项）。
 - 阶段针对性检查 `.venv/bin/python -m pytest -q tests/test_retention.py tests/test_store.py tests/test_cli.py tests/test_backup.py` 通过；最终 `.venv/bin/python -m pytest` 为 417 passed、1 条现有 Starlette/httpx 依赖弃用警告，`.venv/bin/ruff check .`、`.venv/bin/python -m compileall -q src tests`、CLI `--help` 和 `git diff --check` 通过。
 - 本地临时目录演练：WAL 写事务期间捕获一致性快照；无收据时仍可备份；缺失、篡改、符号链接、不安全 mode 和更改收据映射均拒绝；恢复到已腾空的原绝对路径后，按只读接口抽样核对 ReviewKey/Run 状态、Policy Snapshot、Plan/Relation、通知记录、Operator audit 与备份收据，当前实际 Store 未被演练修改。演练只使用测试构造的数据，不是 JiHuLab/OpenCode 或通知服务的现场证据。
 - 仍待 05：在目标 Linux/systemd 身份与真实备份介质上执行停启和异机或等价隔离恢复，核对 owner/group/mode、持续运行时的备份转移、实际服务读写、`/readyz`、新 exact SHA canary、GitLab 与通知结果。macOS 本地测试未执行 Linux 的 `renameat2` 路径。
