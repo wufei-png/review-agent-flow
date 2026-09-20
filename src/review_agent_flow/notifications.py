@@ -1,4 +1,4 @@
-"""Notification ports and Feishu/WeCom webhook adapters."""
+"""Notification ports and Feishu/WeCom delivery adapters."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import json
 from dataclasses import dataclass
 from html import escape
 from typing import Protocol
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from .operator_config import ResolvedNotificationChannel
@@ -84,10 +84,14 @@ class WebhookNotifier:
             return NotificationResult(self.channel_id, False, f"invalid response JSON: {exc}")
         if not isinstance(response_body, dict):
             return NotificationResult(self.channel_id, False, "response JSON is not an object")
-        success_code = response_body.get("code") if self.channel == "feishu" else response_body.get("errcode")
+        success_code = (
+            response_body.get("code") if self.channel == "feishu" else response_body.get("errcode")
+        )
         if success_code != 0:
             detail = json.dumps(response_body, ensure_ascii=False, separators=(",", ":"))[:500]
-            return NotificationResult(self.channel_id, False, f"provider rejected message: {detail}")
+            return NotificationResult(
+                self.channel_id, False, f"provider rejected message: {detail}"
+            )
         return NotificationResult(self.channel_id, True)
 
     def _payload(self, content: str, recipients: tuple[str, ...]) -> dict[str, object]:
@@ -98,6 +102,91 @@ class WebhookNotifier:
                 content = f'<at user_id="{user_id}"></at> {content}'
             return {"msg_type": "text", "content": {"text": content}}
         return {"msgtype": "text", "text": {"content": content, "mentioned_list": ids}}
+
+
+class FeishuDirectNotifier:
+    """Send only to one Operator-bound Feishu user, never to a chat ID."""
+
+    channel = "feishu_dm"
+    _token_url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
+    _message_url = "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id"
+
+    def __init__(
+        self,
+        channel_id: str,
+        app_id: str,
+        app_secret: str,
+        recipient_open_id: str,
+        recipient_username: str,
+    ) -> None:
+        self.channel_id = channel_id
+        self.app_id = app_id
+        self.app_secret = app_secret
+        self.recipient_open_id = recipient_open_id
+        self.recipient_username = recipient_username
+
+    def _post(self, url: str, payload: dict[str, object], token: str | None = None) -> dict | str:
+        headers = {"Content-Type": "application/json; charset=utf-8"}
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token}"
+        request = Request(
+            url,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=10) as response:
+                status = int(getattr(response, "status", 200))
+                raw = response.read(MAX_PROVIDER_RESPONSE_BYTES + 1)
+        except HTTPError as exc:
+            return f"HTTP status {exc.code}"
+        except (OSError, TimeoutError, URLError):
+            return "Feishu request failed"
+        if status < 200 or status >= 300:
+            return f"HTTP status {status}"
+        if len(raw) > MAX_PROVIDER_RESPONSE_BYTES:
+            return "Feishu response exceeds size limit"
+        try:
+            result = json.loads(raw)
+        except (TypeError, ValueError):
+            return "invalid Feishu response JSON"
+        return result if isinstance(result, dict) else "invalid Feishu response object"
+
+    def notify(self, event: NotificationEvent) -> NotificationResult:
+        if event.recipients != (self.recipient_username,):
+            return NotificationResult(self.channel_id, False, "recipient is not the bound owner")
+        token_response = self._post(
+            self._token_url, {"app_id": self.app_id, "app_secret": self.app_secret}
+        )
+        if isinstance(token_response, str):
+            return NotificationResult(self.channel_id, False, token_response)
+        if token_response.get("code") != 0:
+            return NotificationResult(
+                self.channel_id, False, f"Feishu token rejected: {token_response.get('code')}"
+            )
+        token = token_response.get("tenant_access_token")
+        if not isinstance(token, str) or not token:
+            return NotificationResult(self.channel_id, False, "Feishu token missing")
+        content = f"{event.title}\n{event.body}" if event.title else event.body
+        if event.url:
+            content = f"{content}\n{event.url}"
+        message_response = self._post(
+            self._message_url,
+            {
+                "receive_id": self.recipient_open_id,
+                "msg_type": "text",
+                "content": json.dumps({"text": content}, ensure_ascii=False),
+            },
+            token,
+        )
+        if isinstance(message_response, str):
+            return NotificationResult(self.channel_id, False, message_response)
+        if message_response.get("code") != 0:
+            return NotificationResult(
+                self.channel_id, False, f"Feishu message rejected: {message_response.get('code')}"
+            )
+        return NotificationResult(self.channel_id, True)
 
 
 class FanoutNotifier:
@@ -113,14 +202,16 @@ class FanoutNotifier:
         self.notifiers = notifiers
 
     def redaction_secrets(self) -> tuple[str, ...]:
-        """Return runtime webhook credentials that must not cross audit boundaries."""
+        """Return runtime credentials that must not cross audit boundaries."""
 
         return tuple(
-            webhook_url
+            secret
             for notifier in self.notifiers
-            if (webhook_url := getattr(notifier, "webhook_url", None))
-            and isinstance(webhook_url, str)
-            and not webhook_url.isspace()
+            for secret in (
+                getattr(notifier, "webhook_url", None),
+                getattr(notifier, "app_secret", None),
+            )
+            if secret and isinstance(secret, str) and not secret.isspace()
         )
 
     def channel_specs(
@@ -128,7 +219,11 @@ class FanoutNotifier:
     ) -> tuple[tuple[str, str], ...]:
         specs = tuple(
             (
-                str(getattr(notifier, "channel_id", getattr(notifier, "channel", f"channel-{index}"))),
+                str(
+                    getattr(
+                        notifier, "channel_id", getattr(notifier, "channel", f"channel-{index}")
+                    )
+                ),
                 str(getattr(notifier, "channel", f"channel-{index}")),
             )
             for index, notifier in enumerate(self.notifiers)
@@ -147,9 +242,7 @@ class FanoutNotifier:
             (
                 notifier
                 for notifier in self.notifiers
-                if str(
-                    getattr(notifier, "channel_id", getattr(notifier, "channel", ""))
-                )
+                if str(getattr(notifier, "channel_id", getattr(notifier, "channel", "")))
                 == channel_id
             ),
             None,
@@ -163,8 +256,7 @@ class FanoutNotifier:
 
     def notify(self, event: NotificationEvent) -> tuple[NotificationResult, ...]:
         return tuple(
-            self.notify_channel(event, channel_id)
-            for channel_id, _channel in self.channel_specs()
+            self.notify_channel(event, channel_id) for channel_id, _channel in self.channel_specs()
         )
 
 
@@ -175,14 +267,36 @@ def notifiers_from_operator(
 
     notifiers: list[Notifier] = []
     for channel in channels:
-        notifiers.append(
-            WebhookNotifier(
-                channel.channel_type,
-                channel.webhook_url,
-                dict(channel.user_ids),
-                channel.channel_id,
+        if channel.channel_type == "feishu_dm":
+            if not all(
+                (
+                    channel.app_id,
+                    channel.app_secret,
+                    channel.recipient_open_id,
+                    channel.recipient_username,
+                )
+            ):
+                raise ValueError("Feishu direct channel is missing owner binding")
+            notifiers.append(
+                FeishuDirectNotifier(
+                    channel.channel_id,
+                    str(channel.app_id),
+                    str(channel.app_secret),
+                    str(channel.recipient_open_id),
+                    str(channel.recipient_username),
+                )
             )
-        )
+        else:
+            if channel.webhook_url is None:
+                raise ValueError("webhook channel is missing URL")
+            notifiers.append(
+                WebhookNotifier(
+                    channel.channel_type,
+                    channel.webhook_url,
+                    dict(channel.user_ids),
+                    channel.channel_id,
+                )
+            )
     if len({str(notifier.channel_id) for notifier in notifiers}) != len(notifiers):
         raise ValueError("notification channel IDs must be unique")
     return FanoutNotifier(tuple(notifiers))

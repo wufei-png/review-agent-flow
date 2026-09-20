@@ -93,9 +93,13 @@ class AutoFixPublicationConfig:
 @dataclass(frozen=True)
 class NotificationChannelConfig:
     channel_type: str
-    webhook_env: str
+    webhook_env: str | None
     allowed_projects: frozenset[str]
     user_ids: Mapping[str, str]
+    app_id_env: str | None = None
+    app_secret_env: str | None = None
+    recipient_open_id_env: str | None = None
+    recipient_username: str | None = None
 
 
 @dataclass(frozen=True)
@@ -108,8 +112,12 @@ class RetentionConfig:
 class ResolvedNotificationChannel:
     channel_id: str
     channel_type: str
-    webhook_url: str
+    webhook_url: str | None
     user_ids: Mapping[str, str]
+    app_id: str | None = None
+    app_secret: str | None = None
+    recipient_open_id: str | None = None
+    recipient_username: str | None = None
 
 
 @dataclass(frozen=True)
@@ -167,7 +175,7 @@ def _environment_name(value: Any) -> str:
 
 
 def _notification_environment_name(value: Any) -> str:
-    name = _name(value, "notification webhook environment")
+    name = _name(value, "notification environment")
     if _ENVIRONMENT_NAME_RE.fullmatch(name) is None:
         raise OperatorConfigError(f"invalid environment variable name: {name}")
     return name
@@ -311,17 +319,43 @@ def load_operator_config(path: str | Path) -> OperatorConfig:
     for channel_id, channel_value in notification_values.items():
         channel_id = _name(channel_id, "notification channel ID")
         channel = _mapping(channel_value, f"notifications.channels.{channel_id}")
+        channel_type = channel.get("type")
+        if channel_type not in {"feishu", "wecom", "feishu_dm"}:
+            raise OperatorConfigError(
+                f"notifications.channels.{channel_id}.type must be feishu, wecom or feishu_dm"
+            )
+        dm = channel_type == "feishu_dm"
         _reject_unknown(
             channel,
-            {"type", "webhook_env", "allowed_projects", "user_ids"},
+            (
+                {
+                    "type",
+                    "allowed_projects",
+                    "app_id_env",
+                    "app_secret_env",
+                    "recipient_open_id_env",
+                    "recipient_username",
+                }
+                if dm
+                else {"type", "webhook_env", "allowed_projects", "user_ids"}
+            ),
             f"notifications.channels.{channel_id}",
         )
-        channel_type = channel.get("type")
-        if channel_type not in {"feishu", "wecom"}:
+        webhook_env = None if dm else _notification_environment_name(channel.get("webhook_env"))
+        app_id_env = _notification_environment_name(channel.get("app_id_env")) if dm else None
+        app_secret_env = (
+            _notification_environment_name(channel.get("app_secret_env")) if dm else None
+        )
+        recipient_open_id_env = (
+            _notification_environment_name(channel.get("recipient_open_id_env")) if dm else None
+        )
+        recipient_username = (
+            _name(channel.get("recipient_username"), "recipient_username") if dm else None
+        )
+        if dm and len({app_id_env, app_secret_env, recipient_open_id_env}) != 3:
             raise OperatorConfigError(
-                f"notifications.channels.{channel_id}.type must be feishu or wecom"
+                f"notifications.channels.{channel_id} environment names must differ"
             )
-        webhook_env = _notification_environment_name(channel.get("webhook_env"))
         allowed_projects = _projects(
             channel.get("allowed_projects", []),
             f"notifications.channels.{channel_id}.allowed_projects",
@@ -341,9 +375,23 @@ def load_operator_config(path: str | Path) -> OperatorConfig:
             webhook_env,
             allowed_projects,
             MappingProxyType(user_ids),
+            app_id_env,
+            app_secret_env,
+            recipient_open_id_env,
+            recipient_username,
         )
 
-    notification_credentials = {channel.webhook_env for channel in notification_channels.values()}
+    notification_credentials = {
+        name
+        for channel in notification_channels.values()
+        for name in (
+            channel.webhook_env,
+            channel.app_id_env,
+            channel.app_secret_env,
+            channel.recipient_open_id_env,
+        )
+        if name is not None
+    }
     for backend_name, backend in backends.items():
         for profile_name, profile in backend.profiles.items():
             exposed = sorted(set(profile.environment) & notification_credentials)
@@ -413,6 +461,33 @@ def resolve_notification_channels(
             raise OperatorConfigError(
                 f"notification channel {channel_id} does not allow Project {project_id}"
             )
+        if channel.channel_type == "feishu_dm":
+            assert channel.app_id_env and channel.app_secret_env and channel.recipient_open_id_env
+            app_id = source.get(channel.app_id_env)
+            app_secret = source.get(channel.app_secret_env)
+            recipient_open_id = source.get(channel.recipient_open_id_env)
+            if not app_id or not app_secret or not recipient_open_id:
+                raise OperatorConfigError(
+                    f"notification channel {channel_id} requires app and recipient credentials"
+                )
+            if not recipient_open_id.startswith("ou_"):
+                raise OperatorConfigError(
+                    f"notification channel {channel_id} requires a Feishu open_id"
+                )
+            resolved.append(
+                ResolvedNotificationChannel(
+                    channel_id,
+                    channel.channel_type,
+                    None,
+                    channel.user_ids,
+                    app_id,
+                    app_secret,
+                    recipient_open_id,
+                    channel.recipient_username,
+                )
+            )
+            continue
+        assert channel.webhook_env is not None
         webhook_url = source.get(channel.webhook_env)
         if not webhook_url:
             raise OperatorConfigError(

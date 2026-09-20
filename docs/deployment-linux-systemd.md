@@ -6,6 +6,11 @@ share only the SQLite directory through `reviewflow-shared`. Only the API
 receives the webhook secret; only the Worker can access the repository,
 worktrees, Plan backups, GitLab Review Bot, Agent Provider, and notification
 credentials. SQLite necessarily remains readable by both service identities.
+For a single-recipient Feishu deployment, configure `feishu_dm` in the Operator
+file and keep its app credentials and recipient open ID in the Worker environment.
+The adapter accepts only the bound GitLab username and sends by `open_id`;
+verify the app-specific recipient ID with the intended person before enabling
+delivery. Do not also enable the example group webhook for an owner-only canary.
 
 ## Layout
 

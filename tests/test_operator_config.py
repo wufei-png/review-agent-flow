@@ -135,9 +135,7 @@ def test_operator_config_rejects_model_for_generic_command_adapter(tmp_path) -> 
 def test_operator_config_rejects_opencode_subcommand_in_operator_argv(tmp_path) -> None:
     path = _write_config(tmp_path / "operator.yml")
     path.write_text(
-        path.read_text(encoding="utf-8").replace(
-            "command: [opencode]", "command: [opencode, run]"
-        ),
+        path.read_text(encoding="utf-8").replace("command: [opencode]", "command: [opencode, run]"),
         encoding="utf-8",
     )
 
@@ -366,5 +364,77 @@ notifications:
         encoding="utf-8",
     )
 
+    with pytest.raises(OperatorConfigError, match="overlaps Operator notification"):
+        load_operator_config(path)
+
+
+def test_feishu_direct_channel_requires_one_bound_owner_and_private_credentials(tmp_path) -> None:
+    path = _write_config(tmp_path / "operator.yml")
+    path.write_text(
+        path.read_text(encoding="utf-8")
+        + """
+notifications:
+  channels:
+    owner:
+      type: feishu_dm
+      app_id_env: FEISHU_APP_ID
+      app_secret_env: FEISHU_APP_SECRET
+      recipient_open_id_env: FEISHU_OWNER_OPEN_ID
+      recipient_username: wufei-png
+      allowed_projects: ["42"]
+""",
+        encoding="utf-8",
+    )
+    config = load_operator_config(path)
+    environ = {
+        "FEISHU_APP_ID": "cli_app",
+        "FEISHU_APP_SECRET": "private-secret",
+        "FEISHU_OWNER_OPEN_ID": "ou_owner",
+    }
+
+    resolved = resolve_notification_channels(config, ("owner",), "42", environ)
+
+    assert resolved[0].channel_type == "feishu_dm"
+    assert resolved[0].recipient_username == "wufei-png"
+    assert resolved[0].recipient_open_id == "ou_owner"
+    assert resolved[0].webhook_url is None
+    with pytest.raises(OperatorConfigError, match="requires app and recipient credentials"):
+        resolve_notification_channels(config, ("owner",), "42", {})
+    with pytest.raises(OperatorConfigError, match="requires a Feishu open_id"):
+        resolve_notification_channels(
+            config, ("owner",), "42", {**environ, "FEISHU_OWNER_OPEN_ID": "chat-id"}
+        )
+
+
+def test_feishu_direct_channel_rejects_webhook_and_agent_credential_overlap(tmp_path) -> None:
+    path = _write_config(tmp_path / "operator.yml")
+    direct_channel = """
+notifications:
+  channels:
+    owner:
+      type: feishu_dm
+      app_id_env: FEISHU_APP_ID
+      app_secret_env: FEISHU_APP_SECRET
+      recipient_open_id_env: FEISHU_OWNER_OPEN_ID
+      recipient_username: wufei-png
+      allowed_projects: ["42"]
+"""
+    path.write_text(path.read_text(encoding="utf-8") + direct_channel, encoding="utf-8")
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            "type: feishu_dm", "type: feishu_dm\n      webhook_env: GROUP_WEBHOOK"
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(OperatorConfigError, match="unknown fields: webhook_env"):
+        load_operator_config(path)
+
+    path.write_text(
+        _write_config(path)
+        .read_text(encoding="utf-8")
+        .replace("environment: [MODEL_TOKEN]", "environment: [FEISHU_APP_SECRET]")
+        + direct_channel,
+        encoding="utf-8",
+    )
     with pytest.raises(OperatorConfigError, match="overlaps Operator notification"):
         load_operator_config(path)

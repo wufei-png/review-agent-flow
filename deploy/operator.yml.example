@@ -27,6 +27,15 @@ notifications:
       webhook_env: FEISHU_WEBHOOK
       allowed_projects: ["42"]
       user_ids: {}
+    # For an owner-only direct-message deployment, replace the webhook channel
+    # above with a single feishu_dm channel bound to the intended recipient:
+    # feishu-owner-dm:
+    #   type: feishu_dm
+    #   app_id_env: FEISHU_APP_ID
+    #   app_secret_env: FEISHU_APP_SECRET
+    #   recipient_open_id_env: FEISHU_OWNER_OPEN_ID
+    #   recipient_username: gitlab-owner-username
+    #   allowed_projects: ["42"]
 
 retention:
   sensitive_payload_days: 30

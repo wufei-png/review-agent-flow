@@ -16,8 +16,12 @@ storage; the evidence document contains only redacted identities and digests.
   Keep its token in `worker.env` only. Confirm a healthy OpenCode executable,
   selected model and Operator-approved provider credential under the Worker
   identity. The Agent must not receive the GitLab token or notification URL.
-- Prepare a fresh Feishu or WeCom webhook, an Operator channel binding and a
-  canary recipient who will separately confirm visibility. Verify the
+- Prepare an authorized notification transport, an Operator channel binding and a
+  canary recipient who will separately confirm visibility. For an owner-only
+  Feishu canary, use `feishu_dm` with `recipient_username` bound to the parent
+  MR creator and `recipient_open_id_env` set to that same person's open ID for
+  this Feishu app. Keep app credentials in the Worker environment; do not
+  configure a group webhook or a second recipient. Verify the
   target-branch Policy v4 requests the authorized backend, profile, Auto-fix
   and channel IDs, and retain its target SHA and policy digest.
 - Provide a private backup medium and an isolated recovery host or directory
