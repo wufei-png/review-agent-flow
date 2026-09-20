@@ -120,7 +120,8 @@ def _run_worker(args: argparse.Namespace) -> int:
         retention_manager=RetentionManager(store, operator_config.retention),
     )
     if args.once:
-        with worker.runtime_ownership() as assert_owned:
+        once_stop = Event()
+        with worker.runtime_ownership(stop_event=once_stop) as assert_owned:
             assert_owned()
             result = worker.process_one()
             if result is None:
@@ -129,7 +130,7 @@ def _run_worker(args: argparse.Namespace) -> int:
             assert_owned()
             worker.process_worktree_cleanup(limit=1)
             assert_owned()
-            worker.notification_dispatcher.process_channel_batch()
+            worker.notification_dispatcher.process_channel_batch(stop_event=once_stop)
             assert_owned()
             worker.process_retention()
         if result is None:

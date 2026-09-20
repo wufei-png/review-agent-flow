@@ -13,9 +13,11 @@ from review_agent_flow.worker import WorkerResult
 class FakeNotificationDispatcher:
     def __init__(self) -> None:
         self.batch_calls = 0
+        self.stop_event = None
 
-    def process_channel_batch(self) -> int:
+    def process_channel_batch(self, stop_event=None) -> int:
         self.batch_calls += 1
+        self.stop_event = stop_event
         return 0
 
 
@@ -46,7 +48,8 @@ def test_worker_configures_target_branch_policy_resolver(monkeypatch, tmp_path: 
             raise AssertionError("test must use --once")
 
         @contextmanager
-        def runtime_ownership(self):
+        def runtime_ownership(self, *, stop_event):
+            captured["runtime_stop_event"] = stop_event
             yield lambda: None
 
     monkeypatch.setattr(cli, "SQLiteStore", lambda path: object())
@@ -93,6 +96,7 @@ def test_worker_configures_target_branch_policy_resolver(monkeypatch, tmp_path: 
     assert captured["policy_path"] == ".gitlab/reviewflow.yml"
     assert captured["worker"]["project_id"] == "42"
     assert captured["notification_dispatcher"].batch_calls == 1
+    assert captured["notification_dispatcher"].stop_event is captured["runtime_stop_event"]
 
 
 def test_worker_once_emits_json_run_status(monkeypatch, tmp_path: Path, capsys) -> None:
@@ -121,7 +125,8 @@ def test_worker_once_emits_json_run_status(monkeypatch, tmp_path: Path, capsys) 
             raise AssertionError("test must use --once")
 
         @contextmanager
-        def runtime_ownership(self):
+        def runtime_ownership(self, *, stop_event):
+            captured["runtime_stop_event"] = stop_event
             yield lambda: None
 
     monkeypatch.setattr(cli, "SQLiteStore", lambda path: object())
@@ -168,6 +173,7 @@ def test_worker_once_emits_json_run_status(monkeypatch, tmp_path: Path, capsys) 
         "status": "succeeded",
     }
     assert captured["notification_dispatcher"].batch_calls == 1
+    assert captured["notification_dispatcher"].stop_event is captured["runtime_stop_event"]
 
 
 def test_worker_entry_requires_a_bound_project(monkeypatch, tmp_path: Path) -> None:
