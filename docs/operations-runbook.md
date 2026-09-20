@@ -132,28 +132,80 @@ decision. Keep the API running only if continued intake is intended.
 Store snapshot before any manual repair. Do not manually create a replacement
 commit, MR or notification under a ReviewFlow marker. Restart the Worker only
 after the uncertain boundary has an exact remote identity or a documented
-reconciliation path. A blocked Plan can be rearmed with
-`rearm-autofix-plan --plan-id <id> --reason <reason>` after checking its
-immutable Plan and remote state; rearm resets its attempt budget, and a Plan
-past `preflight` resumes reconciliation only. To terminally stop an idle
-frozen, blocked or reconciliation-needed Plan, use
-`abandon-autofix-plan --plan-id <id> --reason <reason>`. Record the returned
-action ID and state/phase. Neither command removes a remote effect. A busy or
-unresolved Plan needs escalation, not repeated rearm.
+reconciliation path. After checking a blocked Plan's immutable payload and
+remote state, set `PLAN_ID` and `REASON` to the reviewed values and run one
+of these commands against the active Store:
+
+```bash
+sudo -u reviewflow-worker /opt/review-agent-flow/.venv/bin/review-agent-flow \
+  rearm-autofix-plan --db /var/lib/review-agent-flow/shared/review-agent-flow.sqlite3 \
+  --plan-id "$PLAN_ID" --reason "$REASON"
+sudo -u reviewflow-worker /opt/review-agent-flow/.venv/bin/review-agent-flow \
+  abandon-autofix-plan --db /var/lib/review-agent-flow/shared/review-agent-flow.sqlite3 \
+  --plan-id "$PLAN_ID" --reason "$REASON"
+```
+
+Rearm resets the attempt budget; a Plan past `preflight` resumes reconciliation
+only. Abandon terminally stops an idle frozen, blocked or
+reconciliation-needed Plan. Record the returned action ID and state/phase.
+Neither command removes a remote effect. A busy or unresolved Plan needs
+escalation, not repeated rearm. These commands run as the Worker service user,
+so record the human Operator and incident reference in the reason and private
+operations log alongside the CLI audit.
 
 For notification `pending` or `running`, inspect the outbox state and provider
 response before restart; a crash after provider acceptance may send the same
 request again. `failed` needs channel/credential and recipient review. Ask the
 recipient whether it is visible before deciding on a manual resend. Only an
-Operator may use `resend-autofix-notification --child-mr-iid <iid>
---reason <reason>`; it requires the retained frozen Policy Snapshot and
-current authorized channel binding, then creates a new audited generation.
-Record the prior and new generations and the risk of duplicate delivery.
-Store-loss Relation recovery is a separate audited
-`recover-autofix-relation` action requiring the full canonical Plan, exact
-parent and child identities and remote verification; see its CLI `--help` and
-the [integration specification](spec/05-integrations.md). It does not restore
-notification resend authority when the frozen Policy Snapshot is missing.
+Operator may resend. Set `CHILD_MR_IID` and `REASON` after reviewing the frozen
+Policy Snapshot and currently authorized channel binding. On the Linux host,
+run the command as a transient service so systemd reads the root-owned
+`worker.env` and supplies the same credential environment as the Worker;
+neither the token nor webhook URL appears in command arguments:
+
+```bash
+sudo systemd-run --wait --pipe --collect \
+  --property=User=reviewflow-worker --property=Group=reviewflow-shared \
+  --property=UMask=0007 \
+  --property=EnvironmentFile=/etc/review-agent-flow/worker.env \
+  --property=WorkingDirectory=/var/lib/review-agent-flow-worker/repository \
+  /opt/review-agent-flow/.venv/bin/review-agent-flow \
+  resend-autofix-notification --child-mr-iid "$CHILD_MR_IID" \
+  --db /var/lib/review-agent-flow/shared/review-agent-flow.sqlite3 \
+  --operator-config /etc/review-agent-flow/operator.yml --reason "$REASON"
+```
+
+The command requires the retained frozen Policy Snapshot and creates a new
+audited request generation. Record the prior and new generations and the risk
+of duplicate delivery. The transient command runs as the Worker service user;
+record the human Operator and incident reference in the reason and private
+operations log.
+
+Store-loss Relation recovery is a separate audited action requiring the full
+canonical Plan, exact parent and child identities and remote verification.
+Prefer restoration of a verified complete bundle. If exceptional Relation
+reconstruction is required, set `PARENT_MR_IID`, `PARENT_SHA`,
+`INTENT_NONCE`, `PLAN_SHA256`, `PLAN_FILE`, `CHILD_MR_IID` and `REASON` from
+the protected evidence, then run under the same transient identity and
+credential environment:
+
+```bash
+sudo systemd-run --wait --pipe --collect \
+  --property=User=reviewflow-worker --property=Group=reviewflow-shared \
+  --property=UMask=0007 \
+  --property=EnvironmentFile=/etc/review-agent-flow/worker.env \
+  --property=WorkingDirectory=/var/lib/review-agent-flow-worker/repository \
+  /opt/review-agent-flow/.venv/bin/review-agent-flow \
+  recover-autofix-relation --parent-mr-iid "$PARENT_MR_IID" \
+  --parent-sha "$PARENT_SHA" --intent-nonce "$INTENT_NONCE" \
+  --plan-sha256 "$PLAN_SHA256" --plan-file "$PLAN_FILE" \
+  --child-mr-iid "$CHILD_MR_IID" --reason "$REASON" \
+  --db /var/lib/review-agent-flow/shared/review-agent-flow.sqlite3
+```
+
+Check the [integration specification](spec/05-integrations.md) before this
+exceptional action. Recovery does not restore notification resend authority
+when the frozen Policy Snapshot is missing.
 
 ## Rotate credentials and restore
 

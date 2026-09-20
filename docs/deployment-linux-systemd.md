@@ -12,6 +12,8 @@ credentials. SQLite necessarily remains readable by both service identities.
 - application virtualenv: `/opt/review-agent-flow/.venv`
 - API identity: `reviewflow-api:reviewflow-shared`
 - Worker identity: `reviewflow-worker:reviewflow-shared`
+- configuration directory: `/etc/review-agent-flow`, root-owned,
+  `reviewflow-shared` group, mode `0750`
 - API environment: `/etc/review-agent-flow/api.env`, root-owned mode `0600`
 - Worker environment: root-owned mode `0600`, read by systemd;
   Operator configuration: `reviewflow-worker`-owned mode `0600`, read by
@@ -30,6 +32,8 @@ sudo useradd --system --no-create-home --shell /usr/sbin/nologin \
   --gid reviewflow-shared reviewflow-api
 sudo useradd --system --no-create-home --shell /usr/sbin/nologin \
   --gid reviewflow-shared reviewflow-worker
+sudo install -d -o root -g reviewflow-shared -m 0750 \
+  /etc/review-agent-flow
 sudo install -d -o root -g reviewflow-shared -m 2770 \
   /var/lib/review-agent-flow/shared
 sudo install -d -o reviewflow-worker -g reviewflow-shared -m 0700 \
@@ -44,7 +48,9 @@ database snapshot; start the new deployment with a fresh database only after
 that evidence is secured. Production data requires a planned backup and
 rollback path before any later schema change.
 
-Copy the examples from `deploy/`, install both units, then run:
+Copy the examples from `deploy/` and install both units. Before enabling them,
+run `systemd-analyze verify` on both installed service files as shown in the
+[single-Project operations runbook](operations-runbook.md). Then run:
 
 ```bash
 sudo systemctl daemon-reload
@@ -52,12 +58,10 @@ sudo systemctl enable --now review-agent-flow-api review-agent-flow-worker
 sudo systemctl status review-agent-flow-api review-agent-flow-worker
 ```
 
-Before enabling the units on the deployment host, run `systemd-analyze verify`
-on both installed service files. Follow the
-[single-Project operations runbook](operations-runbook.md) for service and
-three-loop observation, queue triage, uncertain external writes, credential
-rotation and the new exact-SHA canary. Keep the reference sandbox settings
-until they have been tested under the actual service identities.
+Follow the runbook for service and three-loop observation, queue triage,
+uncertain external writes, credential rotation and the new exact-SHA canary.
+Keep the reference sandbox settings until they have been tested under the
+actual service identities.
 
 Terminate with `systemctl stop`. The Worker handles SIGTERM by stopping new
 claims, asking all independent loops to stop, and waiting for in-flight work to
