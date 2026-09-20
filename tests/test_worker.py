@@ -1107,7 +1107,12 @@ def test_supervised_worker_fails_after_runtime_lease_loss(tmp_path: Path, monkey
     # Runtime lease loss is detected by the independent heartbeat, not a work loop.
     thread.join(timeout=2)
     assert not thread.is_alive()
-    assert errors and "runtime lease lost" in str(errors[0]).lower()
+    assert errors
+    # Any loop may observe the lost lease first; its failure chains the lease error.
+    failure = errors[0]
+    assert "runtime lease lost" in " ".join(
+        str(error).lower() for error in (failure, failure.__cause__)
+    )
     assert claims == 1
 
 
