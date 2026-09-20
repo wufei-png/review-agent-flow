@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
 import os
 import shutil
 import sqlite3
 import stat
+import sys
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -84,6 +86,25 @@ def _snapshot(source: Path, destination: Path) -> None:
         os.fsync(stream.fileno())
 
 
+def _publish_directory(source: Path, destination: Path) -> None:
+    """Atomically rename a directory only when the destination is absent."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == "linux":
+        rename = libc.renameat2
+        rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p,
+                           ctypes.c_uint]
+        result = rename(-100, os.fsencode(source), -100, os.fsencode(destination), 1)
+    elif sys.platform == "darwin":
+        rename = libc.renamex_np
+        rename.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        result = rename(os.fsencode(source), os.fsencode(destination), 0x00000004)
+    else:
+        raise OSError("atomic no-replace directory rename is unavailable")
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), str(destination))
+
+
 def _receipts(database: Path) -> list[sqlite3.Row]:
     uri = f"file:{quote(str(database), safe='/')}?mode=ro&immutable=1"
     with sqlite3.connect(uri, uri=True) as connection:
@@ -122,11 +143,12 @@ def create_backup(source: Path, plan_directory: Path, destination: Path) -> dict
     source = source.absolute()
     plan_directory = plan_directory.absolute()
     destination = destination.absolute()
-    _private_directory(plan_directory)
     _private_directory(destination.parent)
     if destination.exists() or destination.is_symlink():
         raise FileExistsError(destination)
     temporary = Path(tempfile.mkdtemp(prefix=f".{destination.name}.", dir=destination.parent))
+    published = False
+    temporary_identity = temporary.stat().st_dev, temporary.stat().st_ino
     try:
         _private_directory(temporary)
         database = temporary / DATABASE_NAME
@@ -134,6 +156,8 @@ def create_backup(source: Path, plan_directory: Path, destination: Path) -> dict
         _snapshot(source, database)
         plan_entries = []
         rows = _receipts(database)
+        if rows:
+            _private_directory(plan_directory)
         plans = temporary / "plans"
         plans.mkdir(mode=0o700)
         for row in rows:
@@ -176,14 +200,25 @@ def create_backup(source: Path, plan_directory: Path, destination: Path) -> dict
         _write_file(temporary / MANIFEST_NAME, canonical_json(manifest).encode("utf-8"))
         RetentionManager._fsync_directory(plans)
         RetentionManager._fsync_directory(temporary)
-        # Same-parent rename makes the completed bundle visible in one operation.
+        # Same-parent no-replace rename makes the completed bundle visible atomically.
         if destination.exists() or destination.is_symlink():
             raise FileExistsError(destination)
-        os.rename(temporary, destination)
+        _publish_directory(temporary, destination)
+        published = True
         RetentionManager._fsync_directory(destination.parent)
         return manifest
     except BaseException:
-        shutil.rmtree(temporary)
+        try:
+            if published:
+                destination_metadata = destination.lstat()
+                if (destination_metadata.st_dev, destination_metadata.st_ino) == temporary_identity:
+                    shutil.rmtree(destination)
+                    RetentionManager._fsync_directory(destination.parent)
+            else:
+                shutil.rmtree(temporary)
+        except OSError:
+            # Keep the original failure, especially a post-publication durability error.
+            pass
         raise
 
 

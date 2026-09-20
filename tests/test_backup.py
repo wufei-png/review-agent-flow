@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from test_retention import _terminal_payloads
 
-from review_agent_flow import cli
+from review_agent_flow import backup, cli
 from review_agent_flow.backup import create_backup, verify_backup
 from review_agent_flow.operator_config import RetentionConfig
 from review_agent_flow.retention import RetentionManager
@@ -91,6 +91,56 @@ def test_backup_rejects_symlinked_source_database(tmp_path: Path) -> None:
     parent.mkdir(mode=0o700)
     with pytest.raises(ValueError, match="not a regular file"):
         create_backup(link, plans, parent / "one")
+    assert list(parent.iterdir()) == []
+
+
+def test_backup_without_receipts_needs_no_plan_directory(tmp_path: Path) -> None:
+    database = tmp_path / "fresh.db"
+    SQLiteStore(database)
+    parent = tmp_path / "bundles"
+    parent.mkdir(mode=0o700)
+    bundle = parent / "one"
+    manifest = create_backup(database, tmp_path / "not-yet-created-plans", bundle)
+    assert manifest["plans"] == []
+    assert verify_backup(bundle)["plan_count"] == 0
+
+
+def test_backup_does_not_replace_racing_target(tmp_path: Path, monkeypatch) -> None:
+    database, plans = _source(tmp_path)
+    parent = tmp_path / "bundles"
+    parent.mkdir(mode=0o700)
+    target = parent / "one"
+    original_publish = backup._publish_directory
+
+    def race(source: Path, destination: Path) -> None:
+        target.mkdir(mode=0o700)
+        original_publish(source, destination)
+
+    monkeypatch.setattr(backup, "_publish_directory", race)
+    with pytest.raises(FileExistsError):
+        create_backup(database, plans, target)
+    assert target.is_dir()
+    assert list(parent.iterdir()) == [target]
+
+
+def test_backup_preserves_post_publish_fsync_error_and_removes_bundle(
+    tmp_path: Path, monkeypatch
+) -> None:
+    database, plans = _source(tmp_path)
+    parent = tmp_path / "bundles"
+    parent.mkdir(mode=0o700)
+    target = parent / "one"
+    original_fsync = RetentionManager._fsync_directory
+
+    def fail_final_fsync(directory: Path) -> None:
+        if directory == parent and target.exists():
+            raise OSError("simulated parent fsync failure")
+        original_fsync(directory)
+
+    monkeypatch.setattr(RetentionManager, "_fsync_directory", fail_final_fsync)
+    with pytest.raises(OSError, match="simulated parent fsync failure"):
+        create_backup(database, plans, target)
+    assert not target.exists()
     assert list(parent.iterdir()) == []
 
 
