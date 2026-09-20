@@ -1,6 +1,6 @@
 # ReviewFlow 试运行准备执行队列
 
-状态：实施中；01、02 已完成本地实现与检查，03–05 待实施。规划基线：2026-09-20，`f407d0b25583a9553cbac24741183e87457d1523`。每次实施先核对当前提交、工作区和实际代码；本文的基线不是跳过核对的理由。
+状态：实施中；01–03 已完成本地实现与检查，04–05 待实施。规划基线：2026-09-20，`f407d0b25583a9553cbac24741183e87457d1523`。每次实施先核对当前提交、工作区和实际代码；本文的基线不是跳过核对的理由。
 
 ## 目标与契约
 
@@ -30,7 +30,7 @@ Agent 仍从冻结的目标分支 Skill 与 `AgentTaskV1` 获取任务，只向 
 | --- | --- | --- | --- | --- |
 | 01 | P0 | [通知可领取与结果语义](01-notification-and-outcome.md) | 无 | 本地完成；现场证据待 05 |
 | 02 | P1 | [终态保留与 Worker 所有权](02-retention-worker-ownership.md) | 01 完成；schema 切换前保存证据 | 本地完成；现场证据待 05 |
-| 03 | P1 | [Operator 诊断](03-operator-diagnostics.md) | 02 完成 | 待实施 |
+| 03 | P1 | [Operator 诊断](03-operator-diagnostics.md) | 02 完成 | 本地完成；现场证据待 05 |
 | 04 | P1 | [一致性备份与恢复验证](04-backup-restore.md) | 02 完成；建议 03 完成以复用状态查询 | 待实施 |
 | 05 | 发布门槛 | [部署与真实 canary](05-deployment-canary.md) | 01–04 完成；取得独立 canary 资源 | 待实施 |
 
@@ -48,3 +48,5 @@ Agent 仍从冻结的目标分支 Skill 与 `AgentTaskV1` 获取任务，只向 
 - `.venv/bin/python -m pytest`：380 passed，1 条 Starlette/httpx 测试依赖弃用警告；`.venv/bin/ruff check .`、`.venv/bin/python -m compileall -q src tests`、`git diff --check` 通过。测试中的 GitLab 与通知服务为模拟；新 JiHuLab/OpenCode、飞书/企微服务端接受、收件人可见及崩溃恢复现场证据仍由 05 收集。
 - 2026-09-20，02 本地完成：`b449419`（schema 17 与通知终态保留）、`dc442dc`（单 Worker 运行时所有权）、`77aa9e2`（审查后修复 `--once` 通知批次失租）、`8f54e04`（审查后修复退出时失租）。新的只读 review 提出的 P1、P2 均核实并逐项修复，无拒绝项。
 - `.venv/bin/python -m pytest`：392 passed，1 条 Starlette/httpx 测试依赖弃用警告；`.venv/bin/ruff check .`、`.venv/bin/python -m compileall -q src tests`、`git diff --check` 通过。测试验证新建库为 schema 17、旧 schema 16 拒绝，以及租约并发、过期接管、fencing、释放和长任务 heartbeat。未在真实部署上执行 schema 切换或取得一致性数据库快照；旧 canary 证据保留在 `docs/evidence/`，切换前的现场快照和新 canary、通知及恢复证据仍由 05 收集。
+- 2026-09-20，03 本地完成：`cb42a79`（单 Run 效果诊断）、`fd4ca73`（只读 `ops-status` 汇总）、`0c6484a`（审查后修正已发布 Note 和进行中 Auto-fix 的行动提示）。独立只读 review 的两项 P2 均核实并修复，无拒绝项。
+- `.venv/bin/python -m pytest`：398 passed，1 条 Starlette/httpx 测试依赖弃用警告；相关四个测试文件、`.venv/bin/ruff check .`、`.venv/bin/python -m compileall -q src tests`、CLI `--help`、`git diff --check` 通过。诊断仅读取 Store 的已知事实；未核查远端 Note/MR、收件人可见性、真实 Worker 部署或告警阈值。
