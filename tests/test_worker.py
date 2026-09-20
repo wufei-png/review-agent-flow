@@ -1768,6 +1768,47 @@ def test_retryable_gitlab_failure_requeues_then_fails_at_attempt_cap(tmp_path: P
     assert worker.process_one() is None
 
 
+def test_retryable_gitlab_failure_after_run_lease_expires_is_deferred(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    sha = "e" * 40
+    mr = MergeRequest("42", 1, "Retry after lease", "alice", "feature", "main", sha, "https://mr")
+    database = tmp_path / "review.db"
+    store = SQLiteStore(database)
+    run = store.enqueue("42", 1, sha)
+
+    class ExpiringRetryableGitLab(RetryableGitLab):
+        def get_merge_request(self, project_id: str, mr_iid: int) -> MergeRequest:
+            with sqlite3.connect(database) as connection:
+                connection.execute(
+                    "UPDATE review_runs SET lease_until = ? WHERE id = ?",
+                    ("2000-01-01T00:00:00+00:00", run.run_id),
+                )
+            return super().get_merge_request(project_id, mr_iid)
+
+    worker = ReviewWorker(
+        store,
+        ExpiringRetryableGitLab(mr),
+        GitWorktreeManager(repository, tmp_path / "worktrees"),
+        ReviewPolicy(),
+        repository,
+        "https://gitlab",
+        project_id="42",
+        retry_delay_seconds=0,
+    )
+
+    result = worker.process_one()
+
+    assert result is not None and result.status == "deferred"
+    saved = store.get_review_run(run.run_id)
+    assert saved is not None and saved.status == "running"
+    assert saved.failure_attempts == 0
+    assert store.list_failures(run.run_id) == ()
+    reclaimed = store.claim_next(lease_seconds=60)
+    assert reclaimed is not None and reclaimed.run_id == run.run_id
+    assert reclaimed.claim_token != saved.claim_token
+
+
 @pytest.mark.parametrize("heartbeat_mode", ["false", "exception"])
 def test_worker_lease_loss_is_requeued_and_bounded(
     heartbeat_mode: str,

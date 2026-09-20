@@ -837,12 +837,7 @@ class ReviewWorker:
                 self._cleanup_agent_effects(run, receipts, exc)
             failure = classify_exception(exc, secrets=self._redaction_secrets())
             if failure.retryable:
-                requeued = self._retry_or_fail(run, failure)
-                return WorkerResult(
-                    run.run_id,
-                    "deferred" if requeued else "failed",
-                    detail=failure.detail,
-                )
+                return self._retry_or_fail(run, failure)
             if not self._finish_terminal(run, "failed", failure.detail, failure.failure_class):
                 return self._lease_recovery_result(run, failure.detail)
             return WorkerResult(run.run_id, "failed", detail=failure.detail)
@@ -945,7 +940,7 @@ class ReviewWorker:
         )
         return updated
 
-    def _retry_or_fail(self, run: ReviewRun, failure: FailureInfo) -> bool:
+    def _retry_or_fail(self, run: ReviewRun, failure: FailureInfo) -> WorkerResult:
         delay = self._backoff(run.failure_attempts + 1)
         requeued = self.store.retry_or_fail(
             run.run_id,
@@ -955,16 +950,36 @@ class ReviewWorker:
             max_attempts=self.max_attempts,
             claim_token=run.claim_token,
         )
-        self._log_run(
-            run,
-            status="deferred" if requeued else "failed",
-            level=logging.WARNING,
-            diagnostic=failure.detail,
-            failure_class=failure.failure_class,
-            retryable=True,
-            persisted=requeued,
-        )
-        return requeued
+        if requeued:
+            self._log_run(
+                run,
+                status="deferred",
+                level=logging.WARNING,
+                diagnostic=failure.detail,
+                failure_class=failure.failure_class,
+                retryable=True,
+                persisted=True,
+            )
+            return WorkerResult(run.run_id, "deferred", detail=failure.detail)
+
+        current = self.store.get_review_run(run.run_id)
+        if (
+            current is not None
+            and current.status == "failed"
+            and current.failure_class == failure.failure_class
+            and current.claim_token is None
+        ):
+            self._log_run(
+                run,
+                status="failed",
+                level=logging.WARNING,
+                diagnostic=failure.detail,
+                failure_class=failure.failure_class,
+                retryable=True,
+                persisted=True,
+            )
+            return WorkerResult(run.run_id, "failed", detail=failure.detail)
+        return self._lease_recovery_result(run, failure.detail)
 
     def _backoff(self, attempt: int) -> float:
         base = max(0.0, self.retry_delay_seconds)
