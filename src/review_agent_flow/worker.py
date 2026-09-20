@@ -1272,8 +1272,8 @@ class ReviewWorker:
             self._runtime_assert_owned = None
             stop_heartbeat.set()
             thread.join()
-            self.store.release_worker_lease(token)
-            if lost.is_set() and body_error is None:
+            released = self.store.release_worker_lease(token)
+            if (lost.is_set() or not released) and body_error is None:
                 raise RuntimeError("Worker runtime lease lost")
 
     def _assert_runtime_ownership(self) -> None:

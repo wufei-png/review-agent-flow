@@ -1046,6 +1046,26 @@ def test_worker_does_not_claim_review_after_runtime_ownership_is_lost(
     assert saved is not None and saved.status == "pending"
 
 
+def test_worker_fails_when_runtime_lease_disappears_at_release(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    sha = _git_repository(repository)
+    store = SQLiteStore(tmp_path / "review.db")
+    worker = ReviewWorker(
+        store,
+        FakeGitLab(MergeRequest("42", 1, "Parent", "alice", "feature", "main", sha, "https://mr")),
+        GitWorktreeManager(repository, tmp_path / "worktrees"),
+        ReviewPolicy(),
+        repository,
+        "https://gitlab",
+        project_id="42",
+    )
+    with pytest.raises(RuntimeError, match="runtime lease lost"), worker.runtime_ownership() as owned:
+        owned()
+        with store._connect() as connection:
+            connection.execute("DELETE FROM worker_runtime_lease")
+
+
 def test_supervised_worker_fails_after_runtime_lease_loss(tmp_path: Path, monkeypatch) -> None:
     repository = tmp_path / "repo"
     repository.mkdir()
