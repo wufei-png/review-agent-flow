@@ -1861,6 +1861,7 @@ class SQLiteStore:
         if max_attempts <= 0:
             raise ValueError("max_attempts must be positive")
         now = datetime.now(UTC)
+        now_text = now.isoformat()
         safe_reason = self._redact(reason)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -1870,8 +1871,8 @@ class SQLiteStore:
             )
             parameters: tuple[object, ...] = (run_id,)
             if claim_token is not None:
-                query += " AND claim_token = ?"
-                parameters += (claim_token,)
+                query += " AND claim_token = ? AND lease_until IS NOT NULL AND lease_until > ?"
+                parameters += (claim_token, now_text)
             row = connection.execute(query, parameters).fetchone()
             if row is None:
                 return False
@@ -1879,7 +1880,7 @@ class SQLiteStore:
             failure_attempts = int(row["failure_attempts"] or 0) + 1
             exhausted = failure_attempts >= max_attempts
             status = "failed" if exhausted else "pending"
-            finished_at = now.isoformat() if exhausted else None
+            finished_at = now_text if exhausted else None
             next_attempt_at = (
                 None if exhausted else (now + timedelta(seconds=delay_seconds)).isoformat()
             )
@@ -1899,8 +1900,10 @@ class SQLiteStore:
                 run_id,
             )
             if claim_token is not None:
-                update_query += " AND claim_token = ?"
-                update_parameters += (claim_token,)
+                update_query += (
+                    " AND claim_token = ? AND lease_until IS NOT NULL AND lease_until > ?"
+                )
+                update_parameters += (claim_token, now_text)
             updated = connection.execute(update_query, update_parameters)
             if updated.rowcount == 1:
                 self._record_failure(
@@ -1919,7 +1922,7 @@ class SQLiteStore:
                         updated_at = ?, lease_until = NULL, claim_token = NULL
                     WHERE run_id = ? AND state = 'running'
                     """,
-                    (safe_reason, now.isoformat(), run_id),
+                    (safe_reason, now_text, run_id),
                 )
         return updated.rowcount == 1 and not exhausted
 

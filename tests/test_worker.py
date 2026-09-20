@@ -1958,16 +1958,21 @@ def test_agent_success_does_not_write_after_lease_expires(
     assert result is not None and result.status == "deferred"
     saved = store.get_review_run(run.run_id)
     assert saved is not None
-    assert saved.status == "pending"
-    assert saved.failure_class == "lease_lost"
-    assert saved.status != "succeeded"
+    assert saved.status == "running"
+    assert saved.failure_class is None
+    assert store.list_failures(run.run_id) == ()
     assert store.list_effect_receipts(run.run_id, "autofix_plan")[0].state == "planned"
-    assert store.list_effect_receipts(run.run_id, "agent_execution")[0].state == "not_observed"
+    assert store.list_effect_receipts(run.run_id, "agent_execution")[0].state == "running"
     with sqlite3.connect(database) as connection:
         relation_count = connection.execute(
             "SELECT COUNT(*) FROM auto_fix_relations"
         ).fetchone()[0]
     assert relation_count == 0
+
+    reclaimed = store.claim_next(lease_seconds=60)
+    assert reclaimed is not None and reclaimed.run_id == run.run_id
+    assert reclaimed.claim_token != saved.claim_token
+    assert store.list_effect_receipts(run.run_id, "agent_execution")[0].state == "not_observed"
 
 
 def test_agent_start_failure_closes_running_and_expected_receipts(tmp_path: Path) -> None:

@@ -365,6 +365,53 @@ def test_eligibility_deferrals_do_not_consume_failure_retry_budget(tmp_path) -> 
     assert pending.status == "pending"
     assert pending.failure_attempts == 1
 
+    claimed = store.claim_next()
+    assert claimed is not None
+    assert not store.retry_or_fail(
+        run.run_id,
+        "gitlab_transport",
+        "second provider failure",
+        delay_seconds=0,
+        max_attempts=2,
+        claim_token=claimed.claim_token,
+    )
+    failed = store.get_review_run(run.run_id)
+    assert failed is not None and failed.status == "failed"
+    assert failed.failure_attempts == 2
+    assert len(store.list_failures(run.run_id)) == 2
+
+
+@pytest.mark.parametrize("expired_lease", ["2000-01-01T00:00:00+00:00", None])
+def test_retry_or_fail_rejects_expired_run_owner_without_writing_failure(
+    tmp_path, expired_lease: str | None
+) -> None:
+    database = tmp_path / "review.db"
+    store = SQLiteStore(database)
+    run = store.enqueue("42", 1, SHA)
+    claimed = store.claim_next(lease_seconds=60)
+    assert claimed is not None
+    store.create_effect_receipt(run.run_id, "note_expected", "marker", state="running")
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE review_runs SET lease_until = ? WHERE id = ?",
+            (expired_lease, run.run_id),
+        )
+
+    assert not store.retry_or_fail(
+        run.run_id,
+        "gitlab_transport",
+        "stale owner failure",
+        delay_seconds=0,
+        claim_token=claimed.claim_token,
+    )
+    current = store.get_review_run(run.run_id)
+    assert current is not None and current.status == "running"
+    assert current.claim_token == claimed.claim_token
+    assert current.failure_attempts == 0
+    assert current.error is None
+    assert store.list_failures(run.run_id) == ()
+    assert store.list_effect_receipts(run.run_id)[0].state == "running"
+
 
 def test_expired_worker_lease_is_reclaimed_with_a_new_token(tmp_path) -> None:
     database = tmp_path / "review.db"
