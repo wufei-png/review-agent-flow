@@ -70,6 +70,9 @@ def main() -> None:
     executable = shutil.which("opencode")
     if executable is None:
         raise SystemExit("OpenCode executable is unavailable")
+    # OpenCode's built-in OpenAI OAuth plugin is required for this auth record.
+    # --pure still excludes external plugins and the adapter supplies task permissions.
+    os.environ.pop("OPENCODE_DISABLE_DEFAULT_PLUGINS", None)
     os.execv(executable, (executable, *sys.argv[1:]))
 
 
