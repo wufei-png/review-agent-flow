@@ -6,10 +6,9 @@ This is a live, exact-SHA canary with a **no-go** pilot decision. The positive
 ReviewFlow path and the post-MR-write recovery passed. The post-commit-write
 fault stopped safely but could not complete publication from the persisted
 identity; the Operator abandoned that Plan after verifying the unique remote
-commit. TLS webhook intake, a dedicated Provider identity, and human visibility
-of the ReviewFlow outbox messages remain unverified. Both systemd units were
-stopped and disabled at the end. No group message or DM to another person was
-sent.
+commit. TLS webhook intake and a dedicated Provider identity remain
+unverified. Both systemd units were stopped and disabled at the end. No group
+message or DM to another person was sent.
 
 All times below are UTC on 2026-09-20 (Asia/Shanghai: 2026-09-21). Private
 Worker files retain Store and backup payloads; this document contains only
@@ -79,8 +78,8 @@ commit changed only `pricing.py` to add shipping once, and its test passed.
 `review-mr --mr-iid 1` repeated on the same head returned `existing`, Run
 `1`. A Worker restart left one Note, one Plan, one Relation, one request at
 generation `1`, and one delivered outbox row; no second remote Note or child
-MR was observed. The outbox message's human visibility has not yet been
-confirmed.
+MR was observed. 吴非 later supplied a screenshot showing this outbox message
+in the personal Feishu conversation.
 
 ## Fault-window attempts
 
@@ -113,6 +112,19 @@ confirmed.
    and Relation `2`, and did not create another MR. Request generation `1`,
    outbox delivery `2`, one attempt, was server accepted at `18:26:12.961`.
    A remote search found exactly one child MR for this Plan's source branch.
+   吴非's screenshot also shows this outbox message in the same personal
+   conversation.
+
+On 2026-09-21, 吴非 supplied one screenshot showing the earlier transport
+check, the direct adapter probe, and the ReviewFlow Auto-fix messages linking
+to child MRs `!2` and `!3`. This is recipient confirmation that both actual
+outbox messages were visible; it is distinct from the two Feishu server
+acceptance receipts and does not establish read timing. The image is kept only
+in private local operator evidence at
+`~/.local/state/reviewflow-canary/evidence/feishu-owner-visible-2026-09-21.png`
+(mode `0600`, SHA-256
+`b5657a0d3bb4da15bfe5665ef6271cc90eac59df25617703819dce1e9507ca12`);
+the image itself is not committed to the repository.
 
 The fault harnesses were temporary host scripts that wrapped the actual
 GitLab client method and used `os._exit(137)` only after the corresponding
@@ -161,8 +173,7 @@ and isolated restores are live observations, not mocked integration tests.
 
 Still required before a pilot go decision: a supported recovery path that
 completes a post-commit crash after an exact remote commit has been verified;
-TLS webhook ingress and signed live webhook intake; human confirmation of an
-actual ReviewFlow outbox DM; a dedicated renewable Provider identity; and a
-recovery-host/systemd restore exercise if the pilot requires host loss
-readiness. Do not infer any of these from `delivered`, a local test, or the
-isolated namespace drill.
+TLS webhook ingress and signed live webhook intake; a dedicated renewable
+Provider identity; and a recovery-host/systemd restore exercise if the pilot
+requires host loss readiness. Do not infer any of these from `delivered`, a
+local test, or the isolated namespace drill.

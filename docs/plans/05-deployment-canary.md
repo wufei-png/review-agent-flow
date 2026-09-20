@@ -1,6 +1,6 @@
 # 05 · 部署与真实 canary
 
-状态：阶段 1 本地完成；阶段 2 的真实 OpenCode Luna 正向链路、MR 写后恢复和隔离备份演练已执行，但 commit 写后恢复停在安全阻断，完整验收未通过，试运行判定为 no-go。优先级：试运行门槛。前置条件：[01](01-notification-and-outcome.md)、[02](02-retention-worker-ownership.md)、[03](03-operator-diagnostics.md)、[04](04-backup-restore.md) 均完成；尚需 commit 写后完整恢复、TLS webhook 入口、专用可续期 Provider 身份及实际 ReviewFlow 通知的人工可见确认。
+状态：阶段 1 本地完成；阶段 2 的真实 OpenCode Luna 正向链路、MR 写后恢复、隔离备份演练和实际通知人工可见性已有证据，但 commit 写后恢复停在安全阻断，完整验收未通过，试运行判定为 no-go。优先级：试运行门槛。前置条件：[01](01-notification-and-outcome.md)、[02](02-retention-worker-ownership.md)、[03](03-operator-diagnostics.md)、[04](04-backup-restore.md) 均完成；尚需 commit 写后完整恢复、TLS webhook 入口及专用可续期 Provider 身份。
 
 ## 交付结果
 
@@ -38,4 +38,5 @@
 - 新[现场证据](../evidence/jihulab-opencode-canary-2026-09-21.md)：Run `1` 的 exact head `8610a97e552468a78787aaba0d31f8817b54ca48` 产生 Note `9207699`、Plan digest `a58faebde9fb730b437af64a03ea2aeadfb89ef05243ff8867bcf3f32fd39add`、修复 commit `85fcd9c9640de3e4dc90a0a0d68eb4b4eb49d327`、子 MR `!2`、Relation `1` 和 generation `1` 的飞书服务端接受收据。重复入队返回 `existing`，Worker 重启后没有第二个 Note、Relation、请求 generation 或子 MR。父 head 的单测失败 `20 != 15`，修复分支单测通过。
 - 两个独立故障窗口：Run `3` 在 GitLab 返回 commit `7a3fee17e22f86f6ef6462688c18c23761831551` 后、Store 写入 SHA 前退出 `137`；重启没有重发 commit，Plan `2` 因身份未持久化而 `blocked/operator_check`。核对唯一远端分支、父 SHA、变更路径和 Plan 文件内容摘要后，先备份再以审计 action `a72bffe4a76c4e94b1c788d0ae98ed62` 放弃 Plan；该项只证明安全退出，不满足完整恢复。Run `4` 在 GitLab 返回子 MR `!3` 后、本地写 IID 前退出 `137`；正常 Worker 对账已有 MR，落库 Relation `2` 和一次 generation `1` 私信请求，未创建第二个 MR。
 - 真实 Store 的一致性 bundle 经验证并在私有 Linux mount namespace 内恢复到原绝对路径；schema 17、Run/Note/Relation/outbox 收据与摘要一致。真实 Plan 尚未到保留期，正式 bundle 的 Plan 数为 0；仅在隔离副本上提前物化一个 Plan 备份后，含一个 canonical Plan 文件的第二 bundle、绝对收据路径、权限及摘要均通过恢复检查。原 Store 的 API `/readyz` 与 Worker 心跳在演练后通过；未在独立恢复主机或恢复副本上启动 systemd 服务。
-- 本轮最终本地全量 `.venv/bin/python -m pytest` 427 passed、1 条 Starlette/httpx 弃用警告；OpenCode 启动器与隔离定向 4 passed；Ruff、compileall、`git diff --check` 通过。`delegated-change-review` 的全新只读审查对 `0df06cc..1c45d02` 无 P0–P3 发现；审查者未独立重放现场收据。最终 `ops-status` 无 pending/blocked/uncertain 队列，API/Worker 均停止且 disabled。TLS webhook、实际 outbox 的人工可见性、专用可续期 Provider 身份和 commit 写后继续完成发布尚缺证据；不得把安全 abandon 或飞书服务端接受记作通过，试运行 no-go。
+- 本轮最终本地全量 `.venv/bin/python -m pytest` 427 passed、1 条 Starlette/httpx 弃用警告；OpenCode 启动器与隔离定向 4 passed；Ruff、compileall、`git diff --check` 通过。`delegated-change-review` 的全新只读审查对 `0df06cc..1c45d02` 无 P0–P3 发现；审查者未独立重放现场收据。最终 `ops-status` 无 pending/blocked/uncertain 队列，API/Worker 均停止且 disabled。TLS webhook、专用可续期 Provider 身份和 commit 写后继续完成发布尚缺证据；不得把安全 abandon 或飞书服务端接受记作通过，试运行 no-go。
+- 吴非提供的个人飞书会话截图显示 ReviewFlow outbox 的子 MR `!2`、`!3` 两条通知均实际可见；截图另有通道测试与适配器探针消息。原图仅存于私有本机证据目录，摘要及证据边界见[现场收据](../evidence/jihulab-opencode-canary-2026-09-21.md)。此项关闭实际通知人工可见性待验项，不改变上述 no-go 判定；截图不能证明阅读时间。
