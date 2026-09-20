@@ -62,6 +62,8 @@ The Store atomically claims eligible work with an opaque token and lease. Expire
 
 Note, Auto-fix and notification state is independent from process success. Requested Outputs, the Effective Run Decision and Output Expectations are frozen before effects proceed. User-visible Review Outcome is a projection over those durable expectations and receipts, not a synonym for Agent exit status. A `superseded` effect was safely suppressed and contributes no delivery; an all-superseded ReviewKey has `no_effect`. An outbox `delivered` state records provider acceptance, not recipient visibility, and at-least-once delivery may duplicate messages.
 
+The Project-bound Run status query reads persisted Note request, Auto-fix Plan and Relation, and notification delivery facts without claiming work or contacting GitLab. It exposes only selected identity, state, attempt, schedule, lease-validity and redacted diagnostic fields. Its finite `next_action` values are hints to wait for the Worker, wait for reconciliation of an uncertain write, or inspect a blocked/divergent effect. Notification `delivered` is labeled server acceptance with possible duplicates; the query never asserts recipient visibility.
+
 ## Fresh SQLite schema
 
 The pre-release implementation uses schema 17 and performs a hard cutover to a fresh database; schema 16 is rejected, not migrated. It does not read legacy ReviewRun kinds, Run-ID markers or Agent-owned publication state. The schema retains at least:

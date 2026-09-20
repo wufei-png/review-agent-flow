@@ -1603,6 +1603,8 @@ class SQLiteStore:
             }
             for receipt in self.list_effect_receipts(run_id)[-50:]
         ]
+        effects = self._run_effect_diagnostics(run_id)
+        now = self._now().isoformat()
         return {
             "run_id": run.run_id,
             "project_id": run.project_id,
@@ -1614,6 +1616,9 @@ class SQLiteStore:
             "claim_count": run.attempts,
             "failure_attempts": run.failure_attempts,
             "lease_recoveries": run.lease_recoveries,
+            "lease_active": self._lease_active(run.lease_until, now),
+            "lease_expired": run.lease_until is not None
+            and run.lease_until <= now,
             "review_outcome": self.project_review_outcome(run_id),
             "policy_snapshot": (
                 {
@@ -1660,6 +1665,7 @@ class SQLiteStore:
             "failure": latest_failure,
             "failures": failure_items,
             "effect_receipts": receipt_items,
+            "effects": effects,
             "diagnostic": {
                 "error": self._redact(run.error, max_length=2000) if run.error else None,
                 "failure_class": run.failure_class,
@@ -1669,6 +1675,131 @@ class SQLiteStore:
             "created_at": run.created_at,
             "finished_at": run.finished_at,
         }
+
+    @staticmethod
+    def _lease_active(lease_until: str | None, now: str) -> bool:
+        return lease_until is not None and lease_until > now
+
+    def _run_effect_diagnostics(self, run_id: int) -> dict[str, object]:
+        """Project-scoped caller only; select safe columns from local durable effects."""
+        now = self._now().isoformat()
+        with self._connect() as connection:
+            note = connection.execute(
+                """SELECT id, state, attempts, write_uncertain, external_note_id,
+                          next_attempt_at, lease_until, reconcile_attempts,
+                          reconcile_next_at, reconcile_lease_until, last_error
+                   FROM note_publication_requests WHERE run_id = ?""",
+                (run_id,),
+            ).fetchone()
+            plan = connection.execute(
+                """SELECT id, state, attempts, write_phase, write_uncertain,
+                          branch_commit_sha, external_mr_iid, next_attempt_at,
+                          lease_until, last_error
+                   FROM auto_fix_publication_plans WHERE run_id = ?""",
+                (run_id,),
+            ).fetchone()
+            relation = connection.execute(
+                """SELECT id, status, auto_fix_project_id, auto_fix_mr_iid,
+                          published_commit_sha, divergence, reconcile_requested,
+                          reconcile_attempts, reconcile_next_at,
+                          reconcile_lease_until, last_error
+                   FROM auto_fix_relations WHERE run_id = ?""",
+                (run_id,),
+            ).fetchone()
+            deliveries = connection.execute(
+                """SELECT o.id, n.generation, o.channel_id, o.channel,
+                          o.status, o.attempts, o.next_attempt_at, o.lease_until,
+                          o.created_at, o.delivered_at, o.last_error
+                   FROM notification_outbox o
+                   LEFT JOIN notification_requests n
+                     ON n.correlation_id = o.correlation_id
+                   LEFT JOIN auto_fix_relations r ON r.id = n.relation_id
+                   WHERE o.correlation_id = ? OR r.run_id = ?
+                   ORDER BY o.id""",
+                (f"review-run:{run_id}:human", run_id),
+            ).fetchall()
+
+        note_item = None
+        if note is not None:
+            note_item = {
+                "request_id": note["id"], "state": note["state"],
+                "attempts": note["attempts"], "write_uncertain": bool(note["write_uncertain"]),
+                "external_note_id": note["external_note_id"],
+                "next_attempt_at": note["next_attempt_at"],
+                "lease_active": self._lease_active(note["lease_until"], now),
+                "lease_expired": note["lease_until"] is not None and note["lease_until"] <= now,
+                "reconcile_attempts": note["reconcile_attempts"],
+                "reconcile_next_at": note["reconcile_next_at"],
+                "reconcile_lease_active": self._lease_active(note["reconcile_lease_until"], now),
+                "error": self._redact(note["last_error"]) if note["last_error"] else None,
+                "next_action": (
+                    "operator_check" if note["state"] == "blocked"
+                    else "wait_for_reconciliation" if note["write_uncertain"]
+                    else "wait_for_worker" if note["state"] in {"pending", "running"}
+                    else "none"
+                ),
+            }
+        plan_item = None
+        if plan is not None:
+            plan_item = {
+                "plan_id": plan["id"], "state": plan["state"],
+                "attempts": plan["attempts"], "write_phase": plan["write_phase"],
+                "write_uncertain": bool(plan["write_uncertain"]),
+                "branch_commit_sha": plan["branch_commit_sha"],
+                "external_mr_iid": plan["external_mr_iid"],
+                "next_attempt_at": plan["next_attempt_at"],
+                "lease_active": self._lease_active(plan["lease_until"], now),
+                "lease_expired": plan["lease_until"] is not None and plan["lease_until"] <= now,
+                "error": self._redact(plan["last_error"]) if plan["last_error"] else None,
+                "next_action": (
+                    "operator_check" if plan["state"] == "blocked"
+                    else "wait_for_reconciliation" if plan["state"] in {
+                        "needs_reconciliation", "reconciling"
+                    } or (plan["state"] == "running" and plan["write_phase"] != "preflight")
+                    else "wait_for_worker" if plan["state"] in {"frozen", "running"}
+                    else "none"
+                ),
+            }
+        relation_item = None
+        if relation is not None:
+            relation_item = {
+                "relation_id": relation["id"], "status": relation["status"],
+                "auto_fix_project_id": relation["auto_fix_project_id"],
+                "auto_fix_mr_iid": relation["auto_fix_mr_iid"],
+                "published_commit_sha": relation["published_commit_sha"],
+                "divergence": relation["divergence"],
+                "reconcile_requested": bool(relation["reconcile_requested"]),
+                "reconcile_attempts": relation["reconcile_attempts"],
+                "reconcile_next_at": relation["reconcile_next_at"],
+                "reconcile_lease_active": self._lease_active(
+                    relation["reconcile_lease_until"], now
+                ),
+                "error": self._redact(relation["last_error"])
+                if relation["last_error"] else None,
+                "next_action": "operator_check" if relation["divergence"]
+                else "wait_for_reconciliation" if relation["reconcile_requested"]
+                else "none",
+            }
+        notification_items = [
+            {
+                "delivery_id": row["id"], "generation": row["generation"],
+                "channel_id": row["channel_id"], "channel": row["channel"],
+                "status": row["status"], "attempts": row["attempts"],
+                "next_attempt_at": row["next_attempt_at"],
+                "lease_active": self._lease_active(row["lease_until"], now),
+                "lease_expired": row["lease_until"] is not None and row["lease_until"] <= now,
+                "created_at": row["created_at"], "delivered_at": row["delivered_at"],
+                "error": self._redact(row["last_error"]) if row["last_error"] else None,
+                "delivery_meaning": "server_accepted_may_duplicate"
+                if row["status"] == "delivered" else None,
+                "next_action": "operator_check" if row["status"] == "failed"
+                else "wait_for_worker" if row["status"] in {"pending", "running"}
+                else "none",
+            }
+            for row in deliveries
+        ]
+        return {"note": note_item, "auto_fix_plan": plan_item,
+                "auto_fix_relation": relation_item, "notifications": notification_items}
 
     def get_review_run_status(self, project_id: str, run_id: int) -> dict[str, object] | None:
         """Compatibility alias for the project-bound status snapshot."""

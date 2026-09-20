@@ -1,10 +1,12 @@
 import hashlib
+import json
 import sqlite3
 from threading import Barrier, Thread
 
 import pytest
 
 from review_agent_flow.autofix_planner import canonical_json
+from review_agent_flow.gitlab import canonical_note_marker
 from review_agent_flow.store import SQLiteStore
 
 SHA = "a" * 40
@@ -63,6 +65,45 @@ def test_review_run_schema_and_status_have_no_kind_discriminator(tmp_path) -> No
 
     assert "kind" not in columns
     assert "kind" not in store.get_project_bound_review_run_status("42", run.run_id)
+
+
+def test_project_bound_status_explains_effects_without_claims_or_payloads(tmp_path) -> None:
+    database = tmp_path / "review.db"
+    store = SQLiteStore(database)
+    run = store.enqueue("42", 1, SHA)
+    other = store.enqueue("99", 1, OLD_SHA)
+    claimed = store.claim_next(project_id="42")
+    assert claimed is not None
+    receipt = store.create_effect_receipt(
+        run.run_id, "note_expected", canonical_note_marker("42", 1, SHA)
+    )
+    note = store.create_note_publication_request(
+        run.run_id, receipt.receipt_id, "private review text", claimed.claim_token
+    )
+    assert note is not None
+    delivery = store.enqueue_notifications(
+        f"review-run:{run.run_id}:human", "private title", "private body", None,
+        ("alice",), (("reviewers", "feishu"),),
+    )[0]
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE note_publication_requests SET write_uncertain = 1, last_error = ? WHERE id = ?",
+            ("private error", note.request_id),
+        )
+        connection.execute(
+            "UPDATE notification_outbox SET status = 'delivered', delivered_at = created_at, "
+            "terminal_at = created_at WHERE id = ?", (delivery.delivery_id,),
+        )
+    assert store.get_project_bound_review_run_status("42", other.run_id) is None
+    snapshot = store.get_project_bound_review_run_status("42", run.run_id)
+    assert snapshot is not None
+    assert snapshot["effects"]["note"]["next_action"] == "wait_for_reconciliation"
+    assert snapshot["effects"]["notifications"][0]["delivery_meaning"] == (
+        "server_accepted_may_duplicate"
+    )
+    encoded = json.dumps(snapshot)
+    for secret in (claimed.claim_token, "private review text", "private body", "alice"):
+        assert secret not in encoded
 
 
 def test_policy_snapshot_is_exact_and_immutable_per_run(tmp_path) -> None:

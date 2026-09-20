@@ -89,6 +89,18 @@ def _published_relation(
     return completed[0]
 
 
+def test_project_status_exposes_published_plan_and_relation_without_private_payload(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "review.db")
+    relation = _published_relation(store)
+    snapshot = store.get_project_bound_review_run_status("42", relation.run_id)
+    assert snapshot is not None
+    assert snapshot["effects"]["auto_fix_plan"]["state"] == "published"
+    assert snapshot["effects"]["auto_fix_plan"]["external_mr_iid"] == 9
+    assert snapshot["effects"]["auto_fix_relation"]["auto_fix_mr_iid"] == 9
+    assert snapshot["effects"]["auto_fix_relation"]["next_action"] == "none"
+    assert store.get_project_bound_review_run_status("99", relation.run_id) is None
+
+
 def test_webhook_configuration_is_required(tmp_path) -> None:
     store = SQLiteStore(tmp_path / "review.db")
     with pytest.raises(RuntimeError, match="GITLAB_WEBHOOK_SECRET"):
