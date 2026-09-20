@@ -8,6 +8,7 @@ import json
 import os
 import signal
 import socket
+import sqlite3
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -16,6 +17,7 @@ from uuid import uuid4
 
 from . import __version__
 from .autofix_recovery import AutoFixPlanOperator, AutoFixRecoveryService, OperatorContext
+from .backup import create_backup
 from .gitlab import canonical_note_marker, is_valid_sha, normalize_sha
 from .gitlab_client import PythonGitLabClient
 from .notifications import notifiers_from_operator
@@ -197,6 +199,24 @@ def _run_ops_status(args: argparse.Namespace) -> int:
         print(json.dumps({"status": "unavailable", "reason": "database_missing"}, sort_keys=True))
         return 1
     print(json.dumps(store.get_project_ops_status(project_id), sort_keys=True))
+    return 0
+
+
+def _run_backup_store(args: argparse.Namespace) -> int:
+    try:
+        manifest = create_backup(
+            Path(args.db), Path(args.plan_backup_dir), Path(args.output)
+        )
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        print(f"backup-store failed: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps({
+        "status": "created",
+        "output": str(Path(args.output).absolute()),
+        "schema_version": manifest["schema_version"],
+        "snapshot_at": manifest["snapshot_at"],
+        "plan_count": len(manifest["plans"]),
+    }, sort_keys=True))
     return 0
 
 
@@ -411,6 +431,10 @@ def main(argv: list[str] | None = None) -> int:
     ops_status = subparsers.add_parser("ops-status", help="query local Project operations summary")
     ops_status.add_argument("--project-id")
     ops_status.add_argument("--db")
+    backup = subparsers.add_parser("backup-store", help="create a private SQLite and Plan bundle")
+    backup.add_argument("--db", required=True)
+    backup.add_argument("--plan-backup-dir", required=True)
+    backup.add_argument("--output", required=True)
     review_mr = subparsers.add_parser(
         "review-mr",
         help="idempotently enqueue the current head of one bound-Project Merge Request",
@@ -468,6 +492,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_status(args)
     if args.command == "ops-status":
         return _run_ops_status(args)
+    if args.command == "backup-store":
+        return _run_backup_store(args)
     if args.command == "review-mr":
         return _run_review_mr(args)
     if args.command == "recover-autofix-relation":
