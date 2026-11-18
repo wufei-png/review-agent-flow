@@ -336,7 +336,9 @@ def run_verifier(
                     ) from exc
                 if not heartbeat_ok:
                     _terminate(process)
-                    raise LeaseLostError("Review Run lease was lost during Auto-fix verification")
+                    raise LeaseLostError(
+                        "Review Run lease was lost during Auto-fix verification"
+                    ) from None
     if returncode != 0:
         raise DiffEnvelopeError(f"Operator verifier exited with code {returncode}")
     return VerificationEvidence(

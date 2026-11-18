@@ -45,7 +45,10 @@ source .venv/bin/activate
 python -m pip install -e '.[dev]'
 pytest
 ruff check .
+ruff format --check .
 ```
+
+dev extra 将 Ruff 固定为 `0.16.1`；CI 在运行 lint 与全仓格式门禁前会校验该精确版本。
 
 当前代码已完成从 checkpoint 中 Agent-owned 预发布实现到 Program-owned
 发布路径的硬切换；Review Outcome、目标分支 Policy Snapshot 和 Operator-owned

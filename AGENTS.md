@@ -14,10 +14,11 @@ source .venv/bin/activate
 python -m pip install -e '.[dev]'
 pytest
 ruff check .
+ruff format --check .
 python -m review_agent_flow --help
 ```
 
-The editable install provides the `review-agent-flow` CLI. `pytest` runs the configured quiet suite in `tests/`; `ruff check .` enforces static style rules. For a host-native smoke flow, follow `docs/quickstart-host-native.md` rather than inventing credentials or runtime defaults.
+The editable install provides the `review-agent-flow` CLI. `pytest` runs the configured quiet suite in `tests/`; `ruff check .` enforces static style rules and `ruff format --check .` enforces the repository-wide format baseline (Ruff 0.16.1, pinned in the dev extra). For a host-native smoke flow, follow `docs/quickstart-host-native.md` rather than inventing credentials or runtime defaults.
 
 ## Coding Style & Naming Conventions
 

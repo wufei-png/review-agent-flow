@@ -245,10 +245,11 @@ def load_operator_config(path: str | Path) -> OperatorConfig:
     config_path = Path(path).expanduser().resolve()
     if not config_path.is_file():
         raise OperatorConfigError(f"operator config is not a file: {config_path}")
+    # _UniqueKeySafeLoader only subclasses yaml.SafeLoader to reject duplicate keys.
     try:
         loaded = yaml.load(
             config_path.read_text(encoding="utf-8"),
-            Loader=_UniqueKeySafeLoader,
+            Loader=_UniqueKeySafeLoader,  # noqa: S506
         )
     except yaml.YAMLError as exc:
         raise OperatorConfigError(f"invalid operator config YAML: {exc}") from exc

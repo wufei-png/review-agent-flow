@@ -339,4 +339,6 @@ class LocalCliAgentRunner:
                     if not heartbeat_ok:
                         _terminate_process(process)
                         _finish_diagnostics(threads, captures)
-                        raise LeaseLostError("Review Run lease was lost during Agent execution")
+                        raise LeaseLostError(
+                            "Review Run lease was lost during Agent execution"
+                        ) from None

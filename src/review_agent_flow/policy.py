@@ -136,8 +136,9 @@ def parse_policy(text: str) -> ReviewPolicy:
 
     if len(text.encode("utf-8")) > MAX_POLICY_BYTES:
         raise PolicyError(f"Project Policy exceeds {MAX_POLICY_BYTES} bytes")
+    # _UniqueKeySafeLoader only subclasses yaml.SafeLoader to reject duplicate keys.
     try:
-        loaded = yaml.load(text, Loader=_UniqueKeySafeLoader)
+        loaded = yaml.load(text, Loader=_UniqueKeySafeLoader)  # noqa: S506
     except yaml.YAMLError as exc:
         raise PolicyError(f"invalid policy YAML: {exc}") from exc
     raw = {} if loaded is None else loaded

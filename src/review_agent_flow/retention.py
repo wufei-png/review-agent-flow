@@ -91,9 +91,11 @@ class RetentionManager:
                 os.fsync(stream.fileno())
             try:
                 os.link(temporary, destination)
-            except FileExistsError:
+            except FileExistsError as exc:
                 if RetentionManager._read_private_file(destination) != raw:
-                    raise ValueError("concurrent Publication Plan backup conflicts with its digest")
+                    raise ValueError(
+                        "concurrent Publication Plan backup conflicts with its digest"
+                    ) from exc
         finally:
             temporary.unlink(missing_ok=True)
         if RetentionManager._read_private_file(destination) != raw:
