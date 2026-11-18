@@ -92,9 +92,7 @@ class AutoFixPublisher:
             self._redact(detail),
         )
 
-    def _retry(
-        self, plan: AutoFixPublicationPlan, detail: str
-    ) -> AutoFixPublicationResult:
+    def _retry(self, plan: AutoFixPublicationPlan, detail: str) -> AutoFixPublicationResult:
         retrying = self.store.retry_auto_fix_publication_plan(
             plan.plan_id,
             plan.claim_token,
@@ -134,10 +132,7 @@ class AutoFixPublisher:
         )
         if plan is None:
             return None
-        if (
-            not self.config.enabled
-            or self.project_id not in self.config.allowed_projects
-        ):
+        if not self.config.enabled or self.project_id not in self.config.allowed_projects:
             return self._finish(
                 plan,
                 "blocked",
@@ -227,9 +222,7 @@ class AutoFixPublisher:
                 "GitLab returned a conflicting Auto-fix commit identity",
                 uncertain=True,
             )
-        if not self.store.record_auto_fix_branch_commit(
-            plan.plan_id, plan.claim_token, commit.sha
-        ):
+        if not self.store.record_auto_fix_branch_commit(plan.plan_id, plan.claim_token, commit.sha):
             return self._deferred(
                 plan,
                 "publication lease was lost after the Auto-fix commit write",
@@ -333,9 +326,7 @@ class AutoFixPublisher:
                 "Auto-fix Merge Request head conflicts with the confirmed commit",
                 uncertain=True,
             )
-        if not self.store.record_auto_fix_merge_request(
-            plan.plan_id, plan.claim_token, child.iid
-        ):
+        if not self.store.record_auto_fix_merge_request(plan.plan_id, plan.claim_token, child.iid):
             return self._deferred(
                 plan,
                 "publication lease was lost after the Auto-fix Merge Request write",

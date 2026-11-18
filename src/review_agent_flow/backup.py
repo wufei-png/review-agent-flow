@@ -76,9 +76,10 @@ def _snapshot(source: Path, destination: Path) -> None:
     if not stat.S_ISREG(metadata.st_mode):
         raise ValueError("source SQLite database is not a regular file")
     uri = f"file:{quote(str(source), safe='/')}?mode=ro"
-    with sqlite3.connect(uri, uri=True, timeout=30) as live, sqlite3.connect(
-        destination
-    ) as snapshot:
+    with (
+        sqlite3.connect(uri, uri=True, timeout=30) as live,
+        sqlite3.connect(destination) as snapshot,
+    ):
         live.backup(snapshot)
         snapshot.execute("PRAGMA journal_mode = DELETE")
     os.chmod(destination, 0o600)
@@ -91,8 +92,13 @@ def _publish_directory(source: Path, destination: Path) -> None:
     libc = ctypes.CDLL(None, use_errno=True)
     if sys.platform == "linux":
         rename = libc.renameat2
-        rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p,
-                           ctypes.c_uint]
+        rename.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
         result = rename(-100, os.fsencode(source), -100, os.fsencode(destination), 1)
     elif sys.platform == "darwin":
         rename = libc.renamex_np
@@ -168,7 +174,9 @@ def create_backup(source: Path, plan_directory: Path, destination: Path) -> dict
                 or original.parent != plan_directory
                 or original.name != f"{digest}.json"
             ):
-                raise ValueError("Publication Plan receipt path is outside the configured directory")
+                raise ValueError(
+                    "Publication Plan receipt path is outside the configured directory"
+                )
             payload = _private_file(original)
             _plan_payload(payload, digest)
             retained = row["plan_json"]
@@ -176,14 +184,16 @@ def create_backup(source: Path, plan_directory: Path, destination: Path) -> dict
                 raise ValueError("Publication Plan receipt conflicts with retained Store payload")
             relative = f"plans/{digest}.json"
             _write_file(temporary / relative, payload)
-            plan_entries.append({
-                "plan_id": row["plan_id"],
-                "plan_sha256": digest,
-                "source_path": str(original),
-                "path": relative,
-                "sha256": _digest(payload),
-                "bytes": len(payload),
-            })
+            plan_entries.append(
+                {
+                    "plan_id": row["plan_id"],
+                    "plan_sha256": digest,
+                    "source_path": str(original),
+                    "path": relative,
+                    "sha256": _digest(payload),
+                    "bytes": len(payload),
+                }
+            )
         database_sha256, database_bytes = _file_fingerprint(database)
         manifest = {
             "format_version": 1,
@@ -233,15 +243,25 @@ def verify_backup(bundle: Path) -> dict:
         if raw != canonical_json(manifest).encode("utf-8"):
             raise ValueError("backup manifest is not canonical JSON")
         if set(manifest) != {
-            "format_version", "application_version", "schema_version", "snapshot_at",
-            "database", "plans",
+            "format_version",
+            "application_version",
+            "schema_version",
+            "snapshot_at",
+            "database",
+            "plans",
         }:
             raise ValueError("backup manifest fields are invalid")
         if type(manifest["format_version"]) is not int or manifest["format_version"] != 1:
             raise ValueError("unsupported backup format")
-        if type(manifest["schema_version"]) is not int or manifest["schema_version"] != SCHEMA_VERSION:
+        if (
+            type(manifest["schema_version"]) is not int
+            or manifest["schema_version"] != SCHEMA_VERSION
+        ):
             raise ValueError("unsupported backup schema")
-        if not isinstance(manifest["application_version"], str) or not manifest["application_version"]:
+        if (
+            not isinstance(manifest["application_version"], str)
+            or not manifest["application_version"]
+        ):
             raise ValueError("backup application version is invalid")
         timestamp = datetime.fromisoformat(manifest["snapshot_at"])
         if timestamp.tzinfo is None:
@@ -266,7 +286,12 @@ def verify_backup(bundle: Path) -> dict:
     expected_plans: set[str] = set()
     for row, entry in zip(rows, manifest["plans"], strict=True):
         if not isinstance(entry, dict) or set(entry) != {
-            "plan_id", "plan_sha256", "source_path", "path", "sha256", "bytes",
+            "plan_id",
+            "plan_sha256",
+            "source_path",
+            "path",
+            "sha256",
+            "bytes",
         }:
             raise ValueError("backup Plan manifest entry is invalid")
         digest = row["plan_sha256"]

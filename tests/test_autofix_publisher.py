@@ -142,9 +142,7 @@ def _frozen_plan(
     claimed = store.claim_next(project_id="42")
     assert claimed is not None
     if policy_channels is not None:
-        policy = ReviewPolicy(
-            notifications=NotificationPolicy(channels=policy_channels)
-        )
+        policy = ReviewPolicy(notifications=NotificationPolicy(channels=policy_channels))
         assert store.freeze_policy_snapshot(
             run.run_id,
             claimed.claim_token,
@@ -210,9 +208,7 @@ def _frozen_plan(
         )
         assert note_request is not None
         note_request_id = note_request.request_id
-    intent = store.create_auto_fix_publication_intent(
-        claimed.run_id, claimed.claim_token
-    )
+    intent = store.create_auto_fix_publication_intent(claimed.run_id, claimed.claim_token)
     assert intent is not None
     receipt = store.create_effect_receipt(
         claimed.run_id,
@@ -375,9 +371,7 @@ def test_published_autofix_notifications_are_claimable_once_per_channel(tmp_path
     assert dispatcher.process(limit=2) == 0
 
 
-def test_lost_lease_before_commit_prevents_external_write(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_lost_lease_before_commit_prevents_external_write(tmp_path: Path, monkeypatch) -> None:
     store, _run_id, plan_id, _branch = _frozen_plan(tmp_path)
     gitlab = FakeGitLab(
         MergeRequest("42", 1, "Parent", "alice", "feature", "main", SHA, "https://parent")
@@ -398,9 +392,7 @@ def test_lost_lease_before_commit_prevents_external_write(
 def test_publisher_blocks_before_external_write_when_frozen_channel_is_unavailable(
     tmp_path: Path,
 ) -> None:
-    store, _run_id, plan_id, _branch = _frozen_plan(
-        tmp_path, policy_channels=("removed-channel",)
-    )
+    store, _run_id, plan_id, _branch = _frozen_plan(tmp_path, policy_channels=("removed-channel",))
     gitlab = FakeGitLab(
         MergeRequest("42", 1, "Parent", "alice", "feature", "main", SHA, "https://parent")
     )
@@ -414,9 +406,7 @@ def test_publisher_blocks_before_external_write_when_frozen_channel_is_unavailab
 
 
 def test_review_outcome_tracks_pending_and_blocked_autofix_plan(tmp_path: Path) -> None:
-    store, run_id, plan_id, _branch = _frozen_plan(
-        tmp_path, with_delivered_note=True
-    )
+    store, run_id, plan_id, _branch = _frozen_plan(tmp_path, with_delivered_note=True)
     gitlab = FakeGitLab(
         MergeRequest("42", 1, "Parent", "alice", "feature", "main", SHA, "https://parent")
     )
@@ -434,9 +424,7 @@ def test_review_outcome_tracks_pending_and_blocked_autofix_plan(tmp_path: Path) 
 
 
 def test_review_outcome_is_delivered_after_note_and_autofix_publish(tmp_path: Path) -> None:
-    store, run_id, plan_id, _branch = _frozen_plan(
-        tmp_path, with_delivered_note=True
-    )
+    store, run_id, plan_id, _branch = _frozen_plan(tmp_path, with_delivered_note=True)
     gitlab = FakeGitLab(
         MergeRequest("42", 1, "Parent", "alice", "feature", "main", SHA, "https://parent")
     )
@@ -447,9 +435,7 @@ def test_review_outcome_is_delivered_after_note_and_autofix_publish(tmp_path: Pa
     assert store.project_review_outcome(run_id) == "delivered"
 
 
-def test_lost_lease_before_merge_request_stops_after_commit(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_lost_lease_before_merge_request_stops_after_commit(tmp_path: Path, monkeypatch) -> None:
     store, run_id, plan_id, _branch = _frozen_plan(tmp_path)
     gitlab = FakeGitLab(
         MergeRequest("42", 1, "Parent", "alice", "feature", "main", SHA, "https://parent")
@@ -504,9 +490,7 @@ def test_commit_error_stops_normal_retries_as_uncertain(tmp_path: Path) -> None:
     assert plan is not None and plan.write_uncertain is True
     assert plan.write_phase == "commit_write_started"
     assert store.get_auto_fix_publication_intent(run_id).state == "needs_reconciliation"
-    assert store.list_effect_receipts(run_id, "autofix_plan")[0].state == (
-        "needs_reconciliation"
-    )
+    assert store.list_effect_receipts(run_id, "autofix_plan")[0].state == ("needs_reconciliation")
     assert len(gitlab.commit_payloads) == 1
     assert store.get_program_auto_fix_relation(plan_id) is None
 
@@ -605,9 +589,7 @@ def test_expired_external_write_boundary_requires_reconciliation(tmp_path: Path)
     store, run_id, plan_id, _branch = _frozen_plan(tmp_path)
     claimed = store.claim_auto_fix_publication_plan(plan_id=plan_id, lease_seconds=60)
     assert claimed is not None
-    assert store.mark_auto_fix_write_started(
-        plan_id, claimed.claim_token, operation="commit"
-    )
+    assert store.mark_auto_fix_write_started(plan_id, claimed.claim_token, operation="commit")
     with store._connect() as connection:
         connection.execute(
             "UPDATE auto_fix_publication_plans SET lease_until = ? WHERE id = ?",
@@ -625,9 +607,7 @@ def test_reconciliation_blocks_if_confirmed_mr_head_advanced(tmp_path: Path) -> 
     store, run_id, plan_id, branch = _frozen_plan(tmp_path)
     claimed = store.claim_auto_fix_publication_plan(plan_id=plan_id, lease_seconds=60)
     assert claimed is not None
-    assert store.mark_auto_fix_write_started(
-        plan_id, claimed.claim_token, operation="commit"
-    )
+    assert store.mark_auto_fix_write_started(plan_id, claimed.claim_token, operation="commit")
     assert store.record_auto_fix_branch_commit(plan_id, claimed.claim_token, "f" * 40)
     assert store.mark_auto_fix_write_started(
         plan_id, claimed.claim_token, operation="merge_request"
@@ -656,9 +636,7 @@ def test_reconciliation_blocks_if_confirmed_mr_head_advanced(tmp_path: Path) -> 
         description=plan.marker,
     )
 
-    result = AutoFixReconciler(
-        store, gitlab, "42", run_lease_seconds=60
-    ).process()
+    result = AutoFixReconciler(store, gitlab, "42", run_lease_seconds=60).process()
 
     assert result and result[0].status == "blocked"
     assert store.get_program_auto_fix_relation(plan_id) is None
@@ -670,9 +648,7 @@ def test_operator_rearm_uses_write_phase_and_is_idempotently_audited(
     store, run_id, plan_id, _branch = _frozen_plan(tmp_path)
     claimed = store.claim_auto_fix_publication_plan(plan_id=plan_id)
     assert claimed is not None
-    assert store.mark_auto_fix_write_started(
-        plan_id, claimed.claim_token, operation="commit"
-    )
+    assert store.mark_auto_fix_write_started(plan_id, claimed.claim_token, operation="commit")
     assert store.finish_auto_fix_publication_plan(
         plan_id,
         claimed.claim_token,
@@ -697,9 +673,7 @@ def test_operator_rearm_uses_write_phase_and_is_idempotently_audited(
 def test_operator_abandon_is_terminal_and_rejected_rearm_is_audited(
     tmp_path: Path,
 ) -> None:
-    store, run_id, plan_id, _branch = _frozen_plan(
-        tmp_path, with_delivered_note=True
-    )
+    store, run_id, plan_id, _branch = _frozen_plan(tmp_path, with_delivered_note=True)
     operator = AutoFixPlanOperator(store)
     abandoned = operator.transition(
         context=OperatorContext("action-2", "cancel pilot", "op", "host", "1"),

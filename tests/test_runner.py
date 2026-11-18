@@ -70,8 +70,7 @@ def _success_code(diagnostic: str = "") -> str:
     return (
         "import json, os, pathlib; "
         "pathlib.Path(os.environ['REVIEW_AGENT_FLOW_RESULT_PATH']).write_text("
-        "json.dumps({'version': 1, 'review_markdown': 'reviewed'})); "
-        + diagnostic
+        "json.dumps({'version': 1, 'review_markdown': 'reviewed'})); " + diagnostic
     )
 
 
@@ -115,7 +114,7 @@ def test_opencode_adapter_uses_native_noninteractive_prompt_and_task_permissions
         "#!/bin/sh\n"
         'printf "%s\\n" "$@" > "$CAPTURE_PATH"\n'
         'printf "%s" "$OPENCODE_CONFIG_CONTENT" > "$CONFIG_CAPTURE_PATH"\n'
-        "printf '%s' '{\"version\":1,\"review_markdown\":\"reviewed\"}' "
+        'printf \'%s\' \'{"version":1,"review_markdown":"reviewed"}\' '
         '> "$REVIEW_AGENT_FLOW_RESULT_PATH"\n',
         encoding="utf-8",
     )
@@ -161,8 +160,8 @@ def test_runner_parses_optional_autofix_proposal(tmp_path: Path) -> None:
     code = (
         "import os, pathlib; "
         "pathlib.Path(os.environ['REVIEW_AGENT_FLOW_RESULT_PATH']).write_text("
-        "'{\"version\":1,\"review_markdown\":\"reviewed\",'"
-        "'\"autofix_proposal\":{\"summary\":\"Apply the safe fix\"}}')"
+        '\'{"version":1,"review_markdown":"reviewed",\''
+        '\'"autofix_proposal":{"summary":"Apply the safe fix"}}\')'
     )
     result = LocalCliAgentRunner([sys.executable, "-c", code], timeout_seconds=5).run(
         _context(tmp_path)
@@ -201,7 +200,7 @@ def test_runner_resolves_bare_operator_command_from_trusted_path(tmp_path: Path)
     executable = executable_root / "review-agent-test"
     executable.write_text(
         "#!/bin/sh\n"
-        "printf '%s' '{\"version\":1,\"review_markdown\":\"reviewed\"}' "
+        'printf \'%s\' \'{"version":1,"review_markdown":"reviewed"}\' '
         '> "$REVIEW_AGENT_FLOW_RESULT_PATH"\n'
         'printf "%s" "$PATH"\n',
         encoding="utf-8",
@@ -236,9 +235,7 @@ def test_runner_rejects_invalid_success_result(tmp_path: Path, payload: str) -> 
         f"pathlib.Path(os.environ['REVIEW_AGENT_FLOW_RESULT_PATH']).write_text({payload!r})"
     )
     with pytest.raises(AgentContractError):
-        LocalCliAgentRunner([sys.executable, "-c", code], timeout_seconds=5).run(
-            _context(tmp_path)
-        )
+        LocalCliAgentRunner([sys.executable, "-c", code], timeout_seconds=5).run(_context(tmp_path))
 
 
 def test_runner_rejects_missing_symlink_and_oversized_results(tmp_path: Path) -> None:

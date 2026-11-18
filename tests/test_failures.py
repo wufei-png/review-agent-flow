@@ -6,7 +6,9 @@ from review_agent_flow.repository import ShaFetchError, ShaUnavailableError
 
 def test_http_4xx_is_terminal_gitlab_api_failure() -> None:
     for status in (401, 404):
-        failure = classify_exception(HTTPError("https://gitlab.example", status, "failed", {}, None))
+        failure = classify_exception(
+            HTTPError("https://gitlab.example", status, "failed", {}, None)
+        )
         assert failure.failure_class == "gitlab_api"
         assert failure.retryable is False
 

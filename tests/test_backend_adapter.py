@@ -35,9 +35,7 @@ def test_opencode_adapter_maps_autofix_to_task_scoped_edit_permission(
     )
     task = AgentTaskV1(snapshot, skill, result, auto_fix_enabled)
 
-    invocation = build_backend_invocation(
-        "opencode", ("opencode",), task, tmp_path / "task.md"
-    )
+    invocation = build_backend_invocation("opencode", ("opencode",), task, tmp_path / "task.md")
 
     assert invocation.command[:3] == ("opencode", "run", "--pure")
     assert invocation.command[3:5] == ("--agent", "reviewflow")
@@ -50,17 +48,14 @@ def test_opencode_adapter_maps_autofix_to_task_scoped_edit_permission(
     assert config["permission"]["skill"] == "deny"
     assert config["permission"]["bash"]["*"] == "deny"
     assert (
-        config["permission"]["bash"][f"git diff --no-ext-diff {'a' * 40}...{'c' * 40}"]
-        == "allow"
+        config["permission"]["bash"][f"git diff --no-ext-diff {'a' * 40}...{'c' * 40}"] == "allow"
     )
     assert all(not pattern.endswith("-- *") for pattern in config["permission"]["bash"])
     assert config["agent"]["reviewflow"]["permission"] == config["permission"]
     assert config["share"] == "disabled"
     assert invocation.environment["OPENCODE_DISABLE_PROJECT_CONFIG"] == "1"
     assert invocation.environment["OPENCODE_DISABLE_SHARE"] == "1"
-    assert invocation.environment["OPENCODE_CONFIG_DIR"] == str(
-        result.parent / "opencode-config"
-    )
+    assert invocation.environment["OPENCODE_CONFIG_DIR"] == str(result.parent / "opencode-config")
     assert invocation.environment["XDG_DATA_HOME"] == str(result.parent / "opencode-data")
 
 
@@ -87,9 +82,7 @@ def test_command_adapter_preserves_operator_argv_and_supplies_task_path(tmp_path
     task = AgentTaskV1(snapshot, skill, result, False)
     task_path = tmp_path / "task.md"
 
-    invocation = build_backend_invocation(
-        "command", ("custom-agent", "--batch"), task, task_path
-    )
+    invocation = build_backend_invocation("command", ("custom-agent", "--batch"), task, task_path)
 
     assert invocation.command == ("custom-agent", "--batch")
     assert invocation.environment == {"REVIEW_AGENT_FLOW_TASK_PATH": str(task_path)}

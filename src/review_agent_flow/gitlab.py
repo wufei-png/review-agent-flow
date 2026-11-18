@@ -26,10 +26,7 @@ def canonical_note_marker(project_id: str, mr_iid: int, sha: str) -> str:
     if type(mr_iid) is not int or mr_iid <= 0:
         raise ValueError("mr_iid must be a positive integer")
     sha = normalize_sha(sha)
-    return (
-        f"<!-- reviewflow:v1;project={project_id};mr={mr_iid};"
-        f"sha={sha};effect=note -->"
-    )
+    return f"<!-- reviewflow:v1;project={project_id};mr={mr_iid};sha={sha};effect=note -->"
 
 
 def has_exact_note_marker(body: object, marker: object) -> bool:
@@ -108,19 +105,13 @@ class NoteMarkerLookup:
 class NoteObserver(Protocol):
     """Capability for observing Program-owned GitLab Notes."""
 
-    def find_note_by_marker(
-        self, project_id: str, mr_iid: int, marker: str
-    ) -> Note | None: ...
+    def find_note_by_marker(self, project_id: str, mr_iid: int, marker: str) -> Note | None: ...
 
     def has_note_marker(self, project_id: str, mr_iid: int, marker: str) -> bool: ...
 
-    def lookup_note_marker(
-        self, project_id: str, mr_iid: int, marker: str
-    ) -> NoteMarkerLookup: ...
+    def lookup_note_marker(self, project_id: str, mr_iid: int, marker: str) -> NoteMarkerLookup: ...
 
-    def get_trusted_note(
-        self, project_id: str, mr_iid: int, note_id: int
-    ) -> Note | None: ...
+    def get_trusted_note(self, project_id: str, mr_iid: int, note_id: int) -> Note | None: ...
 
 
 @dataclass(frozen=True)
@@ -194,19 +185,13 @@ class GitLabClient(Protocol):
 
     def create_note(self, project_id: str, mr_iid: int, body: str) -> Note: ...
 
-    def find_note_by_marker(
-        self, project_id: str, mr_iid: int, marker: str
-    ) -> Note | None: ...
+    def find_note_by_marker(self, project_id: str, mr_iid: int, marker: str) -> Note | None: ...
 
     def has_note_marker(self, project_id: str, mr_iid: int, marker: str) -> bool: ...
 
-    def lookup_note_marker(
-        self, project_id: str, mr_iid: int, marker: str
-    ) -> NoteMarkerLookup: ...
+    def lookup_note_marker(self, project_id: str, mr_iid: int, marker: str) -> NoteMarkerLookup: ...
 
-    def get_trusted_note(
-        self, project_id: str, mr_iid: int, note_id: int
-    ) -> Note | None: ...
+    def get_trusted_note(self, project_id: str, mr_iid: int, note_id: int) -> Note | None: ...
 
     def create_repository_commit(
         self,

@@ -7,9 +7,7 @@ class PolicyGitLab:
         self.content = content
         self.calls: list[tuple[str, str, str]] = []
 
-    def get_repository_file(
-        self, project_id: str, file_path: str, branch: str
-    ) -> RepositoryFile:
+    def get_repository_file(self, project_id: str, file_path: str, branch: str) -> RepositoryFile:
         self.calls.append((project_id, file_path, branch))
         return RepositoryFile(project_id, file_path, "b" * 40, self.content)
 

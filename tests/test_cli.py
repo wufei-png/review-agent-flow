@@ -231,12 +231,15 @@ def test_status_does_not_create_missing_database(tmp_path: Path, capsys) -> None
     assert not database.exists()
 
 
-def test_ops_status_uses_read_only_database_and_reports_missing_database(tmp_path: Path, capsys) -> None:
+def test_ops_status_uses_read_only_database_and_reports_missing_database(
+    tmp_path: Path, capsys
+) -> None:
     database = tmp_path / "review.db"
     args = ["ops-status", "--project-id", "42", "--db", str(database)]
     assert cli.main(args) == 1
     assert json.loads(capsys.readouterr().out) == {
-        "status": "unavailable", "reason": "database_missing"
+        "status": "unavailable",
+        "reason": "database_missing",
     }
     assert not database.exists()
     from review_agent_flow.store import SQLiteStore
@@ -292,9 +295,7 @@ def test_review_mr_is_project_bound_and_idempotent(monkeypatch, tmp_path: Path, 
     ("merge_request", "message"),
     [
         (
-            MergeRequest(
-                "99", 7, "Wrong Project", "alice", "feature", "main", "a" * 40, "url"
-            ),
+            MergeRequest("99", 7, "Wrong Project", "alice", "feature", "main", "a" * 40, "url"),
             "bound Project",
         ),
         (
@@ -447,13 +448,9 @@ def test_cli_routes_separate_notification_resend(monkeypatch) -> None:
     assert captured["args"].reason == "resend approved"
 
 
-def test_notification_resend_requires_frozen_policy_authority(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_notification_resend_requires_frozen_policy_authority(monkeypatch, tmp_path: Path) -> None:
     store = SimpleNamespace(
-        get_program_auto_fix_relation_by_child=lambda project_id, mr_iid: SimpleNamespace(
-            run_id=7
-        ),
+        get_program_auto_fix_relation_by_child=lambda project_id, mr_iid: SimpleNamespace(run_id=7),
         get_policy_snapshot=lambda run_id: None,
     )
     monkeypatch.setattr(
@@ -480,12 +477,8 @@ def test_cli_routes_operator_plan_transitions(monkeypatch) -> None:
 
     monkeypatch.setattr(cli, "_run_transition_auto_fix_plan", run)
 
-    assert cli.main(
-        ["rearm-autofix-plan", "--plan-id", "7", "--reason", "evidence checked"]
-    ) == 9
-    assert cli.main(
-        ["abandon-autofix-plan", "--plan-id", "8", "--reason", "pilot cancelled"]
-    ) == 9
+    assert cli.main(["rearm-autofix-plan", "--plan-id", "7", "--reason", "evidence checked"]) == 9
+    assert cli.main(["abandon-autofix-plan", "--plan-id", "8", "--reason", "pilot cancelled"]) == 9
     assert captured == [
         (7, "evidence checked", "rearm"),
         (8, "pilot cancelled", "abandon"),
@@ -501,7 +494,5 @@ def test_cli_routes_api_process(monkeypatch) -> None:
 
     monkeypatch.setattr(cli, "_run_api", run)
 
-    assert cli.main(
-        ["api", "--host", "127.0.0.2", "--port", "9000", "--log-level", "warning"]
-    ) == 6
+    assert cli.main(["api", "--host", "127.0.0.2", "--port", "9000", "--log-level", "warning"]) == 6
     assert captured == {"host": "127.0.0.2", "port": 9000, "log_level": "warning"}

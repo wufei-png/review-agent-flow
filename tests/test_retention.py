@@ -225,9 +225,7 @@ def test_notification_retention_starts_at_terminal_time_and_latest_channel(tmp_p
         rows = connection.execute(
             "SELECT channel_id, body FROM notification_outbox ORDER BY channel_id"
         ).fetchall()
-        request_body = connection.execute(
-            "SELECT body FROM notification_requests"
-        ).fetchone()[0]
+        request_body = connection.execute("SELECT body FROM notification_requests").fetchone()[0]
     assert [tuple(row) for row in rows] == [("reviewers", ""), ("second", "second body")]
     assert request_body == "sensitive notification body"
 
@@ -244,19 +242,13 @@ def test_notification_retention_keeps_old_queue_until_terminal_and_handles_empty
 ) -> None:
     store, _run_id, _plan_id, _marker = _terminal_payloads(tmp_path)
     with store._connect() as connection:
-        connection.execute(
-            "UPDATE notification_outbox SET status = 'pending', terminal_at = NULL"
-        )
-    RetentionManager(store, RetentionConfig(1, None)).sweep(
-        now=datetime(2026, 1, 1, tzinfo=UTC)
-    )
+        connection.execute("UPDATE notification_outbox SET status = 'pending', terminal_at = NULL")
+    RetentionManager(store, RetentionConfig(1, None)).sweep(now=datetime(2026, 1, 1, tzinfo=UTC))
     with store._connect() as connection:
         assert connection.execute("SELECT body FROM notification_outbox").fetchone()[0]
         assert connection.execute("SELECT body FROM notification_requests").fetchone()[0]
         connection.execute("DELETE FROM notification_outbox")
-    RetentionManager(store, RetentionConfig(1, None)).sweep(
-        now=datetime(2026, 1, 1, tzinfo=UTC)
-    )
+    RetentionManager(store, RetentionConfig(1, None)).sweep(now=datetime(2026, 1, 1, tzinfo=UTC))
     with store._connect() as connection:
         assert connection.execute("SELECT body FROM notification_requests").fetchone()[0] == ""
 

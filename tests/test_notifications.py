@@ -175,19 +175,32 @@ def test_resolved_feishu_direct_channel_redacts_app_secret() -> None:
 
     assert fanout.channel_specs()[0][0] == "owner"
     assert fanout.channel_specs()[0][1].startswith("feishu_dm:")
-    assert fanout.channel_specs() == notifiers_from_operator(
-        (
-            ResolvedNotificationChannel(
-                "owner", "feishu_dm", None, {}, "cli_app", "rotated", "ou_owner", "wufei-png"
-            ),
-        )
-    ).channel_specs()
-    assert fanout.channel_specs() != notifiers_from_operator(
-        (
-            ResolvedNotificationChannel(
-                "owner", "feishu_dm", None, {}, "other_app", "private-secret", "ou_owner", "wufei-png"
-            ),
-        )
-    ).channel_specs()
+    assert (
+        fanout.channel_specs()
+        == notifiers_from_operator(
+            (
+                ResolvedNotificationChannel(
+                    "owner", "feishu_dm", None, {}, "cli_app", "rotated", "ou_owner", "wufei-png"
+                ),
+            )
+        ).channel_specs()
+    )
+    assert (
+        fanout.channel_specs()
+        != notifiers_from_operator(
+            (
+                ResolvedNotificationChannel(
+                    "owner",
+                    "feishu_dm",
+                    None,
+                    {},
+                    "other_app",
+                    "private-secret",
+                    "ou_owner",
+                    "wufei-png",
+                ),
+            )
+        ).channel_specs()
+    )
     assert fanout.redaction_secrets() == ("private-secret",)
     assert isinstance(fanout.notifiers[0], FeishuDirectNotifier)

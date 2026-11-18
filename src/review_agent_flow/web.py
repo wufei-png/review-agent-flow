@@ -20,6 +20,7 @@ from .structured_logging import log_event as _emit_log_event
 
 LOGGER = logging.getLogger(__name__)
 
+
 class StartupConfigurationError(RuntimeError):
     """Raised when a production entry point is missing required configuration."""
 
@@ -62,7 +63,9 @@ def _normalize_probe_result(value: object) -> LiveProbeResult:
             raw_ok = value.get("ready")
         if raw_ok is None:
             raw_ok = value.get("status") in {"ok", "ready", "success"}
-        return LiveProbeResult(bool(raw_ok), str(value.get("diagnostic")) if value.get("diagnostic") else None)
+        return LiveProbeResult(
+            bool(raw_ok), str(value.get("diagnostic")) if value.get("diagnostic") else None
+        )
     return LiveProbeResult(False, "live probe returned an unsupported result")
 
 
@@ -252,6 +255,7 @@ def create_app(
             endpoint=endpoint,
         )
         raise HTTPException(status_code=401, detail="invalid ReviewFlow internal token")
+
     app = FastAPI(title="Review Agent Flow", version="0.1.0")
 
     @app.get("/health")
@@ -372,7 +376,9 @@ def create_app(
         )
         return JSONResponse(status_code=200, content={"status": "ready", "probe": "gitlab"})
 
-    def _review_run_status(run_id: int, requested_project_id: str = project_id) -> dict[str, object]:
+    def _review_run_status(
+        run_id: int, requested_project_id: str = project_id
+    ) -> dict[str, object]:
         if requested_project_id != project_id:
             log_event(
                 LOGGER,

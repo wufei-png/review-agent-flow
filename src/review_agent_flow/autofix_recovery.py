@@ -212,7 +212,9 @@ class AutoFixRecoveryService:
                 or state not in {"opened", "closed", "merged"}
                 or (state == "merged" and not is_valid_sha(child.merged_sha))
             ):
-                raise AutoFixRecoveryError("child Merge Request conflicts with the Publication Plan")
+                raise AutoFixRecoveryError(
+                    "child Merge Request conflicts with the Publication Plan"
+                )
             unique = self.gitlab.find_merge_request_by_source_branch(
                 project_id, branch, target_branch, marker
             )
@@ -234,7 +236,9 @@ class AutoFixRecoveryService:
                 or observation.parent_ids != (parent_sha,)
                 or observed_actions != actions
             ):
-                raise AutoFixRecoveryError("remote commit actions conflict with the Publication Plan")
+                raise AutoFixRecoveryError(
+                    "remote commit actions conflict with the Publication Plan"
+                )
             return self.store.recover_program_auto_fix_relation(
                 recovery_id=context.recovery_id,
                 project_id=project_id,
@@ -279,9 +283,7 @@ class AutoFixRecoveryService:
         channels: tuple[tuple[str, str], ...],
     ) -> NotificationRequest:
         self._operator_context(context)
-        relation = self.store.get_program_auto_fix_relation_by_child(
-            project_id, child_mr_iid
-        )
+        relation = self.store.get_program_auto_fix_relation_by_child(project_id, child_mr_iid)
         if relation is None:
             raise AutoFixRecoveryError("notification resend requires an existing local Relation")
         intent = self.store.get_auto_fix_publication_intent(relation.run_id)

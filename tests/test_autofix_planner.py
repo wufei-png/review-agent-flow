@@ -25,9 +25,7 @@ def _repository(path: Path) -> str:
     subprocess.run(
         ["git", "-C", str(path), "commit", "-m", "initial"], check=True, capture_output=True
     )
-    return subprocess.check_output(
-        ["git", "-C", str(path), "rev-parse", "HEAD"], text=True
-    ).strip()
+    return subprocess.check_output(["git", "-C", str(path), "rev-parse", "HEAD"], text=True).strip()
 
 
 def test_capture_diff_envelope_canonicalizes_text_actions(tmp_path: Path) -> None:
@@ -56,9 +54,7 @@ def test_capture_diff_envelope_canonicalizes_text_actions(tmp_path: Path) -> Non
         },
     ]
     assert len(envelope.candidate_sha256) == 64
-    assert envelope.candidate_sha256 == capture_diff_envelope(
-        tmp_path, sha
-    ).candidate_sha256
+    assert envelope.candidate_sha256 == capture_diff_envelope(tmp_path, sha).candidate_sha256
 
 
 @pytest.mark.parametrize(

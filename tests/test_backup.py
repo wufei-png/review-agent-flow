@@ -30,8 +30,11 @@ def test_backup_captures_consistent_wal_snapshot_and_receipts(tmp_path: Path) ->
     output = output_parent / "one"
     with sqlite3.connect(database) as writer:
         writer.execute("BEGIN IMMEDIATE")
-        writer.execute("INSERT INTO review_runs(project_id, mr_iid, sha, created_at) "
-                       "VALUES ('42', 99, ?, '2026-01-01')", ("b" * 40,))
+        writer.execute(
+            "INSERT INTO review_runs(project_id, mr_iid, sha, created_at) "
+            "VALUES ('42', 99, ?, '2026-01-01')",
+            ("b" * 40,),
+        )
         manifest = create_backup(database, plans, output)
         assert manifest["schema_version"] == 17
         assert len(manifest["plans"]) == 1
@@ -149,10 +152,20 @@ def _bundle(tmp_path: Path) -> tuple[Path, Path, Path]:
     parent = tmp_path / "bundles"
     parent.mkdir(mode=0o700)
     bundle = parent / "one"
-    assert cli.main([
-        "backup-store", "--db", str(database), "--plan-backup-dir", str(plans),
-        "--output", str(bundle),
-    ]) == 0
+    assert (
+        cli.main(
+            [
+                "backup-store",
+                "--db",
+                str(database),
+                "--plan-backup-dir",
+                str(plans),
+                "--output",
+                str(bundle),
+            ]
+        )
+        == 0
+    )
     return database, plans, bundle
 
 
@@ -163,16 +176,29 @@ def test_verify_backup_cli_and_empty_directory_recovery(tmp_path: Path, capsys) 
     claim = store.claim_next(project_id="42")
     assert claim is not None
     snapshot = store.freeze_policy_snapshot(
-        run.run_id, claim.claim_token, target_branch="main", target_sha="c" * 40,
-        policy_version=4, policy_json='{"version":4}',
+        run.run_id,
+        claim.claim_token,
+        target_branch="main",
+        target_sha="c" * 40,
+        policy_version=4,
+        policy_json='{"version":4}',
     )
     assert snapshot is not None
     assert store.finish(run.run_id, "succeeded", claim_token=claim.claim_token)
     audit = store.record_operator_recovery_failure(
-        recovery_id="backup-rehearsal", action="relation_recovery", project_id="42",
-        parent_mr_iid=1, parent_sha="a" * 40, intent_nonce="nonce",
-        plan_sha256="d" * 64, child_project_id="42", child_mr_iid=9,
-        reason="test", principal="operator", hostname="localhost", tool_version="test",
+        recovery_id="backup-rehearsal",
+        action="relation_recovery",
+        project_id="42",
+        parent_mr_iid=1,
+        parent_sha="a" * 40,
+        intent_nonce="nonce",
+        plan_sha256="d" * 64,
+        child_project_id="42",
+        child_mr_iid=9,
+        reason="test",
+        principal="operator",
+        hostname="localhost",
+        tool_version="test",
         diagnostic="rehearsal",
     )
     parent = tmp_path / "bundles"
@@ -201,14 +227,17 @@ def test_verify_backup_cli_and_empty_directory_recovery(tmp_path: Path, capsys) 
     assert restored_store.get_project_ops_status("42")["runs"]["pending"] == 0
     assert restored_store.list_operator_recoveries() == (audit,)
     with restored_store._connect() as connection:
-        assert connection.execute(
-            "SELECT COUNT(*) FROM review_runs WHERE status = 'succeeded'"
-        ).fetchone()[0] == 2
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM review_runs WHERE status = 'succeeded'"
+            ).fetchone()[0]
+            == 2
+        )
         assert connection.execute("SELECT COUNT(*) FROM auto_fix_relations").fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0] == 1
-        receipt = connection.execute(
-            "SELECT backup_path FROM publication_plan_backups"
-        ).fetchone()[0]
+        receipt = connection.execute("SELECT backup_path FROM publication_plan_backups").fetchone()[
+            0
+        ]
     assert receipt == manifest["plans"][0]["source_path"]
     assert Path(receipt).read_bytes() == (bundle / manifest["plans"][0]["path"]).read_bytes()
     assert verify_backup(bundle)["status"] == "verified"

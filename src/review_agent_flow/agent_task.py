@@ -67,9 +67,7 @@ class AgentTaskV1:
         ):
             _trimmed(getattr(self.snapshot, field), f"Agent task {field}")
         if not self.snapshot.title or len(self.snapshot.title) > MAX_MR_TITLE_CHARS:
-            raise ValueError(
-                f"Agent task title must contain 1-{MAX_MR_TITLE_CHARS} characters"
-            )
+            raise ValueError(f"Agent task title must contain 1-{MAX_MR_TITLE_CHARS} characters")
         if not self.skill_path.is_absolute():
             raise ValueError("Agent skill path must be absolute")
         if not self.snapshot.skill_source_path or self.snapshot.skill_source_path.strip() != (

@@ -228,13 +228,9 @@ class ReviewWorker:
             notification_channels=policy.notifications.channels,
         )
         if requested is None:
-            raise LeaseLostError(
-                "Review Run lease was lost before freezing Requested Outputs"
-            )
+            raise LeaseLostError("Review Run lease was lost before freezing Requested Outputs")
         if self.policy_resolver is not None:
-            backend = (
-                self.backend_resolver(policy) if self.backend_resolver is not None else None
-            )
+            backend = self.backend_resolver(policy) if self.backend_resolver is not None else None
             self.notifier.channel_specs(policy.notifications.channels)
         if policy.ai.enabled and backend is None:
             raise ValueError("AI Review requires an Operator-authorized Agent Backend/Profile")
@@ -267,9 +263,8 @@ class ReviewWorker:
     ) -> None:
         if self.store.get_effective_run_decision(run.run_id) is not None:
             return
-        suppressed = (
-            not cancelled
-            and self.store.is_suppressed_parent_sha(run.project_id, run.mr_iid, run.sha)
+        suppressed = not cancelled and self.store.is_suppressed_parent_sha(
+            run.project_id, run.mr_iid, run.sha
         )
         human_review = self.policy.human.enabled and not cancelled
         ai_review = self.policy.ai.enabled and not suppressed and not cancelled
@@ -409,7 +404,9 @@ class ReviewWorker:
             persisted=False,
             reclaim_required=True,
         )
-        return WorkerResult(run.run_id, "deferred", detail="Review Run lease lost; reclaim will recover")
+        return WorkerResult(
+            run.run_id, "deferred", detail="Review Run lease lost; reclaim will recover"
+        )
 
     def _log_run(
         self,
@@ -482,10 +479,7 @@ class ReviewWorker:
             if run.project_id != self.project_id:
                 raise ValueError("Review Run belongs to a different configured Project")
             merge_request = self.gitlab.get_merge_request(run.project_id, run.mr_iid)
-            if (
-                merge_request.project_id != self.project_id
-                or merge_request.iid != run.mr_iid
-            ):
+            if merge_request.project_id != self.project_id or merge_request.iid != run.mr_iid:
                 detail = "GitLab Merge Request identity does not match the Review Run"
                 if not self._finish_terminal(run, "cancelled", detail, "project_mismatch"):
                     return self._lease_recovery_result(run, detail)
@@ -639,7 +633,9 @@ class ReviewWorker:
                         "Review Run lease was lost before creating the Auto-fix Intent"
                     )
 
-            worktree_id = str(run.run_id) if run.attempts <= 1 else f"{run.run_id}-attempt-{run.attempts}"
+            worktree_id = (
+                str(run.run_id) if run.attempts <= 1 else f"{run.run_id}-attempt-{run.attempts}"
+            )
             worktree = self.worktrees.path_for(worktree_id)
             if worktree.exists():
                 raise WorktreeError(f"worktree path already exists: {worktree}")
@@ -756,7 +752,9 @@ class ReviewWorker:
                     )
                 if not self.store.finish(run.run_id, "succeeded", claim_token=run.claim_token):
                     raise LeaseLostError("Review Run lease lost before Agent result completion")
-                self._log_run(run, status="succeeded", diagnostic="Agent process exited successfully")
+                self._log_run(
+                    run, status="succeeded", diagnostic="Agent process exited successfully"
+                )
                 completed_result = WorkerResult(run.run_id, "succeeded", result)
             finally:
                 if worktree_created:
@@ -1012,9 +1010,7 @@ class ReviewWorker:
             run.claim_token,
             error=error,
         ):
-            raise LeaseLostError(
-                "Review Run lease was lost before resolving the Auto-fix Intent"
-            )
+            raise LeaseLostError("Review Run lease was lost before resolving the Auto-fix Intent")
 
     def _freeze_auto_fix_plan(
         self,
@@ -1056,9 +1052,7 @@ class ReviewWorker:
                 )
             verification = self.agent_backend.verification if self.agent_backend else None
             if verification is None:
-                raise DiffEnvelopeError(
-                    "Auto-fix publication requires an Operator-owned verifier"
-                )
+                raise DiffEnvelopeError("Auto-fix publication requires an Operator-owned verifier")
             evidence = run_verifier(
                 verification.command,
                 worktree,
@@ -1066,15 +1060,11 @@ class ReviewWorker:
                 before.candidate_sha256,
                 timeout_seconds=self.agent_timeout_seconds,
                 heartbeat=lambda: self._heartbeat(run),
-                heartbeat_interval_seconds=max(
-                    0.1, min(30.0, self.lease_seconds / 3)
-                ),
+                heartbeat_interval_seconds=max(0.1, min(30.0, self.lease_seconds / 3)),
             )
             after = capture_diff_envelope(worktree, run.sha)
             if after != before:
-                raise DiffEnvelopeError(
-                    "Operator verifier mutated the Auto-fix candidate"
-                )
+                raise DiffEnvelopeError("Operator verifier mutated the Auto-fix candidate")
         except DiffEnvelopeError as exc:
             self._resolve_auto_fix_plan(
                 run,
@@ -1461,9 +1451,7 @@ class ReviewWorker:
                     task=task,
                 ),
                 heartbeat=lambda: self._heartbeat(run),
-                heartbeat_interval_seconds=max(
-                    0.1, min(30.0, self.lease_seconds / 3)
-                ),
+                heartbeat_interval_seconds=max(0.1, min(30.0, self.lease_seconds / 3)),
                 extra_env=self.agent_backend.environment,
             )
 
@@ -1484,9 +1472,7 @@ class ReviewWorker:
             content = load_project_skill(self.repository, revision, configured)
             if content is not None:
                 return f"{revision}:{configured}", content
-        return str(DEFAULT_REVIEW_AGENT_SKILL), load_operator_skill(
-            DEFAULT_REVIEW_AGENT_SKILL
-        )
+        return str(DEFAULT_REVIEW_AGENT_SKILL), load_operator_skill(DEFAULT_REVIEW_AGENT_SKILL)
 
     def _notify_humans(self, run: ReviewRun, merge_request) -> None:
         if not self.policy.human.enabled:

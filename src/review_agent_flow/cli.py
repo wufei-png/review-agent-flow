@@ -57,13 +57,15 @@ def _run_worker(args: argparse.Namespace) -> int:
     gitlab_url = _required(args.gitlab_url, "GITLAB_URL")
     gitlab_token = _required(args.gitlab_token, "GITLAB_TOKEN")
     project_id = _required(args.project_id, "REVIEW_AGENT_FLOW_PROJECT_ID")
-    repository = Path(_required(args.repository, "REVIEW_AGENT_FLOW_REPOSITORY")).expanduser().resolve()
-    policy_path = args.policy or os.getenv(
-        "REVIEW_AGENT_FLOW_POLICY", ".gitlab/reviewflow.yml"
+    repository = (
+        Path(_required(args.repository, "REVIEW_AGENT_FLOW_REPOSITORY")).expanduser().resolve()
     )
-    operator_path = Path(
-        _required(args.operator_config, "REVIEW_AGENT_FLOW_OPERATOR_CONFIG")
-    ).expanduser().resolve()
+    policy_path = args.policy or os.getenv("REVIEW_AGENT_FLOW_POLICY", ".gitlab/reviewflow.yml")
+    operator_path = (
+        Path(_required(args.operator_config, "REVIEW_AGENT_FLOW_OPERATOR_CONFIG"))
+        .expanduser()
+        .resolve()
+    )
     if operator_path == repository or repository in operator_path.parents:
         raise SystemExit("Operator configuration must be outside the reviewed repository")
     try:
@@ -80,9 +82,7 @@ def _run_worker(args: argparse.Namespace) -> int:
         raise SystemExit(f"invalid Operator configuration: {exc}") from exc
     review_bot_username = _required(None, "GITLAB_REVIEW_BOT_USERNAME")
     backup_dir = operator_config.retention.publication_plan_backup_dir
-    if backup_dir is not None and (
-        backup_dir == repository or repository in backup_dir.parents
-    ):
+    if backup_dir is not None and (backup_dir == repository or repository in backup_dir.parents):
         raise SystemExit(
             "Publication Plan backup directory must be outside the reviewed repository"
         )
@@ -100,7 +100,9 @@ def _run_worker(args: argparse.Namespace) -> int:
         gitlab=gitlab,
         worktrees=GitWorktreeManager(
             repository=repository,
-            root=Path(args.worktrees or os.getenv("REVIEW_AGENT_FLOW_WORKTREES", "/tmp/review-agent-flow")),
+            root=Path(
+                args.worktrees or os.getenv("REVIEW_AGENT_FLOW_WORKTREES", "/tmp/review-agent-flow")
+            ),
         ),
         policy=ReviewPolicy(),
         repository=repository,
@@ -116,9 +118,7 @@ def _run_worker(args: argparse.Namespace) -> int:
         retry_delay_seconds=args.poll_interval,
         autofix_publication=operator_config.autofix_publication,
         policy_resolver=GitLabTargetBranchPolicyResolver(gitlab, policy_path),
-        backend_resolver=lambda policy: resolve_backend(
-            operator_config, policy.ai, project_id
-        ),
+        backend_resolver=lambda policy: resolve_backend(operator_config, policy.ai, project_id),
         retention_manager=RetentionManager(store, operator_config.retention),
     )
     if args.once:
@@ -204,19 +204,22 @@ def _run_ops_status(args: argparse.Namespace) -> int:
 
 def _run_backup_store(args: argparse.Namespace) -> int:
     try:
-        manifest = create_backup(
-            Path(args.db), Path(args.plan_backup_dir), Path(args.output)
-        )
+        manifest = create_backup(Path(args.db), Path(args.plan_backup_dir), Path(args.output))
     except (OSError, ValueError, sqlite3.Error) as exc:
         print(f"backup-store failed: {exc}", file=sys.stderr)
         return 1
-    print(json.dumps({
-        "status": "created",
-        "output": str(Path(args.output).absolute()),
-        "schema_version": manifest["schema_version"],
-        "snapshot_at": manifest["snapshot_at"],
-        "plan_count": len(manifest["plans"]),
-    }, sort_keys=True))
+    print(
+        json.dumps(
+            {
+                "status": "created",
+                "output": str(Path(args.output).absolute()),
+                "schema_version": manifest["schema_version"],
+                "snapshot_at": manifest["snapshot_at"],
+                "plan_count": len(manifest["plans"]),
+            },
+            sort_keys=True,
+        )
+    )
     return 0
 
 
@@ -252,9 +255,7 @@ def _run_review_mr(args: argparse.Namespace) -> int:
         canonical_note_marker(project_id, args.mr_iid, sha)
     except ValueError as exc:
         raise SystemExit(f"invalid ReviewKey: {exc}") from exc
-    store = SQLiteStore(
-        args.db or os.getenv("REVIEW_AGENT_FLOW_DB", "review-agent-flow.sqlite3")
-    )
+    store = SQLiteStore(args.db or os.getenv("REVIEW_AGENT_FLOW_DB", "review-agent-flow.sqlite3"))
     store.add_redaction_secret(gitlab_token)
     run, created = store.enqueue_with_status(project_id, args.mr_iid, sha)
     current = store.wake_run(project_id, args.mr_iid, sha) or run
@@ -333,12 +334,12 @@ def _run_recover_auto_fix_relation(args: argparse.Namespace) -> int:
 def _run_resend_auto_fix_notification(args: argparse.Namespace) -> int:
     service = _recovery_service(args)
     project_id = _required(args.project_id, "REVIEW_AGENT_FLOW_PROJECT_ID")
-    operator_path = Path(
-        _required(args.operator_config, "REVIEW_AGENT_FLOW_OPERATOR_CONFIG")
-    ).expanduser().resolve()
-    relation = service.store.get_program_auto_fix_relation_by_child(
-        project_id, args.child_mr_iid
+    operator_path = (
+        Path(_required(args.operator_config, "REVIEW_AGENT_FLOW_OPERATOR_CONFIG"))
+        .expanduser()
+        .resolve()
     )
+    relation = service.store.get_program_auto_fix_relation_by_child(project_id, args.child_mr_iid)
     if relation is None:
         raise SystemExit("Auto-fix Relation was not found")
     snapshot = service.store.get_policy_snapshot(relation.run_id)
@@ -350,9 +351,7 @@ def _run_resend_auto_fix_notification(args: argparse.Namespace) -> int:
         resolved = resolve_notification_channels(operator_config, channel_ids, project_id)
     except OperatorConfigError as exc:
         raise SystemExit(f"invalid Operator configuration: {exc}") from exc
-    channels = tuple(
-        (channel.channel_id, channel.channel_type) for channel in resolved
-    )
+    channels = tuple((channel.channel_id, channel.channel_type) for channel in resolved)
     context = _operator_context(args)
     try:
         request = service.resend_notification(
@@ -379,9 +378,7 @@ def _run_resend_auto_fix_notification(args: argparse.Namespace) -> int:
 
 
 def _run_transition_auto_fix_plan(args: argparse.Namespace, action: str) -> int:
-    store = SQLiteStore(
-        args.db or os.getenv("REVIEW_AGENT_FLOW_DB", "review-agent-flow.sqlite3")
-    )
+    store = SQLiteStore(args.db or os.getenv("REVIEW_AGENT_FLOW_DB", "review-agent-flow.sqlite3"))
     context = _operator_context(args)
     try:
         audit = AutoFixPlanOperator(store).transition(

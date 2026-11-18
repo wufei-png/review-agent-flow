@@ -80,13 +80,9 @@ class GitShaEnsurer:
                 if completed.returncode:
                     detail = completed.stderr.strip() or completed.stdout.strip()
                     error_type = (
-                        ShaUnavailableError
-                        if _is_permanent_fetch_error(detail)
-                        else ShaFetchError
+                        ShaUnavailableError if _is_permanent_fetch_error(detail) else ShaFetchError
                     )
-                    raise error_type(
-                        f"git fetch for {sha} failed: {detail or 'unknown git error'}"
-                    )
+                    raise error_type(f"git fetch for {sha} failed: {detail or 'unknown git error'}")
                 if not self._has_commit(sha):
                     raise ShaUnavailableError(
                         f"git fetch completed but commit {sha} is still unavailable"

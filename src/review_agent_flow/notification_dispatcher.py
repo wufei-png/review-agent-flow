@@ -146,9 +146,7 @@ class NotificationDispatcher:
         attempted_delivery_ids: list[int] = []
         attempted_channel_ids: list[str] = []
         claim_ids = (
-            tuple(dict.fromkeys(delivery_ids))
-            if delivery_ids is not None
-            else (None,) * limit
+            tuple(dict.fromkeys(delivery_ids)) if delivery_ids is not None else (None,) * limit
         )
         for delivery_id in claim_ids:
             if stop_event is not None and stop_event.is_set():

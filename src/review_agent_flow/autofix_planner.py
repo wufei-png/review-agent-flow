@@ -197,9 +197,7 @@ def _read_regular_file(path: Path) -> tuple[bytes, bool]:
 
 def _text(content: bytes, path: str) -> str:
     if b"\0" in content:
-        raise DiffEnvelopeError(
-            f"Auto-fix candidate rejects binary content at path: {path}"
-        )
+        raise DiffEnvelopeError(f"Auto-fix candidate rejects binary content at path: {path}")
     try:
         return content.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -238,7 +236,9 @@ def capture_diff_envelope(worktree: Path, expected_sha: str) -> DiffEnvelope:
             continue
 
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
-            raise DiffEnvelopeError("Auto-fix candidate rejects symlinks, gitlinks and special files")
+            raise DiffEnvelopeError(
+                "Auto-fix candidate rejects symlinks, gitlinks and special files"
+            )
         current, executable = _read_regular_file(candidate_path)
         current_text = _text(current, path)
         if baseline is None:
@@ -302,9 +302,7 @@ def run_verifier(
     if timeout_seconds <= 0 or heartbeat_interval_seconds <= 0:
         raise ValueError("verifier timeouts must be positive")
     command_value = tuple(command)
-    command_digest = hashlib.sha256(
-        canonical_json(list(command_value)).encode("utf-8")
-    ).hexdigest()
+    command_digest = hashlib.sha256(canonical_json(list(command_value)).encode("utf-8")).hexdigest()
     started = time.monotonic()
     try:
         process = subprocess.Popen(
@@ -338,9 +336,7 @@ def run_verifier(
                     ) from exc
                 if not heartbeat_ok:
                     _terminate(process)
-                    raise LeaseLostError(
-                        "Review Run lease was lost during Auto-fix verification"
-                    )
+                    raise LeaseLostError("Review Run lease was lost during Auto-fix verification")
     if returncode != 0:
         raise DiffEnvelopeError(f"Operator verifier exited with code {returncode}")
     return VerificationEvidence(

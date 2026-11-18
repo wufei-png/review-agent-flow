@@ -86,7 +86,9 @@ class FakeMergeRequests:
         return self.listed
 
 
-def _client(value: FakeNotes | SimpleNamespace, username: str | None = "review-bot") -> PythonGitLabClient:
+def _client(
+    value: FakeNotes | SimpleNamespace, username: str | None = "review-bot"
+) -> PythonGitLabClient:
     client = object.__new__(PythonGitLabClient)
     if isinstance(value, FakeNotes):
         value = SimpleNamespace(mergerequests=FakeMergeRequests(value))
@@ -114,9 +116,7 @@ def test_merge_request_preserves_source_project_identity() -> None:
         merge_commit_sha=None,
         merged_commit_sha=None,
     )
-    project = SimpleNamespace(
-        mergerequests=SimpleNamespace(get=lambda _iid: resource)
-    )
+    project = SimpleNamespace(mergerequests=SimpleNamespace(get=lambda _iid: resource))
 
     merge_request = _client(project).get_merge_request("42", 1)
 
@@ -133,9 +133,7 @@ def test_merge_request_rejects_native_identity_mismatch(
     native_project_id: int | None, native_iid: int | None
 ) -> None:
     resource = SimpleNamespace(project_id=native_project_id, iid=native_iid)
-    project = SimpleNamespace(
-        mergerequests=SimpleNamespace(get=lambda _iid: resource)
-    )
+    project = SimpleNamespace(mergerequests=SimpleNamespace(get=lambda _iid: resource))
 
     with pytest.raises(
         GitLabIdentityConflict,
@@ -375,10 +373,12 @@ def test_note_marker_is_not_trusted_without_review_bot_username() -> None:
 def test_note_marker_requires_one_standalone_canonical_line() -> None:
     marker = canonical_note_marker("42", 1, SHA)
     notes = FakeNotes(
-        [[
-            SimpleNamespace(body=f"prefix {marker}"),
-            SimpleNamespace(body=f"{marker}\n{marker}"),
-        ]]
+        [
+            [
+                SimpleNamespace(body=f"prefix {marker}"),
+                SimpleNamespace(body=f"{marker}\n{marker}"),
+            ]
+        ]
     )
     project = SimpleNamespace(mergerequests=FakeMergeRequests(notes))
 
@@ -509,9 +509,7 @@ def test_python_gitlab_created_note_requires_configured_bot_author() -> None:
 
 
 def test_python_gitlab_get_trusted_note_distinguishes_404_and_author_conflict() -> None:
-    notes = FakeNotes(
-        [SimpleNamespace(id=17, body="body", author={"username": "review-bot"})]
-    )
+    notes = FakeNotes([SimpleNamespace(id=17, body="body", author={"username": "review-bot"})])
     client = _client(notes)
 
     assert client.get_trusted_note("42", 1, 17) == Note("42", 1, 17, "body")

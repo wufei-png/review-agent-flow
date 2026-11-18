@@ -11,7 +11,9 @@ def _git_repository(path: Path) -> str:
     subprocess.run(["git", "-C", str(path), "config", "user.name", "Test"], check=True)
     (path / "README.md").write_text("test\n", encoding="utf-8")
     subprocess.run(["git", "-C", str(path), "add", "README.md"], check=True)
-    subprocess.run(["git", "-C", str(path), "commit", "-m", "initial"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(path), "commit", "-m", "initial"], check=True, capture_output=True
+    )
     return subprocess.check_output(["git", "-C", str(path), "rev-parse", "HEAD"], text=True).strip()
 
 

@@ -214,7 +214,9 @@ def _parse_pipeline(payload: dict[str, Any]) -> tuple[WebhookDecision, ...]:
             or payload.get("merge_request_iid")
         )
         if mr_iid is None:
-            decisions.append(WebhookDecision(False, "pipeline has no MR IID", project_id=project_id))
+            decisions.append(
+                WebhookDecision(False, "pipeline has no MR IID", project_id=project_id)
+            )
             continue
         if merge_request.get("work_in_progress") is True or merge_request.get("draft") is True:
             decisions.append(
@@ -234,7 +236,10 @@ def _parse_pipeline(payload: dict[str, Any]) -> tuple[WebhookDecision, ...]:
                 sha=normalize_sha(sha),
                 title=title,
                 source_branch=str(source_branch) if source_branch else None,
-                target_branch=str(merge_request.get("target_branch") or attrs.get("target_branch") or "") or None,
+                target_branch=str(
+                    merge_request.get("target_branch") or attrs.get("target_branch") or ""
+                )
+                or None,
                 description=str(description) if description is not None else None,
             )
         )

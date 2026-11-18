@@ -20,9 +20,7 @@ NEW_SHA = "b" * 40
 
 class NoteGitLab:
     def __init__(self, sha: str = SHA) -> None:
-        self.mr = MergeRequest(
-            "42", 1, "Review", "alice", "feature", "main", sha, "https://mr"
-        )
+        self.mr = MergeRequest("42", 1, "Review", "alice", "feature", "main", sha, "https://mr")
         self.notes: list[Note] = []
         self.create_calls = 0
         self.lookup_error: Exception | None = None
@@ -32,9 +30,7 @@ class NoteGitLab:
     def get_merge_request(self, project_id: str, mr_iid: int) -> MergeRequest:
         return self.mr
 
-    def lookup_note_marker(
-        self, project_id: str, mr_iid: int, marker: str
-    ) -> NoteMarkerLookup:
+    def lookup_note_marker(self, project_id: str, mr_iid: int, marker: str) -> NoteMarkerLookup:
         if self.lookup_error is not None:
             raise self.lookup_error
         candidates = tuple(note for note in self.notes if marker in note.body)
@@ -55,15 +51,13 @@ class NoteGitLab:
             raise RuntimeError("connection lost after Note creation")
         return note
 
-    def get_trusted_note(
-        self, project_id: str, mr_iid: int, note_id: int
-    ) -> Note | None:
+    def get_trusted_note(self, project_id: str, mr_iid: int, note_id: int) -> Note | None:
         return next((note for note in self.notes if note.note_id == note_id), None)
 
 
-def _request(database: Path, markdown: str = "Actionable review") -> tuple[
-    SQLiteStore, NotePublicationRequest
-]:
+def _request(
+    database: Path, markdown: str = "Actionable review"
+) -> tuple[SQLiteStore, NotePublicationRequest]:
     store = SQLiteStore(database)
     run = store.enqueue("42", 1, SHA)
     claimed = store.claim_next()
@@ -89,9 +83,7 @@ def _request(database: Path, markdown: str = "Actionable review") -> tuple[
         notification_channels=(),
         expectations=(("note", marker),),
     )
-    receipt = store.create_effect_receipt(
-        run.run_id, "note_expected", marker, state="planned"
-    )
+    receipt = store.create_effect_receipt(run.run_id, "note_expected", marker, state="planned")
     request = store.create_note_publication_request(
         run.run_id, receipt.receipt_id, markdown, claimed.claim_token
     )
@@ -106,9 +98,7 @@ def test_note_request_is_frozen_and_claim_fenced(tmp_path: Path) -> None:
     claimed = store.claim_next()
     assert claimed is not None
     marker = canonical_note_marker("42", 1, SHA)
-    receipt = store.create_effect_receipt(
-        run.run_id, "note_expected", marker, state="planned"
-    )
+    receipt = store.create_effect_receipt(run.run_id, "note_expected", marker, state="planned")
 
     request = store.create_note_publication_request(
         run.run_id, receipt.receipt_id, "Raw **Markdown**", claimed.claim_token
@@ -237,14 +227,10 @@ def test_final_uncertain_create_gets_lookup_only_recovery_and_adopts_after_head_
     store, request = _request(tmp_path / "review.db")
     gitlab = NoteGitLab()
     gitlab.raise_after_create = True
-    publisher = NotePublisher(
-        store, gitlab, "42", max_attempts=1, retry_delay_seconds=0
-    )
+    publisher = NotePublisher(store, gitlab, "42", max_attempts=1, retry_delay_seconds=0)
 
     first = publisher.process(request_id=request.request_id)[0]
-    gitlab.mr = MergeRequest(
-        "42", 1, "Review", "alice", "feature", "main", NEW_SHA, "https://mr"
-    )
+    gitlab.mr = MergeRequest("42", 1, "Review", "alice", "feature", "main", NEW_SHA, "https://mr")
     second = publisher.process(request_id=request.request_id)[0]
 
     assert first.status == "pending"
@@ -256,9 +242,7 @@ def test_final_uncertain_create_reserves_a_lookup_only_attempt(tmp_path: Path) -
     store, request = _request(tmp_path / "review.db")
     gitlab = NoteGitLab()
     gitlab.raise_before_create = True
-    publisher = NotePublisher(
-        store, gitlab, "42", max_attempts=1, retry_delay_seconds=0
-    )
+    publisher = NotePublisher(store, gitlab, "42", max_attempts=1, retry_delay_seconds=0)
 
     first = publisher.process(request_id=request.request_id)[0]
     second = publisher.process(request_id=request.request_id)[0]

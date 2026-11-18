@@ -49,9 +49,7 @@ def test_auto_fix_shaped_merge_request_is_not_trusted_by_parser() -> None:
     assert decision.accepted is True
     assert decision.kind == "normal"
     assert decision.parent_mr_iid is None
-    assert parse_auto_fix_branch(
-        f"autofix/MR-1/sha-{SHA}/intent-{NONCE}"
-    ) == (1, SHA, NONCE)
+    assert parse_auto_fix_branch(f"autofix/MR-1/sha-{SHA}/intent-{NONCE}") == (1, SHA, NONCE)
     assert parse_auto_fix_branch("autofix/MR-1/run-7") is None
 
 

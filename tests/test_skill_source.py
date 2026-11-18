@@ -26,9 +26,7 @@ def _commit(path: Path, message: str) -> str:
         check=True,
         capture_output=True,
     )
-    return subprocess.check_output(
-        ["git", "-C", str(path), "rev-parse", "HEAD"], text=True
-    ).strip()
+    return subprocess.check_output(["git", "-C", str(path), "rev-parse", "HEAD"], text=True).strip()
 
 
 def test_project_skill_reads_exact_commit_not_worktree(tmp_path: Path) -> None:
@@ -78,9 +76,7 @@ def test_operator_skill_rejects_symlink(tmp_path: Path) -> None:
     ("content", "message"),
     [(b"\xff", "UTF-8"), (b"valid\x00text", "NUL")],
 )
-def test_project_skill_rejects_invalid_text(
-    tmp_path: Path, content: bytes, message: str
-) -> None:
+def test_project_skill_rejects_invalid_text(tmp_path: Path, content: bytes, message: str) -> None:
     repository = tmp_path / "repo"
     repository.mkdir()
     _repository(repository)

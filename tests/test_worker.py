@@ -70,9 +70,7 @@ def ReviewWorker(*args, **kwargs):
             command,
             1800,
             {},
-            VerificationProfile((sys.executable, "-c", "pass"))
-            if policy.ai.auto_fix
-            else None,
+            VerificationProfile((sys.executable, "-c", "pass")) if policy.ai.auto_fix else None,
         )
     if policy.ai.auto_fix and "autofix_publication" not in kwargs:
         kwargs["autofix_publication"] = AutoFixPublicationConfig(
@@ -131,9 +129,7 @@ class FakeGitLab:
         self.notes.append(note)
         return note
 
-    def lookup_note_marker(
-        self, project_id: str, mr_iid: int, marker: str
-    ) -> NoteMarkerLookup:
+    def lookup_note_marker(self, project_id: str, mr_iid: int, marker: str) -> NoteMarkerLookup:
         self.note_lookups.append(marker)
         candidates = tuple(
             note
@@ -145,9 +141,7 @@ class FakeGitLab:
             tuple(note for note in candidates if not has_exact_note_marker(note.body, marker)),
         )
 
-    def get_trusted_note(
-        self, project_id: str, mr_iid: int, note_id: int
-    ) -> Note | None:
+    def get_trusted_note(self, project_id: str, mr_iid: int, note_id: int) -> Note | None:
         return next((note for note in self.notes if note.note_id == note_id), None)
 
     def create_repository_commit(
@@ -237,9 +231,7 @@ class ObservedNoteGitLab(FakeGitLab):
         self.returned_mr_iid = returned_mr_iid
         self.note_markers: list[str] = []
 
-    def lookup_note_marker(
-        self, project_id: str, mr_iid: int, marker: str
-    ) -> NoteMarkerLookup:
+    def lookup_note_marker(self, project_id: str, mr_iid: int, marker: str) -> NoteMarkerLookup:
         self.note_markers.append(marker)
         note = Note(
             project_id if self.returned_project_id is None else self.returned_project_id,
@@ -253,9 +245,7 @@ class ObservedNoteGitLab(FakeGitLab):
 
 
 class FailingNoteObserverGitLab(FakeGitLab):
-    def lookup_note_marker(
-        self, project_id: str, mr_iid: int, marker: str
-    ) -> NoteMarkerLookup:
+    def lookup_note_marker(self, project_id: str, mr_iid: int, marker: str) -> NoteMarkerLookup:
         raise RuntimeError("Note observer API unavailable")
 
 
@@ -315,7 +305,9 @@ def _git_repository(path: Path) -> str:
     subprocess.run(["git", "-C", str(path), "config", "user.name", "Test"], check=True)
     (path / "README.md").write_text("test\n", encoding="utf-8")
     subprocess.run(["git", "-C", str(path), "add", "README.md"], check=True)
-    subprocess.run(["git", "-C", str(path), "commit", "-m", "initial"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(path), "commit", "-m", "initial"], check=True, capture_output=True
+    )
     return subprocess.check_output(["git", "-C", str(path), "rev-parse", "HEAD"], text=True).strip()
 
 
@@ -365,9 +357,7 @@ def test_worker_runs_agent_in_exact_sha_worktree_and_cleans_it(tmp_path: Path) -
     note_receipt = store.list_effect_receipts(1, "note_expected")[0]
     assert note_receipt.state == "published"
     assert note_receipt.external_identity == "gitlab:42!1#note-1"
-    assert gitlab.created_note_bodies == [
-        f"{canonical_note_marker('42', 1, sha)}\nreviewed"
-    ]
+    assert gitlab.created_note_bodies == [f"{canonical_note_marker('42', 1, sha)}\nreviewed"]
 
 
 def test_worker_defers_new_ai_run_while_gitlab_diff_refs_are_preparing(
@@ -376,9 +366,7 @@ def test_worker_defers_new_ai_run_while_gitlab_diff_refs_are_preparing(
     repository = tmp_path / "repo"
     repository.mkdir()
     sha = _git_repository(repository)
-    mr = MergeRequest(
-        "42", 1, "Diff is preparing", "alice", "feature", "main", sha, "https://mr"
-    )
+    mr = MergeRequest("42", 1, "Diff is preparing", "alice", "feature", "main", sha, "https://mr")
     store = SQLiteStore(tmp_path / "review.db")
     run = store.enqueue("42", 1, sha)
     notifier = RecordingNotifier()
@@ -393,7 +381,7 @@ def test_worker_defers_new_ai_run_while_gitlab_diff_refs_are_preparing(
         GitWorktreeManager(repository, tmp_path / "worktrees"),
         ReviewPolicy(
             human=HumanPolicy(enabled=True, reviewers=("alice",)),
-            ai=AIPolicy(enabled=True, command=(sys.executable, "-c", "raise AssertionError"))
+            ai=AIPolicy(enabled=True, command=(sys.executable, "-c", "raise AssertionError")),
         ),
         repository,
         "https://gitlab",
@@ -439,9 +427,7 @@ def test_expired_run_resumes_frozen_note_without_rerunning_agent_or_stranding_in
     run = store.enqueue("42", 1, sha)
     claimed = store.claim_next(project_id="42")
     assert claimed is not None
-    intent = store.create_auto_fix_publication_intent(
-        claimed.run_id, claimed.claim_token
-    )
+    intent = store.create_auto_fix_publication_intent(claimed.run_id, claimed.claim_token)
     assert intent is not None
     store.create_effect_receipt(
         run.run_id,
@@ -516,9 +502,7 @@ def test_expired_run_resumes_frozen_note_without_rerunning_agent_or_stranding_in
     auto_fix_receipt = store.list_effect_receipts(run.run_id, "autofix_plan")[0]
     assert auto_fix_receipt.state == "blocked"
     assert store.get_auto_fix_publication_plan(run.run_id) is None
-    assert gitlab.created_note_bodies == [
-        f"{canonical_note_marker('42', 1, sha)}\ndurable review"
-    ]
+    assert gitlab.created_note_bodies == [f"{canonical_note_marker('42', 1, sha)}\ndurable review"]
 
 
 def test_agent_note_receipt_observes_native_id_without_equating_agent_success_to_note_success(
@@ -636,7 +620,9 @@ def test_note_marker_observation_uses_review_key_receipt_key(tmp_path: Path) -> 
     repository = tmp_path / "repo"
     repository.mkdir()
     sha = _git_repository(repository)
-    mr = MergeRequest("42", 1, "Stable Note receipt key", "alice", "feature", "main", sha, "https://mr")
+    mr = MergeRequest(
+        "42", 1, "Stable Note receipt key", "alice", "feature", "main", sha, "https://mr"
+    )
     store = SQLiteStore(tmp_path / "review.db")
     run = store.enqueue("42", 1, sha)
     marker = canonical_note_marker(run.project_id, run.mr_iid, run.sha)
@@ -696,14 +682,18 @@ def test_worker_blocks_noncanonical_or_invalid_observed_note(
     repository = tmp_path / "repo"
     repository.mkdir()
     sha = _git_repository(repository)
-    mr = MergeRequest("42", 1, "Reject malformed Note", "alice", "feature", "main", sha, "https://mr")
+    mr = MergeRequest(
+        "42", 1, "Reject malformed Note", "alice", "feature", "main", sha, "https://mr"
+    )
     store = SQLiteStore(tmp_path / "review.db")
     run = store.enqueue("42", 1, sha)
     worker = ReviewWorker(
         store,
         ObservedNoteGitLab(mr, body_template=body_template, note_id=note_id),
         GitWorktreeManager(repository, tmp_path / "worktrees"),
-        ReviewPolicy(ai=AIPolicy(enabled=True, command=(sys.executable, "-c", "print('reviewed')"))),
+        ReviewPolicy(
+            ai=AIPolicy(enabled=True, command=(sys.executable, "-c", "print('reviewed')"))
+        ),
         repository,
         "https://gitlab",
         project_id="42",
@@ -728,7 +718,9 @@ def test_worker_keeps_note_observer_exception_pending(tmp_path: Path) -> None:
         store,
         FailingNoteObserverGitLab(mr),
         GitWorktreeManager(repository, tmp_path / "worktrees"),
-        ReviewPolicy(ai=AIPolicy(enabled=True, command=(sys.executable, "-c", "print('reviewed')"))),
+        ReviewPolicy(
+            ai=AIPolicy(enabled=True, command=(sys.executable, "-c", "print('reviewed')"))
+        ),
         repository,
         "https://gitlab",
         project_id="42",
@@ -766,7 +758,9 @@ def test_worker_rejects_note_from_wrong_project_or_mr(
     repository = tmp_path / "repo"
     repository.mkdir()
     sha = _git_repository(repository)
-    mr = MergeRequest("42", 1, "Reject misbound Note", "alice", "feature", "main", sha, "https://mr")
+    mr = MergeRequest(
+        "42", 1, "Reject misbound Note", "alice", "feature", "main", sha, "https://mr"
+    )
     store = SQLiteStore(tmp_path / "review.db")
     run = store.enqueue("42", 1, sha)
     worker = ReviewWorker(
@@ -777,7 +771,9 @@ def test_worker_rejects_note_from_wrong_project_or_mr(
             returned_mr_iid=returned_mr_iid,
         ),
         GitWorktreeManager(repository, tmp_path / "worktrees"),
-        ReviewPolicy(ai=AIPolicy(enabled=True, command=(sys.executable, "-c", "print('reviewed')"))),
+        ReviewPolicy(
+            ai=AIPolicy(enabled=True, command=(sys.executable, "-c", "print('reviewed')"))
+        ),
         repository,
         "https://gitlab",
         project_id="42",
@@ -922,9 +918,7 @@ def test_supervised_worker_fails_when_one_independent_loop_exits(
     sha = _git_repository(repository)
     worker = ReviewWorker(
         SQLiteStore(tmp_path / "review.db"),
-        FakeGitLab(
-            MergeRequest("42", 1, "Parent", "alice", "feature", "main", sha, "https://mr")
-        ),
+        FakeGitLab(MergeRequest("42", 1, "Parent", "alice", "feature", "main", sha, "https://mr")),
         GitWorktreeManager(repository, tmp_path / "worktrees"),
         ReviewPolicy(),
         repository,
@@ -948,17 +942,13 @@ def test_supervised_worker_fails_when_one_independent_loop_exits(
     assert worker.store.worker_lease_summary() is None
 
 
-def test_supervised_worker_stops_gracefully_on_external_event(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_supervised_worker_stops_gracefully_on_external_event(tmp_path: Path, monkeypatch) -> None:
     repository = tmp_path / "repo"
     repository.mkdir()
     sha = _git_repository(repository)
     worker = ReviewWorker(
         SQLiteStore(tmp_path / "review.db"),
-        FakeGitLab(
-            MergeRequest("42", 1, "Parent", "alice", "feature", "main", sha, "https://mr")
-        ),
+        FakeGitLab(MergeRequest("42", 1, "Parent", "alice", "feature", "main", sha, "https://mr")),
         GitWorktreeManager(repository, tmp_path / "worktrees"),
         ReviewPolicy(),
         repository,
@@ -1060,7 +1050,10 @@ def test_worker_fails_when_runtime_lease_disappears_at_release(tmp_path: Path) -
         "https://gitlab",
         project_id="42",
     )
-    with pytest.raises(RuntimeError, match="runtime lease lost"), worker.runtime_ownership() as owned:
+    with (
+        pytest.raises(RuntimeError, match="runtime lease lost"),
+        worker.runtime_ownership() as owned,
+    ):
         owned()
         with store._connect() as connection:
             connection.execute("DELETE FROM worker_runtime_lease")
@@ -1325,7 +1318,9 @@ def test_worker_requires_project_binding(tmp_path: Path) -> None:
         )
 
 
-def test_worktree_registration_failure_does_not_create_an_untracked_worktree(tmp_path: Path) -> None:
+def test_worktree_registration_failure_does_not_create_an_untracked_worktree(
+    tmp_path: Path,
+) -> None:
     repository = tmp_path / "repo"
     repository.mkdir()
     sha = _git_repository(repository)
@@ -1636,9 +1631,7 @@ def test_worker_freezes_target_branch_policy_and_effective_outputs(tmp_path: Pat
     repository = tmp_path / "repo"
     repository.mkdir()
     sha = _git_repository(repository)
-    mr = MergeRequest(
-        "42", 1, "Policy snapshot", "alice", "feature", "main", sha, "https://mr"
-    )
+    mr = MergeRequest("42", 1, "Policy snapshot", "alice", "feature", "main", sha, "https://mr")
     store = SQLiteStore(tmp_path / "review.db")
     run = store.enqueue("42", 1, sha)
 
@@ -1852,7 +1845,9 @@ def test_worker_claims_only_its_bound_project(tmp_path: Path) -> None:
     worker = ReviewWorker(
         store,
         FakeGitLab(
-            MergeRequest("42", 1, "Different project", "alice", "feature", "main", sha, "https://mr")
+            MergeRequest(
+                "42", 1, "Different project", "alice", "feature", "main", sha, "https://mr"
+            )
         ),
         GitWorktreeManager(repository, tmp_path / "worktrees"),
         ReviewPolicy(),
@@ -1864,7 +1859,6 @@ def test_worker_claims_only_its_bound_project(tmp_path: Path) -> None:
     assert worker.process_one() is None
     pending = store.claim_next(project_id="99")
     assert pending is not None
-
 
 
 def test_retryable_gitlab_failure_requeues_then_fails_at_attempt_cap(tmp_path: Path) -> None:
@@ -2117,7 +2111,11 @@ def test_agent_success_does_not_write_after_lease_expires(
         store,
         FakeGitLab(mr),
         GitWorktreeManager(repository, tmp_path / "worktrees"),
-        ReviewPolicy(ai=AIPolicy(enabled=True, auto_fix=True, command=(sys.executable, "-c", "print('unused')"))),
+        ReviewPolicy(
+            ai=AIPolicy(
+                enabled=True, auto_fix=True, command=(sys.executable, "-c", "print('unused')")
+            )
+        ),
         repository,
         "https://gitlab",
         project_id="42",
@@ -2145,9 +2143,7 @@ def test_agent_success_does_not_write_after_lease_expires(
     assert store.list_effect_receipts(run.run_id, "autofix_plan")[0].state == "planned"
     assert store.list_effect_receipts(run.run_id, "agent_execution")[0].state == "running"
     with sqlite3.connect(database) as connection:
-        relation_count = connection.execute(
-            "SELECT COUNT(*) FROM auto_fix_relations"
-        ).fetchone()[0]
+        relation_count = connection.execute("SELECT COUNT(*) FROM auto_fix_relations").fetchone()[0]
     assert relation_count == 0
 
     reclaimed = store.claim_next(lease_seconds=60)
@@ -2160,7 +2156,9 @@ def test_agent_start_failure_closes_running_and_expected_receipts(tmp_path: Path
     repository = tmp_path / "repo"
     repository.mkdir()
     sha = _git_repository(repository)
-    mr = MergeRequest("42", 1, "Agent startup failure", "alice", "feature", "main", sha, "https://mr")
+    mr = MergeRequest(
+        "42", 1, "Agent startup failure", "alice", "feature", "main", sha, "https://mr"
+    )
     store = SQLiteStore(tmp_path / "review.db")
     run = store.enqueue("42", 1, sha)
     worker = ReviewWorker(
@@ -2185,10 +2183,7 @@ def test_agent_start_failure_closes_running_and_expected_receipts(tmp_path: Path
     saved = store.get_review_run(run.run_id)
     assert saved is not None
     assert saved.failure_class == "agent_configuration"
-    receipts = {
-        receipt.effect_kind: receipt
-        for receipt in store.list_effect_receipts(run.run_id)
-    }
+    receipts = {receipt.effect_kind: receipt for receipt in store.list_effect_receipts(run.run_id)}
     assert receipts["agent_execution"].state == "failed"
     assert receipts["note_expected"].state == "not_observed"
     assert receipts["autofix_plan"].state == "not_observed"
@@ -2201,7 +2196,9 @@ def test_partial_agent_effect_preparation_closes_created_receipts(
     repository = tmp_path / "repo"
     repository.mkdir()
     sha = _git_repository(repository)
-    mr = MergeRequest("42", 1, "Receipt preparation failure", "alice", "feature", "main", sha, "https://mr")
+    mr = MergeRequest(
+        "42", 1, "Receipt preparation failure", "alice", "feature", "main", sha, "https://mr"
+    )
     store = SQLiteStore(tmp_path / "review.db")
     run = store.enqueue("42", 1, sha)
     original_create = store.create_effect_receipt

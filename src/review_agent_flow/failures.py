@@ -55,9 +55,7 @@ def classify_exception(
         return FailureInfo("gitlab_api", False, detail)
     if status is not None and 500 <= status <= 599:
         return FailureInfo("gitlab_server_error", True, detail)
-    if status is None and (
-        "too many requests" in detail.lower() or "rate limit" in detail.lower()
-    ):
+    if status is None and ("too many requests" in detail.lower() or "rate limit" in detail.lower()):
         return FailureInfo("gitlab_rate_limited", True, detail)
     if isinstance(error, URLError):
         return FailureInfo("gitlab_network", True, detail)

@@ -39,12 +39,12 @@ class PythonGitLabClient(GitLabClient):
         try:
             import gitlab
         except ImportError as exc:  # pragma: no cover - exercised in deployment
-            raise RuntimeError("install the 'python-gitlab' dependency to use GitLabClient") from exc
+            raise RuntimeError(
+                "install the 'python-gitlab' dependency to use GitLabClient"
+            ) from exc
         self._gitlab = gitlab.Gitlab(url, private_token=private_token)
         self._projects: dict[str, Any] = {}
-        self._review_bot_username = review_bot_username or os.getenv(
-            "GITLAB_REVIEW_BOT_USERNAME"
-        )
+        self._review_bot_username = review_bot_username or os.getenv("GITLAB_REVIEW_BOT_USERNAME")
 
     def _project(self, project_id: str) -> Any:
         if project_id not in self._projects:
@@ -64,9 +64,7 @@ class PythonGitLabClient(GitLabClient):
         state = str(getattr(mr, "state", "opened") or "opened")
         if state == "opened" and getattr(mr, "merged_at", None):
             state = "merged"
-        merged_sha = getattr(mr, "merge_commit_sha", None) or getattr(
-            mr, "merged_commit_sha", None
-        )
+        merged_sha = getattr(mr, "merge_commit_sha", None) or getattr(mr, "merged_commit_sha", None)
         return MergeRequest(
             project_id=str(project_id),
             iid=mr_iid,
@@ -92,9 +90,7 @@ class PythonGitLabClient(GitLabClient):
         pipeline = pipelines[0]
         return Pipeline(str(project_id), int(pipeline.id), sha, str(pipeline.status))
 
-    def get_repository_file(
-        self, project_id: str, file_path: str, branch: str
-    ) -> RepositoryFile:
+    def get_repository_file(self, project_id: str, file_path: str, branch: str) -> RepositoryFile:
         project = self._project(project_id)
         branch_resource = project.branches.get(branch)
         commit = getattr(branch_resource, "commit", {}) or {}
@@ -169,9 +165,7 @@ class PythonGitLabClient(GitLabClient):
             raise RuntimeError("GitLab returned an invalid created Note identity")
         return note
 
-    def lookup_note_marker(
-        self, project_id: str, mr_iid: int, marker: str
-    ) -> NoteMarkerLookup:
+    def lookup_note_marker(self, project_id: str, mr_iid: int, marker: str) -> NoteMarkerLookup:
         if not self._review_bot_username:
             raise RuntimeError("GITLAB_REVIEW_BOT_USERNAME is required for Note publication")
         notes_manager = self._project(project_id).mergerequests.get(mr_iid).notes
@@ -192,9 +186,7 @@ class PythonGitLabClient(GitLabClient):
                 conflicts.append(note)
         return NoteMarkerLookup(tuple(exact), tuple(conflicts))
 
-    def get_trusted_note(
-        self, project_id: str, mr_iid: int, note_id: int
-    ) -> Note | None:
+    def get_trusted_note(self, project_id: str, mr_iid: int, note_id: int) -> Note | None:
         if not self._review_bot_username:
             raise RuntimeError("GITLAB_REVIEW_BOT_USERNAME is required for Note reconciliation")
         notes_manager = self._project(project_id).mergerequests.get(mr_iid).notes
@@ -221,9 +213,7 @@ class PythonGitLabClient(GitLabClient):
             return False
         return bool(lookup.exact)
 
-    def find_note_by_marker(
-        self, project_id: str, mr_iid: int, marker: str
-    ) -> Note | None:
+    def find_note_by_marker(self, project_id: str, mr_iid: int, marker: str) -> Note | None:
         if (
             type(project_id) is not str
             or not project_id.strip()
@@ -250,9 +240,7 @@ class PythonGitLabClient(GitLabClient):
         force: bool = False,
     ) -> CreatedCommit:
         if not self._review_bot_username:
-            raise RuntimeError(
-                "GITLAB_REVIEW_BOT_USERNAME is required for Auto-fix publication"
-            )
+            raise RuntimeError("GITLAB_REVIEW_BOT_USERNAME is required for Auto-fix publication")
         commit = self._project(project_id).commits.create(
             {
                 "branch": branch,
@@ -278,9 +266,7 @@ class PythonGitLabClient(GitLabClient):
         draft: bool = False,
     ) -> CreatedMergeRequest:
         if not self._review_bot_username:
-            raise RuntimeError(
-                "GITLAB_REVIEW_BOT_USERNAME is required for Auto-fix publication"
-            )
+            raise RuntimeError("GITLAB_REVIEW_BOT_USERNAME is required for Auto-fix publication")
         published_title = title
         if draft and not title.startswith(("Draft:", "[Draft]", "(Draft)")):
             published_title = f"Draft: {title}"
@@ -298,10 +284,7 @@ class PythonGitLabClient(GitLabClient):
             if isinstance(author, dict)
             else getattr(author, "username", "")
         )
-        if (
-            self._review_bot_username
-            and author_username != self._review_bot_username
-        ):
+        if self._review_bot_username and author_username != self._review_bot_username:
             raise GitLabIdentityConflict(
                 "created Auto-fix Merge Request author does not match the Review Bot"
             )
@@ -314,10 +297,7 @@ class PythonGitLabClient(GitLabClient):
             web_url=str(mr.web_url),
             description=str(getattr(mr, "description", "") or ""),
             author_username=author_username,
-            draft=bool(
-                getattr(mr, "draft", False)
-                or getattr(mr, "work_in_progress", False)
-            ),
+            draft=bool(getattr(mr, "draft", False) or getattr(mr, "work_in_progress", False)),
         )
 
     def find_merge_request_by_source_branch(
@@ -376,8 +356,7 @@ class PythonGitLabClient(GitLabClient):
                     merged_sha=str(merged_sha) if merged_sha else None,
                     author_username=author_username,
                     draft=bool(
-                        getattr(mr, "draft", False)
-                        or getattr(mr, "work_in_progress", False)
+                        getattr(mr, "draft", False) or getattr(mr, "work_in_progress", False)
                     ),
                 )
             )
@@ -436,12 +415,8 @@ class PythonGitLabClient(GitLabClient):
                 self._resource_value(diff, "too_large", False)
             ):
                 raise GitLabIdentityConflict("GitLab omitted part of the repository commit diff")
-            old_path = self._canonical_repository_path(
-                self._resource_value(diff, "old_path")
-            )
-            new_path = self._canonical_repository_path(
-                self._resource_value(diff, "new_path")
-            )
+            old_path = self._canonical_repository_path(self._resource_value(diff, "old_path"))
+            new_path = self._canonical_repository_path(self._resource_value(diff, "new_path"))
             if old_path != new_path or bool(self._resource_value(diff, "renamed_file", False)):
                 raise GitLabIdentityConflict("recovery rejects renamed repository paths")
             old_mode = str(self._resource_value(diff, "a_mode", "") or "")
@@ -465,7 +440,9 @@ class PythonGitLabClient(GitLabClient):
             try:
                 raw_content = file_resource.decode()
             except Exception as exc:
-                raise GitLabIdentityConflict("GitLab returned unreadable repository content") from exc
+                raise GitLabIdentityConflict(
+                    "GitLab returned unreadable repository content"
+                ) from exc
             if not isinstance(raw_content, bytes) or b"\0" in raw_content:
                 raise GitLabIdentityConflict("recovery rejects binary repository content")
             if len(raw_content) > MAX_PUBLICATION_FILE_BYTES:
@@ -473,17 +450,15 @@ class PythonGitLabClient(GitLabClient):
             try:
                 content = raw_content.decode("utf-8")
             except UnicodeDecodeError as exc:
-                raise GitLabIdentityConflict("recovery rejects non-UTF-8 repository content") from exc
+                raise GitLabIdentityConflict(
+                    "recovery rejects non-UTF-8 repository content"
+                ) from exc
             executable = new_mode == "100755"
             if created:
                 total_content_bytes += len(raw_content)
                 actions.append(RepositoryAction("create", new_path, content, executable))
-            elif old_mode != new_mode and not str(
-                self._resource_value(diff, "diff", "") or ""
-            ):
-                actions.append(
-                    RepositoryAction("chmod", new_path, execute_filemode=executable)
-                )
+            elif old_mode != new_mode and not str(self._resource_value(diff, "diff", "") or ""):
+                actions.append(RepositoryAction("chmod", new_path, execute_filemode=executable))
             else:
                 total_content_bytes += len(raw_content)
                 actions.append(RepositoryAction("update", new_path, content, executable))
@@ -491,5 +466,8 @@ class PythonGitLabClient(GitLabClient):
                 raise GitLabIdentityConflict("repository commit exceeds the recovery size bound")
         actions.sort(key=lambda action: action.file_path)
         return RepositoryCommitObservation(
-            str(project_id), observed_sha.lower(), tuple(str(parent).lower() for parent in raw_parents), tuple(actions)
+            str(project_id),
+            observed_sha.lower(),
+            tuple(str(parent).lower() for parent in raw_parents),
+            tuple(actions),
         )

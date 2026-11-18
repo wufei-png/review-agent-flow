@@ -173,10 +173,13 @@ def test_explicit_delivery_ids_respect_limit(tmp_path) -> None:
     first = dispatcher.enqueue(NotificationEvent("First", "Body", correlation_id="review:1"))[0]
     second = dispatcher.enqueue(NotificationEvent("Second", "Body", correlation_id="review:2"))[0]
 
-    assert dispatcher.process(
-        limit=1,
-        delivery_ids=(first.delivery_id, second.delivery_id),
-    ) == 1
+    assert (
+        dispatcher.process(
+            limit=1,
+            delivery_ids=(first.delivery_id, second.delivery_id),
+        )
+        == 1
+    )
     assert store.get_notification_delivery(first.delivery_id).status == "delivered"
     assert store.get_notification_delivery(second.delivery_id).status == "pending"
 
@@ -200,9 +203,7 @@ def test_dispatch_loop_runs_independently_until_stopped(tmp_path) -> None:
     stopped = Event()
 
     class StoppingNotifier(RecordingNotifier):
-        def notify_channel(
-            self, event: NotificationEvent, channel_id: str
-        ) -> NotificationResult:
+        def notify_channel(self, event: NotificationEvent, channel_id: str) -> NotificationResult:
             result = super().notify_channel(event, channel_id)
             stopped.set()
             return result
@@ -259,9 +260,7 @@ def test_channel_batch_stops_before_claiming_another_delivery(tmp_path) -> None:
     stopped = Event()
 
     class StoppingTwoChannelNotifier(TwoChannelNotifier):
-        def notify_channel(
-            self, event: NotificationEvent, channel_id: str
-        ) -> NotificationResult:
+        def notify_channel(self, event: NotificationEvent, channel_id: str) -> NotificationResult:
             result = super().notify_channel(event, channel_id)
             stopped.set()
             return result
@@ -281,9 +280,7 @@ def test_custom_webhook_secret_is_redacted_from_log_and_store(
 ) -> None:
     secret = "https://hooks.example.invalid/custom-secret"
     notifier = notifiers_from_operator(
-        (
-            ResolvedNotificationChannel("custom", "feishu", secret, {}),
-        )
+        (ResolvedNotificationChannel("custom", "feishu", secret, {}),)
     )
     store = SQLiteStore(tmp_path / "review.db")
     dispatcher = NotificationDispatcher(store, notifier, retry_delay_seconds=0)
@@ -304,15 +301,11 @@ def test_custom_webhook_secret_is_redacted_from_log_and_store(
     assert "[REDACTED]" in recorded.last_error
 
 
-def test_rotated_webhook_secret_is_redacted_before_store_write(
-    tmp_path, monkeypatch
-) -> None:
+def test_rotated_webhook_secret_is_redacted_before_store_write(tmp_path, monkeypatch) -> None:
     original = "https://hooks.example.invalid/original"
     rotated = "https://hooks.example.invalid/rotated"
     notifier = notifiers_from_operator(
-        (
-            ResolvedNotificationChannel("custom", "feishu", original, {}),
-        )
+        (ResolvedNotificationChannel("custom", "feishu", original, {}),)
     )
     store = SQLiteStore(tmp_path / "review.db")
     dispatcher = NotificationDispatcher(store, notifier)

@@ -65,9 +65,9 @@ def test_unconfigured_live_probe_and_failed_storage_never_look_ready(tmp_path) -
         == 401
     )
     probe = client.get(
-            "/probes/gitlab",
-            headers={"X-ReviewFlow-Internal-Token": runtime_token},
-        )
+        "/probes/gitlab",
+        headers={"X-ReviewFlow-Internal-Token": runtime_token},
+    )
     assert probe.status_code == 503
     assert probe.json() == {
         "status": "not_ready",
@@ -170,30 +170,36 @@ def test_project_bound_status_is_read_only_and_credential_free(tmp_path) -> None
 def test_status_cli_is_read_only_and_safe_for_unknown_runs(tmp_path, capsys) -> None:
     store = SQLiteStore(tmp_path / "review.db")
     store.enqueue("42", 1, SHA)
-    assert cli.main(
-        [
-            "status",
-            "--project-id",
-            "42",
-            "--db",
-            str(tmp_path / "review.db"),
-            "--run-id",
-            "1",
-        ]
-    ) == 0
+    assert (
+        cli.main(
+            [
+                "status",
+                "--project-id",
+                "42",
+                "--db",
+                str(tmp_path / "review.db"),
+                "--run-id",
+                "1",
+            ]
+        )
+        == 0
+    )
     output = json.loads(capsys.readouterr().out)
     assert output["project_id"] == "42"
-    assert cli.main(
-        [
-            "status",
-            "--project-id",
-            "42",
-            "--db",
-            str(tmp_path / "review.db"),
-            "--run-id",
-            "99",
-        ]
-    ) == 1
+    assert (
+        cli.main(
+            [
+                "status",
+                "--project-id",
+                "42",
+                "--db",
+                str(tmp_path / "review.db"),
+                "--run-id",
+                "99",
+            ]
+        )
+        == 1
+    )
     assert json.loads(capsys.readouterr().out) == {"status": "not_found"}
 
 

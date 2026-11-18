@@ -98,10 +98,7 @@ def test_real_opencode_denies_nested_instructions_and_ambient_skills(
         denied_skill.stdout + denied_skill.stderr
     )
 
-    review_command = (
-        "git --no-pager diff --no-ext-diff "
-        f"{snapshot.base_sha}...{snapshot.head_sha}"
-    )
+    review_command = f"git --no-pager diff --no-ext-diff {snapshot.base_sha}...{snapshot.head_sha}"
     escaped = tmp_path / "escaped.txt"
     dangerous_commands = (
         f"{review_command} -- README.md > {escaped}",

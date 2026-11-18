@@ -456,8 +456,11 @@ class SQLiteStore:
                 WHERE worker_runtime_lease.lease_until <= ?
                 """,
                 (
-                    owner_id, token, now_text,
-                    (now + timedelta(seconds=lease_seconds)).isoformat(), now_text,
+                    owner_id,
+                    token,
+                    now_text,
+                    (now + timedelta(seconds=lease_seconds)).isoformat(),
+                    now_text,
                 ),
             )
         return token if claimed.rowcount == 1 else None
@@ -478,8 +481,12 @@ class SQLiteStore:
                 SET heartbeat_at = ?, lease_until = ?
                 WHERE singleton_id = 1 AND claim_token = ? AND lease_until > ?
                 """,
-                (now_text, (now + timedelta(seconds=lease_seconds)).isoformat(),
-                 claim_token, now_text),
+                (
+                    now_text,
+                    (now + timedelta(seconds=lease_seconds)).isoformat(),
+                    claim_token,
+                    now_text,
+                ),
             )
         return updated.rowcount == 1
 
@@ -592,8 +599,11 @@ class SQLiteStore:
             "observed_at": now_text,
             "worker": {
                 "scope": "deployment",
-                "state": "absent" if worker is None else
-                "active" if worker["lease_until"] > now_text else "expired",
+                "state": "absent"
+                if worker is None
+                else "active"
+                if worker["lease_until"] > now_text
+                else "expired",
                 "owner_id": worker["owner_id"] if worker is not None else None,
                 "heartbeat_at": worker["heartbeat_at"] if worker is not None else None,
                 "lease_until": worker["lease_until"] if worker is not None else None,
@@ -1092,9 +1102,7 @@ class SQLiteStore:
     def enqueue(self, project_id: str, mr_iid: int, sha: str) -> ReviewRun:
         return self.enqueue_with_status(project_id, mr_iid, sha)[0]
 
-    def enqueue_with_status(
-        self, project_id: str, mr_iid: int, sha: str
-    ) -> tuple[ReviewRun, bool]:
+    def enqueue_with_status(self, project_id: str, mr_iid: int, sha: str) -> tuple[ReviewRun, bool]:
         """Return the stable Review Run and whether this call created it."""
 
         if not project_id or not str(project_id).strip():
@@ -1194,9 +1202,7 @@ class SQLiteStore:
             if type(mr_iid) is not int or mr_iid <= 0:
                 raise ValueError("Agent task mr_iid must be a positive integer")
             if not title or len(title) > MAX_MR_TITLE_CHARS:
-                raise ValueError(
-                    f"Agent task title must contain 1-{MAX_MR_TITLE_CHARS} characters"
-                )
+                raise ValueError(f"Agent task title must contain 1-{MAX_MR_TITLE_CHARS} characters")
             strings = {
                 "source_project_id": source_project_id,
                 "source_branch": source_branch,
@@ -1209,9 +1215,7 @@ class SQLiteStore:
             start_sha = normalize_sha(start_sha)
             head_sha = normalize_sha(head_sha)
             if not skill_source_path or skill_source_path.strip() != skill_source_path:
-                raise ValueError(
-                    "Agent task skill_source_path must be a non-empty trimmed string"
-                )
+                raise ValueError("Agent task skill_source_path must be a non-empty trimmed string")
             skill_content = validate_skill_content(skill_content)
             skill_sha256 = hashlib.sha256(skill_content.encode("utf-8")).hexdigest()
         now = self._now().isoformat()
@@ -1729,8 +1733,7 @@ class SQLiteStore:
             "failure_attempts": run.failure_attempts,
             "lease_recoveries": run.lease_recoveries,
             "lease_active": self._lease_active(run.lease_until, now),
-            "lease_expired": run.lease_until is not None
-            and run.lease_until <= now,
+            "lease_expired": run.lease_until is not None and run.lease_until <= now,
             "review_outcome": self.project_review_outcome(run_id),
             "policy_snapshot": (
                 {
@@ -1834,11 +1837,15 @@ class SQLiteStore:
         note_item = None
         if note is not None:
             note_uncertain = bool(note["write_uncertain"]) and note["state"] not in {
-                "published", "removed", "superseded"
+                "published",
+                "removed",
+                "superseded",
             }
             note_item = {
-                "request_id": note["id"], "state": note["state"],
-                "attempts": note["attempts"], "write_uncertain": note_uncertain,
+                "request_id": note["id"],
+                "state": note["state"],
+                "attempts": note["attempts"],
+                "write_uncertain": note_uncertain,
                 "external_note_id": note["external_note_id"],
                 "next_attempt_at": note["next_attempt_at"],
                 "lease_active": self._lease_active(note["lease_until"], now),
@@ -1848,19 +1855,24 @@ class SQLiteStore:
                 "reconcile_lease_active": self._lease_active(note["reconcile_lease_until"], now),
                 "error": self._redact(note["last_error"]) if note["last_error"] else None,
                 "next_action": (
-                    "operator_check" if note["state"] == "blocked"
-                    else "wait_for_worker" if note["state"] == "running"
-                    and self._lease_active(note["lease_until"], now)
-                    else "wait_for_reconciliation" if note_uncertain
-                    else "wait_for_worker" if note["state"] in {"pending", "running"}
+                    "operator_check"
+                    if note["state"] == "blocked"
+                    else "wait_for_worker"
+                    if note["state"] == "running" and self._lease_active(note["lease_until"], now)
+                    else "wait_for_reconciliation"
+                    if note_uncertain
+                    else "wait_for_worker"
+                    if note["state"] in {"pending", "running"}
                     else "none"
                 ),
             }
         plan_item = None
         if plan is not None:
             plan_item = {
-                "plan_id": plan["id"], "state": plan["state"],
-                "attempts": plan["attempts"], "write_phase": plan["write_phase"],
+                "plan_id": plan["id"],
+                "state": plan["state"],
+                "attempts": plan["attempts"],
+                "write_phase": plan["write_phase"],
                 "write_uncertain": bool(plan["write_uncertain"]),
                 "branch_commit_sha": plan["branch_commit_sha"],
                 "external_mr_iid": plan["external_mr_iid"],
@@ -1869,19 +1881,25 @@ class SQLiteStore:
                 "lease_expired": plan["lease_until"] is not None and plan["lease_until"] <= now,
                 "error": self._redact(plan["last_error"]) if plan["last_error"] else None,
                 "next_action": (
-                    "operator_check" if plan["state"] == "blocked"
-                    else "wait_for_reconciliation" if plan["state"] in {
-                        "needs_reconciliation", "reconciling"
-                    } or (plan["state"] == "running" and plan["write_phase"] != "preflight"
-                          and not self._lease_active(plan["lease_until"], now))
-                    else "wait_for_worker" if plan["state"] in {"frozen", "running"}
+                    "operator_check"
+                    if plan["state"] == "blocked"
+                    else "wait_for_reconciliation"
+                    if plan["state"] in {"needs_reconciliation", "reconciling"}
+                    or (
+                        plan["state"] == "running"
+                        and plan["write_phase"] != "preflight"
+                        and not self._lease_active(plan["lease_until"], now)
+                    )
+                    else "wait_for_worker"
+                    if plan["state"] in {"frozen", "running"}
                     else "none"
                 ),
             }
         relation_item = None
         if relation is not None:
             relation_item = {
-                "relation_id": relation["id"], "status": relation["status"],
+                "relation_id": relation["id"],
+                "status": relation["status"],
                 "auto_fix_project_id": relation["auto_fix_project_id"],
                 "auto_fix_mr_iid": relation["auto_fix_mr_iid"],
                 "published_commit_sha": relation["published_commit_sha"],
@@ -1892,32 +1910,44 @@ class SQLiteStore:
                 "reconcile_lease_active": self._lease_active(
                     relation["reconcile_lease_until"], now
                 ),
-                "error": self._redact(relation["last_error"])
-                if relation["last_error"] else None,
-                "next_action": "operator_check" if relation["divergence"]
-                else "wait_for_reconciliation" if relation["reconcile_requested"]
+                "error": self._redact(relation["last_error"]) if relation["last_error"] else None,
+                "next_action": "operator_check"
+                if relation["divergence"]
+                else "wait_for_reconciliation"
+                if relation["reconcile_requested"]
                 else "none",
             }
         notification_items = [
             {
-                "delivery_id": row["id"], "generation": row["generation"],
-                "channel_id": row["channel_id"], "channel": row["channel"],
-                "status": row["status"], "attempts": row["attempts"],
+                "delivery_id": row["id"],
+                "generation": row["generation"],
+                "channel_id": row["channel_id"],
+                "channel": row["channel"],
+                "status": row["status"],
+                "attempts": row["attempts"],
                 "next_attempt_at": row["next_attempt_at"],
                 "lease_active": self._lease_active(row["lease_until"], now),
                 "lease_expired": row["lease_until"] is not None and row["lease_until"] <= now,
-                "created_at": row["created_at"], "delivered_at": row["delivered_at"],
+                "created_at": row["created_at"],
+                "delivered_at": row["delivered_at"],
                 "error": self._redact(row["last_error"]) if row["last_error"] else None,
                 "delivery_meaning": "server_accepted_may_duplicate"
-                if row["status"] == "delivered" else None,
-                "next_action": "operator_check" if row["status"] == "failed"
-                else "wait_for_worker" if row["status"] in {"pending", "running"}
+                if row["status"] == "delivered"
+                else None,
+                "next_action": "operator_check"
+                if row["status"] == "failed"
+                else "wait_for_worker"
+                if row["status"] in {"pending", "running"}
                 else "none",
             }
             for row in deliveries
         ]
-        return {"note": note_item, "auto_fix_plan": plan_item,
-                "auto_fix_relation": relation_item, "notifications": notification_items}
+        return {
+            "note": note_item,
+            "auto_fix_plan": plan_item,
+            "auto_fix_relation": relation_item,
+            "notifications": notification_items,
+        }
 
     def get_review_run_status(self, project_id: str, run_id: int) -> dict[str, object] | None:
         """Compatibility alias for the project-bound status snapshot."""
@@ -5836,8 +5866,15 @@ class SQLiteStore:
                 WHERE status = 'running'
                   AND (lease_until IS NULL OR lease_until <= ?)
                 """,
-                (max_attempts, max_attempts, now_text, max_attempts, now_text,
-                 max_attempts, now_text),
+                (
+                    max_attempts,
+                    max_attempts,
+                    now_text,
+                    max_attempts,
+                    now_text,
+                    max_attempts,
+                    now_text,
+                ),
             )
             claimed = self._claim_notification_row(
                 connection,
@@ -5934,7 +5971,13 @@ class SQLiteStore:
                 "WHERE id = ? AND status = 'running'"
             )
             parameters = (
-                status, next_attempt_at, delivered_at, status, now_text, last_error, delivery_id
+                status,
+                next_attempt_at,
+                delivered_at,
+                status,
+                now_text,
+                last_error,
+                delivery_id,
             )
             if claim_token is not None:
                 query += " AND claim_token = ? AND lease_until IS NOT NULL AND lease_until > ?"

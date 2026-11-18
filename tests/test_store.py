@@ -82,8 +82,12 @@ def test_project_bound_status_explains_effects_without_claims_or_payloads(tmp_pa
     )
     assert note is not None
     delivery = store.enqueue_notifications(
-        f"review-run:{run.run_id}:human", "private title", "private body", None,
-        ("alice",), (("reviewers", "feishu"),),
+        f"review-run:{run.run_id}:human",
+        "private title",
+        "private body",
+        None,
+        ("alice",),
+        (("reviewers", "feishu"),),
     )[0]
     with sqlite3.connect(database) as connection:
         connection.execute(
@@ -92,7 +96,8 @@ def test_project_bound_status_explains_effects_without_claims_or_payloads(tmp_pa
         )
         connection.execute(
             "UPDATE notification_outbox SET status = 'delivered', delivered_at = created_at, "
-            "terminal_at = created_at WHERE id = ?", (delivery.delivery_id,),
+            "terminal_at = created_at WHERE id = ?",
+            (delivery.delivery_id,),
         )
     assert store.get_project_bound_review_run_status("42", other.run_id) is None
     snapshot = store.get_project_bound_review_run_status("42", run.run_id)
@@ -128,12 +133,20 @@ def test_project_ops_status_counts_only_bound_work_and_expired_leases(tmp_path) 
     )
     assert note is not None
     store.enqueue_notifications(
-        f"review-run:{running.run_id}:human", "title", "body", None,
-        (), (("reviewers", "feishu"),),
+        f"review-run:{running.run_id}:human",
+        "title",
+        "body",
+        None,
+        (),
+        (("reviewers", "feishu"),),
     )
     store.enqueue_notifications(
-        "review-run:3:human", "foreign title", "foreign body", None,
-        (), (("foreign", "feishu"),),
+        "review-run:3:human",
+        "foreign title",
+        "foreign body",
+        None,
+        (),
+        (("foreign", "feishu"),),
     )
     token = store.acquire_worker_lease("worker-1", 60)
     assert token is not None
@@ -144,7 +157,8 @@ def test_project_ops_status_counts_only_bound_work_and_expired_leases(tmp_path) 
         )
         connection.execute(
             "UPDATE note_publication_requests SET state = 'blocked', write_uncertain = 1 "
-            "WHERE id = ?", (note.request_id,),
+            "WHERE id = ?",
+            (note.request_id,),
         )
         connection.execute(
             "UPDATE notification_outbox SET status = 'failed' WHERE correlation_id = ?",
@@ -211,14 +225,17 @@ def test_policy_snapshot_is_exact_and_immutable_per_run(tmp_path) -> None:
 
     assert snapshot is not None
     assert snapshot.target_sha == OLD_SHA
-    assert store.freeze_policy_snapshot(
-        run.run_id,
-        claimed.claim_token,
-        target_branch="main",
-        target_sha=OLD_SHA,
-        policy_version=4,
-        policy_json='{"version":4}',
-    ) == snapshot
+    assert (
+        store.freeze_policy_snapshot(
+            run.run_id,
+            claimed.claim_token,
+            target_branch="main",
+            target_sha=OLD_SHA,
+            policy_version=4,
+            policy_json='{"version":4}',
+        )
+        == snapshot
+    )
     with pytest.raises(ValueError, match="immutable"):
         store.freeze_policy_snapshot(
             run.run_id,
@@ -249,19 +266,13 @@ def test_agent_task_snapshot_is_exact_and_immutable_per_run(tmp_path) -> None:
         "skill_source_path": f"{NEW_SHA}:.reviewflow/SKILL.md",
         "skill_content": "# Frozen Skill\n",
     }
-    snapshot = store.freeze_agent_task_snapshot(
-        run.run_id, claimed.claim_token, **values
-    )
+    snapshot = store.freeze_agent_task_snapshot(run.run_id, claimed.claim_token, **values)
 
     assert snapshot is not None and snapshot.base_sha == OLD_SHA
     assert snapshot.skill_content == "# Frozen Skill\n"
     assert snapshot.skill_sha256 == hashlib.sha256(b"# Frozen Skill\n").hexdigest()
-    assert store.freeze_agent_task_snapshot(
-        run.run_id, claimed.claim_token, **values
-    ) == snapshot
-    assert store.requeue(
-        run.run_id, "transient worktree failure", claim_token=claimed.claim_token
-    )
+    assert store.freeze_agent_task_snapshot(run.run_id, claimed.claim_token, **values) == snapshot
+    assert store.requeue(run.run_id, "transient worktree failure", claim_token=claimed.claim_token)
     retried_claim = store.claim_next()
     assert retried_claim is not None
     retried = store.freeze_agent_task_snapshot(
@@ -424,9 +435,7 @@ def test_fresh_schema_has_no_agent_owned_autofix_tables(tmp_path) -> None:
             ).fetchall()
         }
 
-    assert {"auto_fix_intents", "auto_fix_mrs", "auto_fix_merge_events"}.isdisjoint(
-        tables
-    )
+    assert {"auto_fix_intents", "auto_fix_mrs", "auto_fix_merge_events"}.isdisjoint(tables)
     assert {
         "auto_fix_publication_intents",
         "auto_fix_publication_plans",
@@ -716,7 +725,6 @@ def test_effect_receipt_claim_reclaim_is_project_scoped(tmp_path) -> None:
     assert row == ("running", "project-b-token")
 
 
-
 def test_effect_receipt_crash_reclaim_stops_at_max_attempts(tmp_path) -> None:
     database = tmp_path / "review.db"
     store = SQLiteStore(database)
@@ -755,12 +763,7 @@ def test_effect_receipt_crash_reclaim_stops_at_max_attempts(tmp_path) -> None:
             ("2000-01-01T00:00:00+00:00", receipt.receipt_id),
         )
 
-    assert (
-        store.claim_pending_effect_receipts(
-            "test_effect", max_attempts=3, project_id="42"
-        )
-        == ()
-    )
+    assert store.claim_pending_effect_receipts("test_effect", max_attempts=3, project_id="42") == ()
     exhausted = store.get_effect_receipt(receipt.receipt_id)
     assert exhausted is not None
     assert exhausted.state == "not_observed"
@@ -789,20 +792,11 @@ def test_pending_effect_receipt_at_max_attempts_is_not_claimed(tmp_path) -> None
             (2, receipt.receipt_id),
         )
 
-    assert (
-        store.claim_pending_effect_receipts(
-            "test_effect", max_attempts=2, project_id="42"
-        )
-        == ()
-    )
+    assert store.claim_pending_effect_receipts("test_effect", max_attempts=2, project_id="42") == ()
     exhausted = store.get_effect_receipt(receipt.receipt_id)
     assert exhausted is not None
     assert exhausted.state == "not_observed"
     assert exhausted.next_attempt_at is None
-
-
-
-
 
 
 def test_invalid_sha_is_rejected_before_enqueue(tmp_path) -> None:
@@ -812,7 +806,6 @@ def test_invalid_sha_is_rejected_before_enqueue(tmp_path) -> None:
     assert store.claim_next() is None
 
 
-
 def test_program_auto_fix_intent_is_immutable_and_lease_fenced(tmp_path) -> None:
     store = SQLiteStore(tmp_path / "review.db")
     run = store.enqueue("42", 1, SHA)
@@ -820,12 +813,8 @@ def test_program_auto_fix_intent_is_immutable_and_lease_fenced(tmp_path) -> None
     claimed = store.claim_next(project_id="42")
     assert claimed is not None
 
-    first = store.create_auto_fix_publication_intent(
-        claimed.run_id, claimed.claim_token
-    )
-    second = store.create_auto_fix_publication_intent(
-        claimed.run_id, claimed.claim_token
-    )
+    first = store.create_auto_fix_publication_intent(claimed.run_id, claimed.claim_token)
+    second = store.create_auto_fix_publication_intent(claimed.run_id, claimed.claim_token)
 
     assert first is not None
     assert second == first
@@ -839,9 +828,7 @@ def test_program_auto_fix_plan_freezes_canonical_inputs_and_marker(tmp_path) -> 
     store.enqueue("42", 1, SHA)
     claimed = store.claim_next(project_id="42")
     assert claimed is not None
-    intent = store.create_auto_fix_publication_intent(
-        claimed.run_id, claimed.claim_token
-    )
+    intent = store.create_auto_fix_publication_intent(claimed.run_id, claimed.claim_token)
     assert intent is not None
     receipt = store.create_effect_receipt(
         claimed.run_id,
@@ -893,8 +880,6 @@ def test_program_auto_fix_plan_freezes_canonical_inputs_and_marker(tmp_path) -> 
         )
 
 
-
-
 def test_notification_channel_identity_survives_configuration_reordering(tmp_path) -> None:
     store = SQLiteStore(tmp_path / "review.db")
     first = store.enqueue_notifications(
@@ -944,9 +929,7 @@ def test_notification_outbox_is_idempotent_per_channel(tmp_path) -> None:
     assert claimed.channel == "feishu"
     assert claimed.recipients == ("alice",)
     assert claimed.attempts == 1
-    assert store.finish_notification(
-        claimed.delivery_id, True, claim_token=claimed.claim_token
-    )
+    assert store.finish_notification(claimed.delivery_id, True, claim_token=claimed.claim_token)
     completed = store.get_notification_delivery(claimed.delivery_id)
     assert completed is not None
     assert completed.terminal_at is not None
@@ -1031,12 +1014,16 @@ def test_stale_notification_claim_cannot_finish_reclaimed_delivery(tmp_path) -> 
     reclaimed = store.claim_next_notification(lease_seconds=60)
     assert reclaimed is not None
     assert reclaimed.claim_token != first.claim_token
-    assert store.finish_notification(
-        deliveries[0].delivery_id, True, claim_token=first.claim_token
-    ) is False
-    assert store.finish_notification(
-        deliveries[0].delivery_id, True, claim_token=reclaimed.claim_token
-    ) is True
+    assert (
+        store.finish_notification(deliveries[0].delivery_id, True, claim_token=first.claim_token)
+        is False
+    )
+    assert (
+        store.finish_notification(
+            deliveries[0].delivery_id, True, claim_token=reclaimed.claim_token
+        )
+        is True
+    )
 
 
 def test_review_lease_heartbeat_requires_current_unexpired_claim_token(tmp_path) -> None:
@@ -1109,18 +1096,14 @@ def test_expired_claims_cannot_finish_before_reclaim(tmp_path) -> None:
     effect_run = store.enqueue("42", 2, OLD_SHA)
     claimed_effect_run = store.claim_next(project_id="42")
     assert claimed_effect_run is not None and claimed_effect_run.run_id == effect_run.run_id
-    assert store.finish(
-        effect_run.run_id, "succeeded", claim_token=claimed_effect_run.claim_token
-    )
+    assert store.finish(effect_run.run_id, "succeeded", claim_token=claimed_effect_run.claim_token)
     receipt = store.create_effect_receipt(
         effect_run.run_id,
         "test_effect",
         "effect-2",
         state="pending",
     )
-    claimed_receipt = store.claim_pending_effect_receipts(
-        "test_effect", project_id="42"
-    )[0]
+    claimed_receipt = store.claim_pending_effect_receipts("test_effect", project_id="42")[0]
     with sqlite3.connect(database) as connection:
         connection.execute(
             "UPDATE effect_receipts SET lease_until = ? WHERE id = ?",

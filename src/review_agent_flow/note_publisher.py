@@ -90,8 +90,7 @@ class NotePublisher:
         reconcile_next_at = None
         if state == "published":
             reconcile_next_at = (
-                datetime.now(UTC)
-                + timedelta(seconds=self.reconciliation_interval_seconds)
+                datetime.now(UTC) + timedelta(seconds=self.reconciliation_interval_seconds)
             ).isoformat()
         updated = self.store.finish_note_publication(
             request.request_id,
@@ -110,9 +109,7 @@ class NotePublisher:
             detail if updated else "Note publication lease was lost before completion",
         )
 
-    def _retry(
-        self, request: NotePublicationRequest, detail: str
-    ) -> NotePublicationResult:
+    def _retry(self, request: NotePublicationRequest, detail: str) -> NotePublicationResult:
         attempt_limit = self.max_attempts + (
             DEFAULT_NOTE_UNCERTAIN_LOOKUP_ATTEMPTS if request.write_uncertain else 0
         )
@@ -137,9 +134,7 @@ class NotePublisher:
         )
 
     def _lookup(self, request: NotePublicationRequest) -> NoteMarkerLookup:
-        lookup = self.gitlab.lookup_note_marker(
-            request.project_id, request.mr_iid, request.marker
-        )
+        lookup = self.gitlab.lookup_note_marker(request.project_id, request.mr_iid, request.marker)
         if not isinstance(lookup, NoteMarkerLookup):
             raise TypeError("GitLab adapter returned an invalid Note marker lookup")
         return lookup
@@ -185,9 +180,7 @@ class NotePublisher:
                     state="blocked",
                     detail="Uncertain Note write was not found within the lookup-only budget",
                 )
-            if not self.store.mark_note_write_uncertain(
-                request.request_id, request.claim_token
-            ):
+            if not self.store.mark_note_write_uncertain(request.request_id, request.claim_token):
                 return NotePublicationResult(
                     request.request_id,
                     request.run_id,
@@ -195,9 +188,7 @@ class NotePublisher:
                     "Note publication lease was lost before the GitLab write",
                 )
             request = replace(request, write_uncertain=True)
-            created = self.gitlab.create_note(
-                request.project_id, request.mr_iid, request.body
-            )
+            created = self.gitlab.create_note(request.project_id, request.mr_iid, request.body)
             if not self._valid_note(request, created):
                 return self._finish(
                     request,
@@ -255,11 +246,7 @@ class NotePublisher:
     ) -> NotePublicationResult:
         next_at = None
         if state == "published":
-            delay = (
-                self.reconciliation_interval_seconds
-                if delay_seconds is None
-                else delay_seconds
-            )
+            delay = self.reconciliation_interval_seconds if delay_seconds is None else delay_seconds
             next_at = (datetime.now(UTC) + timedelta(seconds=delay)).isoformat()
         updated = self.store.finish_published_note_reconciliation(
             request.request_id,
@@ -276,9 +263,7 @@ class NotePublisher:
             detail if updated else "Note reconciliation lease was lost before completion",
         )
 
-    def reconcile_published(
-        self, request_id: int | None = None
-    ) -> NotePublicationResult | None:
+    def reconcile_published(self, request_id: int | None = None) -> NotePublicationResult | None:
         """Observe an already-published Note without ever recreating a missing Note."""
 
         request = self.store.claim_published_note_reconciliation(
@@ -302,8 +287,7 @@ class NotePublisher:
             )
         except Exception as exc:  # noqa: BLE001 - observation failure is not deletion
             delay = min(
-                self.retry_delay_seconds
-                * (2 ** min(max(request.reconcile_attempts - 1, 0), 16)),
+                self.retry_delay_seconds * (2 ** min(max(request.reconcile_attempts - 1, 0), 16)),
                 self.max_retry_delay_seconds,
             )
             return self._finish_reconciliation(

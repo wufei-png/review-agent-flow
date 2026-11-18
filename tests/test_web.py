@@ -57,22 +57,16 @@ def _published_relation(
     )
     assert plan is not None
     assert store.finish(run.run_id, "succeeded", claim_token=claimed.claim_token)
-    claimed_plan = store.claim_auto_fix_publication_plan(
-        plan_id=plan.plan_id, project_id="42"
-    )
+    claimed_plan = store.claim_auto_fix_publication_plan(plan_id=plan.plan_id, project_id="42")
     assert claimed_plan is not None
     assert store.mark_auto_fix_write_started(
         plan.plan_id, claimed_plan.claim_token, operation="commit"
     )
-    assert store.record_auto_fix_branch_commit(
-        plan.plan_id, claimed_plan.claim_token, "f" * 40
-    )
+    assert store.record_auto_fix_branch_commit(plan.plan_id, claimed_plan.claim_token, "f" * 40)
     assert store.mark_auto_fix_write_started(
         plan.plan_id, claimed_plan.claim_token, operation="merge_request"
     )
-    assert store.record_auto_fix_merge_request(
-        plan.plan_id, claimed_plan.claim_token, child_iid
-    )
+    assert store.record_auto_fix_merge_request(plan.plan_id, claimed_plan.claim_token, child_iid)
     completed = store.complete_auto_fix_publication(
         plan.plan_id,
         claimed_plan.claim_token,
@@ -91,7 +85,9 @@ def _published_relation(
     return completed[0]
 
 
-def test_project_status_exposes_published_plan_and_relation_without_private_payload(tmp_path) -> None:
+def test_project_status_exposes_published_plan_and_relation_without_private_payload(
+    tmp_path,
+) -> None:
     store = SQLiteStore(tmp_path / "review.db")
     relation = _published_relation(store)
     snapshot = store.get_project_bound_review_run_status("42", relation.run_id)
@@ -128,8 +124,8 @@ def test_ops_status_counts_plan_reconciliation_block_and_relation_divergence(tmp
     assert store.get_project_ops_status("42")["auto_fix"]["reconciliation"] == 1
     with sqlite3.connect(database) as connection:
         connection.execute(
-            "UPDATE auto_fix_publication_plans SET state = 'needs_reconciliation' "
-            "WHERE id = ?", (relation.plan_id,),
+            "UPDATE auto_fix_publication_plans SET state = 'needs_reconciliation' WHERE id = ?",
+            (relation.plan_id,),
         )
         connection.execute(
             "UPDATE auto_fix_relations SET divergence = 'source_branch' WHERE id = ?",
@@ -212,9 +208,7 @@ def test_auto_fix_merge_marks_only_the_resulting_sha(tmp_path) -> None:
             "work_in_progress": False,
         },
     }
-    response = client.post(
-        "/webhooks/gitlab", json=payload, headers={"X-Gitlab-Token": "secret"}
-    )
+    response = client.post("/webhooks/gitlab", json=payload, headers={"X-Gitlab-Token": "secret"})
     assert response.status_code == 200
     assert response.json()["kind"] == "autofix_merged"
     assert store.is_suppressed_parent_sha("42", 1, MERGED_SHA) is True

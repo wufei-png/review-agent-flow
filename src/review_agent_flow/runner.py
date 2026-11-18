@@ -317,7 +317,9 @@ class LocalCliAgentRunner:
             try:
                 process.wait(timeout=min(interval, remaining))
                 stdout, stderr = _finish_diagnostics(threads, captures)
-                output = _load_agent_output(context.result_path) if process.returncode == 0 else None
+                output = (
+                    _load_agent_output(context.result_path) if process.returncode == 0 else None
+                )
                 return AgentResult(
                     process.returncode or 0,
                     stdout,
@@ -337,6 +339,4 @@ class LocalCliAgentRunner:
                     if not heartbeat_ok:
                         _terminate_process(process)
                         _finish_diagnostics(threads, captures)
-                        raise LeaseLostError(
-                            "Review Run lease was lost during Agent execution"
-                        )
+                        raise LeaseLostError("Review Run lease was lost during Agent execution")

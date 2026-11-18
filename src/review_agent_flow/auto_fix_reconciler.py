@@ -64,11 +64,7 @@ class AutoFixReconciler:
         self._secret_provider = secret_provider or (lambda: ())
 
     def _secrets(self) -> tuple[str, ...]:
-        return tuple(
-            value
-            for value in self._secret_provider()
-            if value and not value.isspace()
-        )
+        return tuple(value for value in self._secret_provider() if value and not value.isspace())
 
     def _redact(self, value: object) -> str:
         return redact(value, secrets=self._secrets())
@@ -106,9 +102,7 @@ class AutoFixReconciler:
             self._redact(detail),
         )
 
-    def _block_plan(
-        self, plan: AutoFixPublicationPlan, detail: str
-    ) -> AutoFixReconciliationResult:
+    def _block_plan(self, plan: AutoFixPublicationPlan, detail: str) -> AutoFixReconciliationResult:
         persisted = self.store.finish_auto_fix_publication_plan(
             plan.plan_id,
             plan.claim_token,
@@ -204,9 +198,7 @@ class AutoFixReconciler:
             f"reconciled Auto-fix Merge Request !{child.iid}",
         )
 
-    def _reconcile_plan(
-        self, plan: AutoFixPublicationPlan
-    ) -> AutoFixReconciliationResult:
+    def _reconcile_plan(self, plan: AutoFixPublicationPlan) -> AutoFixReconciliationResult:
         try:
             payload = self._payload(plan)
             project_id = payload.review_key.project_id
@@ -347,9 +339,7 @@ class AutoFixReconciler:
             self._redact(detail) if persisted else "Relation reconciliation lease was lost",
         )
 
-    def _reconcile_relation(
-        self, relation: ProgramAutoFixRelation
-    ) -> AutoFixReconciliationResult:
+    def _reconcile_relation(self, relation: ProgramAutoFixRelation) -> AutoFixReconciliationResult:
         try:
             child = self.gitlab.get_merge_request(
                 relation.auto_fix_project_id, relation.auto_fix_mr_iid
